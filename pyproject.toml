@@ -1,0 +1,23 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "speechproject"
+version = "0.1.0"
+description = "Speech separation, speaker identification and ASR toolkit"
+authors = [{name="Gino"}]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "faster-whisper>=1.1.1",
+  "ctranslate2>=4.6.0",
+  "torch>=2.5.1",
+  "torchaudio>=2.5.1",
+  "jieba-fast>=0.53",
+  "numpy>=2.2.1",
+  "tqdm>=4.67.1"
+]
+
+[tool.setuptools.packages.find]
+where = ["modules"]

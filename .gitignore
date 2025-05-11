@@ -1,0 +1,27 @@
+# Python cache
+__pycache__/
+*.egg-info/
+.env
+output_log.txt
+*.py[cod]
+*.log
+*.env
+
+
+# 模型與大型資料
+*.bin
+*.pt
+*.ckpt
+*.onnx
+*.wav
+ct2_models/
+work_output/
+pretrained_models/
+embeddingFiles/
+
+# 虛擬環境
+venv/
+*.pyc
+
+# VS Code 設定
+.vscode/
