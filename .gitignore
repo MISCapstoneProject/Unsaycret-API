@@ -6,6 +6,7 @@ output_log.txt
 *.py[cod]
 *.log
 *.env
+logs/
 
 
 # 模型與大型資料
@@ -18,6 +19,7 @@ ct2_models/
 work_output/
 pretrained_models/
 embeddingFiles/
+models/speechbrain_recognition/
 
 # 虛擬環境
 venv/

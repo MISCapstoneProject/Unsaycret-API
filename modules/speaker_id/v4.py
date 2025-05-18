@@ -82,7 +82,9 @@ from datetime import datetime, timezone
 from typing import Tuple, List, Dict, Optional, Union, Any
 import weaviate  # type: ignore
 from weaviate.classes.query import MetadataQuery # type: ignore
-import sync_npy_username  # 用來呼叫 ffmpeg 或檢查更新
+import utils.sync_npy_username as sync_npy_username  # 用來呼叫 ffmpeg 或檢查更新
+from utils.log_utils import setup_logging, restore_stdout  # ✅ 引入你搬去 utils 的新版函式
+
 
 # 控制輸出的全局變數
 _ENABLE_OUTPUT = False  # 預設為 False，即不輸出詳細訊息
@@ -177,24 +179,7 @@ class Tee:
         self.file.flush()
         self.stdout.flush()
 
-# 日誌設定函數，可由外部調用
-def setup_logging(log_file: str = "output_log.txt", mode: str = "w") -> None:
-    """
-    設定日誌輸出
-    
-    Args:
-        log_file: 日誌檔案路徑
-        mode: 檔案開啟模式
-    """
-    global _original_stdout
-    _original_stdout = sys.stdout
-    sys.stdout = Tee(log_file, mode)
 
-# 恢復原始標準輸出
-def restore_stdout() -> None:
-    """恢復原始標準輸出"""
-    if '_original_stdout' in globals() and _original_stdout is not None:
-        sys.stdout = _original_stdout
 
 # 載入 SpeechBrain 語音辨識模型
 from speechbrain.inference import SpeakerRecognition
