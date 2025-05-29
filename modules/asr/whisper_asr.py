@@ -53,24 +53,37 @@ class WhisperASR:
 
         print("✅ Done →", out_path)
         return str(out_path)
-    def transcribe(self, wav_path: str) -> tuple[str, float]:
+    def transcribe(self, wav_path: str) -> tuple[str, float, list[dict]]:
         """
-        對單一 wav 檔做 ASR，回傳 (full_text, avg_confidence)
+        對單一 wav 檔做 ASR，回傳 (full_text, avg_confidence, word_timestamps)
         """
         seg_gen, _ = self.model.transcribe(
             str(wav_path),
-            word_timestamps=False,   # 這邊不需要時間戳
+            word_timestamps=True,   # ✅ 改為 True，取得詞時間
             vad_filter=False,
             beam_size=self.beam,
             language=None if self.lang == "auto" else self.lang,
         )
         segments = list(seg_gen)
         if not segments:
-            return "", 0.0
+            return "", 0.0, []
 
-        # 組成完整文字
         full_txt = "".join(s.text for s in segments).strip()
-        # 平均置信度 (用 word-level probability)
-        probs = [w.probability for s in segments for w in (s.words or [])]
-        avg_conf = float(sum(probs) / len(probs)) if probs else 0.0
-        return full_txt, avg_conf
+
+        words = [w for s in segments for w in (s.words or [])]
+
+        # 若 words 為空，改用 segment-level average_logprob 當 fallback
+        if words:
+            probs = [w.probability for w in words]
+            avg_conf = float(sum(probs) / len(probs))
+            word_info = [{
+                "start": float(w.start),
+                "end": float(w.end),
+                "word": str(w.word),
+                "probability": float(w.probability)
+            } for w in words]
+        else:
+            avg_conf = float(sum(s.avg_logprob for s in segments) / len(segments))
+            word_info = []
+
+        return full_txt, avg_conf, word_info
