@@ -11,7 +11,7 @@ import json, uuid, pathlib, datetime as dt
 import torchaudio
 from concurrent.futures import ThreadPoolExecutor
 from modules.separation.separator import AudioSeparator
-from modules.speaker_id.v4 import SpeakerIdentifier
+from modules.speaker_id.VID_identify_v5 import SpeakerIdentifier
 from modules.asr.whisper_asr import WhisperASR
 
 # ---------- 1. 自動偵測 GPU ----------
