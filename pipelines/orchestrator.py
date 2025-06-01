@@ -41,34 +41,40 @@ def process_segment(seg_path, t0, t1):
     }
 
 # ---------- 4. 主 pipeline 函式 ----------
-def run_pipeline(raw_wav: str, max_workers: int = 4):
-    # 載入音訊檔
-    waveform, sr = torchaudio.load(raw_wav)
+def make_pretty(seg: dict) -> dict:
+    """把一段 segment 轉成易讀格式"""
+    return {
+        "time": f"{seg['start']:.2f}s → {seg['end']:.2f}s",
+        "speaker": seg["speaker"],
+        "similarity": f"{seg['distance']:.3f}",
+        "confidence": f"{seg['confidence']*100:.1f}%",
+        "text": seg["text"],
+        "word_count": len(seg["words"]),
+    }
 
-    # 建立輸出資料夾
+def run_pipeline(raw_wav: str, max_workers: int = 1):
+    # (保持和你一樣，只有 1 條執行緒)
+    waveform, sr = torchaudio.load(raw_wav)
     out_dir = pathlib.Path("work_output") / dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 語音分離 → 得到多個音檔段落
     segments = sep.separate_and_save(waveform, str(out_dir), segment_index=0)
-    # segments: [(seg_path, t0, t1), ...]
 
-    print(f"🔄 處理 {len(segments)} 個音檔片段...")
+    print(f"🔄 處理 {len(segments)} 段... (max_workers={max_workers})")
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        bundle = list(ex.map(lambda s: process_segment(*s), segments))
 
-    # ---------- 5. 多執行緒處理每一段 ----------
-    with ThreadPoolExecutor(max_workers=max_workers) as executor:
-        bundle = list(executor.map(lambda s: process_segment(*s), segments))
-
-    # ---------- 6. 排序（保險） ----------
     bundle.sort(key=lambda x: x["start"])
 
-    # ---------- 7. 寫入 JSON ----------
+    # -------- 新增 prettified bundle --------
+    pretty_bundle = [make_pretty(s) for s in bundle]
+
     json_path = out_dir / "output.json"
     with open(json_path, "w", encoding="utf-8") as f:
         json.dump({"segments": bundle}, f, ensure_ascii=False, indent=2)
 
     print(f"✅ Pipeline finished → {json_path}")
-    return bundle
+    return bundle, pretty_bundle
 
 if __name__ == "__main__":
     import sys
