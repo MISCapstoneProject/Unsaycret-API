@@ -1,61 +1,84 @@
 # pipelines/orchestrator.py
+# 在文件最顶部
+import torch, os
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
+
+logger.info("🖥  GPU available: %s", torch.cuda.is_available())
+if torch.cuda.is_available():
+    logger.info("   Device: %s", torch.cuda.get_device_name(0))
+# 然後再 import 你的模块
+
+import threading
 import json, uuid, pathlib, datetime as dt
 import torchaudio
+from concurrent.futures import ThreadPoolExecutor
 from modules.separation.separator import AudioSeparator
-from modules.speaker_id.v4 import SpeakerIdentifier
+from modules.identification.VID_identify_v5 import SpeakerIdentifier
 from modules.asr.whisper_asr import WhisperASR
+
+# ---------- 1. 自動偵測 GPU ----------
+use_gpu = torch.cuda.is_available()
+logger.info(f"🚀 使用設備: {'cuda' if use_gpu else 'cpu'}")
+
 
 sep = AudioSeparator()
 spk = SpeakerIdentifier()
-asr = WhisperASR(model_name="medium", gpu=False)
+asr = WhisperASR(model_name="medium", gpu=use_gpu)
 
-def run_pipeline(raw_wav: str):
-    # 1️⃣ 先 load WAV → 得到 tensor
+# ---------- 3. 處理單一片段的函式 ----------
+
+def process_segment(seg_path, t0, t1):
+    logger.info(f"🔧 執行緒 {threading.get_ident()} 正在處理 segment ({t0:.2f} - {t1:.2f})")
+
+    speaker_id, name, dist = spk.process_audio_file(seg_path)
+    text, conf, words       = asr.transcribe(seg_path)
+    return {
+        "start": round(t0, 2),
+        "end":   round(t1, 2),
+        "speaker": name,
+        "distance": round(float(dist), 3),
+        "text": text,
+        "confidence": round(conf, 2),
+        "words": words,
+    }
+
+# ---------- 4. 主 pipeline 函式 ----------
+def make_pretty(seg: dict) -> dict:
+    """把一段 segment 轉成易讀格式"""
+    return {
+        "time": f"{seg['start']:.2f}s → {seg['end']:.2f}s",
+        "speaker": seg["speaker"],
+        "similarity": f"{seg['distance']:.3f}",
+        "confidence": f"{seg['confidence']*100:.1f}%",
+        "text": seg["text"],
+        "word_count": len(seg["words"]),
+    }
+
+def run_pipeline(raw_wav: str, max_workers: int = 1):
+    # (保持和你一樣，只有 1 條執行緒)
     waveform, sr = torchaudio.load(raw_wav)
-
-    # 2️⃣ 設定好輸出資料夾（可以按日期命名），或傳進原本的 separate_and_save
     out_dir = pathlib.Path("work_output") / dt.datetime.now().strftime("%Y%m%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    # 3️⃣ 呼叫核心分離函式，傳入 audio_tensor、output_dir、segment_index
-    #    這裡我們單檔只用 segment_index=0，你也可以做迴圈多檔
     segments = sep.separate_and_save(waveform, str(out_dir), segment_index=0)
-    # segments = [(seg_path, start, end), …]
 
-    # 4️⃣ 逐一做語者辨識 & ASR，並加進 bundle
-    bundle = []
-    
-    for seg_path, t0, t1 in segments:
-        # 正確解包：第一個是 speaker_id、第二個才是 name、第三個才是 distance
-        result = spk.process_audio_file(seg_path)
-        if result is None:
-            # 如果意外回傳 None，可以選擇跳過或預設值
-            continue
+    logger.info(f"🔄 處理 {len(segments)} 段... (max_workers={max_workers})")
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        bundle = list(ex.map(lambda s: process_segment(*s), segments))
 
-        speaker_id, name, dist = result
-        dist = float(dist)  # 這回 dist 就是數值，不會再炸
+    bundle.sort(key=lambda x: x["start"])
 
-        # 接著再做 ASR
-        text, conf = asr.transcribe(seg_path)
+    # -------- 新增 prettified bundle --------
+    pretty_bundle = [make_pretty(s) for s in bundle]
 
-        bundle.append({
-            "start": round(t0, 2),
-            "end":   round(t1, 2),
-            "speaker": name,
-            "distance": round(dist, 3),
-            "text": text,
-            "confidence": round(conf, 2)
-        })
-
-
-
-    # 5️⃣ 寫檔
     json_path = out_dir / "output.json"
     with open(json_path, "w", encoding="utf-8") as f:
-        json.dump(bundle, f, ensure_ascii=False, indent=2)
+        json.dump({"segments": bundle}, f, ensure_ascii=False, indent=2)
 
-    print("✅ Pipeline finished →", json_path)
-    return bundle
+    logger.info(f"✅ Pipeline finished → {json_path}")
+    return bundle, pretty_bundle
 
 if __name__ == "__main__":
     import sys
