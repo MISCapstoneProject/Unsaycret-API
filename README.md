@@ -1,5 +1,6 @@
-SPEECHPROJECT_CLEAN 專案說明
-專案簡介
+# Unsaycret
+
+## 專案簡介
 本專案為語音處理系統整合範例，包含語音分離、語音辨識、說話人辨識、API 封裝，以及資料庫串接（Weaviate）等模組，目標是提供一套可拓展的語音處理流程框架。
 
 ## 📂 專案架構
@@ -53,5 +54,52 @@ SPEECHPROJECT_CLEAN/
 - ✅ 主程式引用方式統一改為 `from utils.log_utils import ...`
 - ✅ 刪除舊的 `output_log.txt` 檔案，並新增 `.gitignore` 排除 logs
 - ✅ 新增專案 README 結構與說明
+
+## ⚡️ 伺服器啟動方式
+
+### 1. 安裝依賴
+```cmd
+pip install -r requirements.txt
+```
+
+### 2. 啟動 FastAPI 伺服器
+```cmd
+uvicorn services.api:app --reload
+```
+
+- 若未安裝 uvicorn，請先執行：
+  ```cmd
+  pip install uvicorn
+  ```
+- 啟動後可於 http://localhost:8000/docs 查看 API 文件（Swagger UI）
+
+---
+
+## 📂 主要目錄結構（2025/06/08）
+
+```
+sonic-slicer-api/
+├── ct2_models/              # Faster-Whisper 模型資料
+├── examples/                # 測試與範例腳本
+├── models/                  # SpeechBrain 語音模型
+├── modules/                 # 語音分離、辨識、說話人辨識等自定義模組
+│   ├── asr/                 # 語音辨識（ASR）
+│   ├── separation/          # 語者分離
+│   └── speaker_id/          # 說話人辨識
+├── pipelines/               # 處理流程（分離+辨識）
+├── pretrained_models/       # 預訓練模型檔案
+├── services/                # FastAPI 伺服器與 API 定義
+├── utils/                   # 輔助工具
+├── weaviate_study/          # Weaviate 向量資料庫整合
+├── work_output/             # 處理結果輸出
+├── requirements.txt         # 依賴套件清單
+├── pyproject.toml           # Python 專案描述
+├── README.md                # 本說明文件
+└── ...
+```
+
+---
+
+> 本 README 由 AI 依據實際專案結構自動補全，若有異動請手動更新。
 
 
