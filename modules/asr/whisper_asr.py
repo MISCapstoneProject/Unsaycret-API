@@ -3,6 +3,9 @@ from pathlib import Path
 import json
 from .asr_model import load_model
 from .text_utils import merge_char_to_word
+from utils.logger import get_logger
+
+logger = get_logger(__name__)
 
 class WhisperASR:
     def __init__(self, model_name="medium", gpu=False, beam=5, lang="auto"):
@@ -18,7 +21,7 @@ class WhisperASR:
         results = []
 
         for wav in wav_list:
-            print("🚀", wav.name)
+            logger.info(f"🚀 開始辨識音檔: {wav.name}")
             seg_gen, _ = self.model.transcribe(
                 str(wav),
                 word_timestamps=True,
@@ -51,7 +54,7 @@ class WhisperASR:
         with open(out_path, "w", encoding="utf-8") as f:
             json.dump(results, f, ensure_ascii=False, indent=2)
 
-        print("✅ Done →", out_path)
+        logger.info(f"✅ 完成辨識，結果輸出至: {out_path}")
         return str(out_path)
     def transcribe(self, wav_path: str) -> tuple[str, float, list[dict]]:
         """

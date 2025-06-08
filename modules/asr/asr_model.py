@@ -13,7 +13,7 @@ _MODEL_MAP = {
 
 def load_model(model_name: str = "medium",
                gpu: bool = False,
-               cache: str = "ct2_models") -> WhisperModel:
+               cache: str = "models/faster-whisper") -> WhisperModel:
     """
     model_name 可用簡名 (tiny…large-v3) 或完整 repo 名。
     """

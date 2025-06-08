@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "Speech separation, speaker identification and ASR toolkit"
 authors = [{name="Gino"}]
 readme = "README.md"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 dependencies = [
   "faster-whisper>=1.1.1",
   "ctranslate2>=4.6.0",

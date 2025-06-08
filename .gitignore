@@ -19,11 +19,13 @@ ct2_models/
 work_output/
 pretrained_models/
 embeddingFiles/
-models/speechbrain_recognition/
+models
 
 # 虛擬環境
-venv/
+venv
+.venv
 *.pyc
 
 # VS Code 設定
 .vscode/
+.github
