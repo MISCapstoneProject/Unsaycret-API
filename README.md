@@ -4,7 +4,6 @@
 Unsaycret-API 是一套模組化的語音處理系統，整合語音分離、說者辨識、語音辨識、API 服務，並支援向量資料庫串接。
 這專案執行後會架起 API 伺服器，以供呼叫使用。
 
----
 
 ## 🚀 主要功能
 
@@ -14,7 +13,6 @@ Unsaycret-API 是一套模組化的語音處理系統，整合語音分離、說
 - 🛜 **API 服務**：FastAPI 提供 RESTful 與 WebSocket 介面。
 - 🧠 **Weaviate 整合**：語音向量與辨識結果可存入 Weaviate，支援語者搜尋與比對。
 
----
 
 ## 📂 目錄結構與模組說明
 
@@ -66,7 +64,6 @@ Unsaycret-API/
 └── ...
 ```
 
----
 
 ### 各資料夾/模組詳細說明
 
@@ -108,7 +105,6 @@ Unsaycret-API/
 - **work_output/**  
   每次語音處理的結果資料夾，包含分離音檔與辨識結果（output.json）。
 
----
 
 ## ⚡️ 快速啟動
 
@@ -128,25 +124,31 @@ Unsaycret-API/
    python examples/test_modules.py
    ```
 
----
 
-## Docker 和 Weaviate 設定 (必要步驟)
+## 🐳 Docker & Weaviate 部署指南 （2025‑06-16 更新）(必要步驟)
 
-1. 確保 Docker Desktop 已安裝並運行
-2. 啟動 Weaviate 容器：
-   ```cmd
-   cd weaviate_study
-   docker-compose up -d
-   ```
-3. 等待容器啟動完成（通常需要 30-60 秒）
-4. 初始化 Weaviate 結構：
-   ```cmd
-   python weaviate_study\create_collections.py
-   ```
+### 1 啟動 Weaviate + Console
 
-> **注意**: 首次啟動後，必須執行 `create_collections.py` 來建立必要的資料集合。此步驟只需執行一次，除非您刪除了 Weaviate 容器或需要重置資料庫的所有資料。
+```bash
+# 於專案根目錄
+docker compose up -d
+```
 
----
+> 第一次啟動需 30–60 秒；執行 `docker compose ps`，待 `STATUS` 顯示 **Up (healthy)** 即完成。
+
+
+### 2 初始化資料結構（**只需一次**）
+
+```bash
+python weaviate_study/create_collections.py
+```
+
+將為語者資訊、向量索引等建立必要 Class；除非想重置資料庫全部，否則不必重跑。
+
+
+### 📦 資料庫備份、還原與轉移功能
+
+已實現資料庫的資料進行備份、還原與轉移功能，方便進行資料保護與環境遷移。詳細操作步驟與指令將於後續文件補充。
 
 ## 系統需求
 

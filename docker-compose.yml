@@ -1,0 +1,48 @@
+---
+version: '3.8'
+
+services:
+  weaviate:
+    command:
+    - --host
+    - 0.0.0.0
+    - --port
+    - '8080'
+    - --scheme
+    - http
+    image: cr.weaviate.io/semitechnologies/weaviate:1.30.0
+    ports:
+    - 8080:8080
+    - 50051:50051
+    volumes:
+    - weaviate_data:/var/lib/weaviate
+    - weaviate_backups:/var/lib/weaviate/backups
+    restart: unless-stopped
+    healthcheck:          
+      test: ["CMD", "curl", "-f", "http://localhost:8080/v1/.well-known/ready"]
+      interval: 30s       
+      timeout: 5s
+      retries: 3
+    environment:
+      QUERY_DEFAULTS_LIMIT: 25
+      AUTHENTICATION_ANONYMOUS_ACCESS_ENABLED: 'true'
+      PERSISTENCE_DATA_PATH: '/var/lib/weaviate'
+      DEFAULT_VECTORIZER_MODULE: 'none'
+      ENABLE_MODULES: 'backup-filesystem'
+      BACKUP_FILESYSTEM_PATH: '/var/lib/weaviate/backups'
+      CLUSTER_HOSTNAME: 'node1'
+
+  weaviate_console:
+    image: semitechnologies/weaviate-console:latest
+    ports:
+      - "8081:80"
+    depends_on:
+      - weaviate
+    environment:
+      - WEAVIATE_URL=http://weaviate:8080
+
+volumes:
+  weaviate_data:
+  weaviate_backups:
+
+...
