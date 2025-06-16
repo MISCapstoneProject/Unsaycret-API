@@ -56,7 +56,7 @@ def make_pretty(seg: dict) -> dict:
         "word_count": len(seg["words"]),
     }
 
-def run_pipeline(raw_wav: str, max_workers: int = 1):
+def run_pipeline(raw_wav: str, max_workers: int = 4):
     # (保持和你一樣，只有 1 條執行緒)
     waveform, sr = torchaudio.load(raw_wav)
     out_dir = pathlib.Path("work_output") / dt.datetime.now().strftime("%Y%m%d_%H%M%S")

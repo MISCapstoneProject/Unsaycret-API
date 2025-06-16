@@ -55,8 +55,10 @@ CLI 互動介面與資料操作分離，結構現代、易於維護。主要功�
 
 ===============================================================================
 """
-
-import os
+import sys, os
+root = os.path.abspath(os.path.join(os.path.dirname(__file__),"../.."))
+if root not in sys.path:
+    sys.path.insert(0, root)
 import re
 import sys
 import uuid
@@ -93,7 +95,7 @@ class SpeakerManager:
 
     def __init__(self):
         # 使用 DatabaseService 作為統一接口
-        from database.database import DatabaseService
+        from modules.database.database import DatabaseService
         self._db = DatabaseService()
         
     def list_all_speakers(self) -> List[Dict[str, Any]]:
