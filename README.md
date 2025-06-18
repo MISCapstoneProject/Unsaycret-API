@@ -195,6 +195,23 @@ python weaviate_study/create_collections.py
 3. **聲紋轉移**: `POST /speaker/transfer` - 合併錯誤識別的語者
 4. **語者查詢**: `GET /speaker/{speaker_id}` - 獲取語者詳細資訊
 
+### 2. 資料夾批次轉錄 API
+
+可以一次處理數個音檔。僅需傳入路徑或上傳 ZIP 檔就可以啟動。
+
+```python
+import requests
+
+# 傳入路徑
+resp = requests.post("http://localhost:8000/transcribe_dir", data={"path": "/path/to/wavs"})
+print(resp.json()["summary_tsv"])
+
+# 以 ZIP 檔上傳
+with open("audios.zip", "rb") as f:
+    resp = requests.post("http://localhost:8000/transcribe_dir", files={"zip_file": f})
+print(resp.json()["summary_tsv"])
+```
+
 ## 其他說明
 
 - **模型快取**：ASR 與分離模型會自動下載至 `models/` 相關資料夾。
