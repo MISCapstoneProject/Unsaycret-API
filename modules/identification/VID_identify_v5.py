@@ -1131,30 +1131,3 @@ class SpeakerIdentifier:
         except Exception as e:
             print(f"添加聲紋向量時發生錯誤: {e}")
             return False
-
-
-if __name__ == "__main__":
-    set_output_enabled(True)  # 啟用輸出
-
-    # 創建說話者識別器
-    identifier = SpeakerIdentifier()
-    
-    # 主程式執行: 若要處理單一檔案或資料夾，可解除下列註解
-
-    # 範例：處理單一檔案 (現在會透過 process_audio_stream)
-    identifier.process_audio_file("16K-model/Audios-16K-IDTF/speaker1_20250501-22_49_13_1.wav")
-
-    # 範例：直接處理音訊流 (假設你有 NumPy 陣列 signal 和取樣率 sr)
-    # try:
-    #     # 假設這是從某個來源得到的音訊數據和取樣率
-    #     # 例如：從麥克風、網路流等
-    #     sample_signal, sample_sr = sf.read("16K-model/Audios-16K-IDTF/speaker2_20250501-22_49_13_1.wav") # 僅為範例，實際應來自流
-    #     identifier.process_audio_stream(sample_signal, sample_sr, source_description="範例音訊流")
-    # except Exception as e:
-    #     print(f"處理範例音訊流時出錯: {e}")
-
-
-    # identifier.process_audio_directory("testFiles/test_audioFile/0770")
-    
-    # 如果需要將音檔提取聲紋並添加到現有說話者，可解除下列註解
-    # identifier.add_voiceprint_to_speaker("path_to_audio.wav", "speaker_uuid")
