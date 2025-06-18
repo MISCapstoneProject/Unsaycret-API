@@ -171,7 +171,23 @@ class AudioSeparator:
         self.output_files = []  # 儲存分離後的音檔路徑
         self.save_audio_files = True  # 設定: 是否將分離後的音訊儲存為wav檔案
         logger.info("AudioSeparator 初始化完成")
-        
+
+
+    def process_audio_file(self, file_path: str, output_dir: str, segment_index: int = 1) -> None:
+        """在離線模式下處理單一音檔並進行語者分離與識別"""
+        try:
+            waveform, sr = torchaudio.load(file_path)
+            if waveform.shape[0] > 1:
+                waveform = torch.mean(waveform, dim=0, keepdim=True)
+            waveform = waveform.to(self.device)
+            if sr != TARGET_RATE:
+                resample = torchaudio.transforms.Resample(orig_freq=sr, new_freq=TARGET_RATE).to(self.device)
+                waveform = resample(waveform)
+            self.separate_and_identify(waveform, output_dir, segment_index)
+        except Exception as e:
+            logger.error(f"處理檔案 {file_path} 時發生錯誤：{e}")
+            
+            
     def set_save_audio_files(self, save: bool) -> None:
         """
         設定是否儲存分離後的音訊檔案
@@ -681,3 +697,16 @@ def check_weaviate_connection() -> bool:
     except Exception as e:
         logger.error(f"Weaviate 連線失敗：{e}")
         return False
+    
+def run_realtime(output_dir: str = OUTPUT_DIR) -> str:
+    """方便外部呼叫的錄音處理函式"""
+    separator = AudioSeparator()
+    return separator.record_and_process(output_dir)
+
+
+def run_offline(file_path: str, output_dir: str = OUTPUT_DIR, save_files: bool = True) -> None:
+    """方便外部呼叫的離線音檔處理函式"""
+    separator = AudioSeparator()
+    separator.set_save_audio_files(save_files)
+    separator.process_audio_file(file_path, output_dir)
+
