@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import uuid
+import math
 from datetime import datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
@@ -37,11 +38,33 @@ spk = SpeakerIdentifier()
 asr = WhisperASR(model_name="medium", gpu=use_gpu)
 
 
+def is_effective_audio(wav_path: str,
+                       rms_db_threshold: float = -35.0,
+                       voiced_ratio_threshold: float = 0.05) -> bool:
+    """Check if wav contains valid speech based on RMS and voiced ratio."""
+    waveform, sr = torchaudio.load(wav_path)
+    rms = waveform.pow(2).mean().sqrt().item()
+    rms_db = 20 * math.log10(rms + 1e-12)
+
+    amp_thresh = 10 ** (rms_db_threshold / 20)
+    voiced_ratio = (waveform.abs() > amp_thresh).float().mean().item()
+
+    logger.debug(
+        f"檢查 {os.path.basename(wav_path)}: RMS {rms_db:.1f} dBFS, voiced {voiced_ratio:.2%}"
+    )
+
+    return rms_db >= rms_db_threshold and voiced_ratio >= voiced_ratio_threshold
+
+
 def process_segment(seg_path: str, t0: float, t1: float) -> dict:
     """Process a single separated segment."""
     logger.info(
         f"🔧 執行緒 {threading.get_ident()} 處理 ({t0:.2f}-{t1:.2f}) → {os.path.basename(seg_path)}"
     )
+
+    if not is_effective_audio(seg_path):
+        logger.info(f"⏭ 跳過無效音檔: {os.path.basename(seg_path)}")
+        return None
 
     start = time.perf_counter()
 
@@ -96,7 +119,7 @@ def run_pipeline_file(raw_wav: str, max_workers: int = 3):
     
     logger.info(f"🔄 處理 {len(segments)} 段... (max_workers={max_workers})")
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        bundle = list(ex.map(lambda s: process_segment(*s), segments))
+        bundle = [r for r in ex.map(lambda s: process_segment(*s), segments) if r]
 
     bundle.sort(key=lambda x: x["start"])
     pretty_bundle = [make_pretty(s) for s in bundle]
