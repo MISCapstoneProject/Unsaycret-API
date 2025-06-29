@@ -6,7 +6,6 @@ build-backend = "setuptools.build_meta"
 name = "speechproject"
 version = "0.1.0"
 description = "Speech separation, speaker identification and ASR toolkit"
-authors = [{name="Gino"}]
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
