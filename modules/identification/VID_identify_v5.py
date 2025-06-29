@@ -189,7 +189,7 @@ from speechbrain.inference import SpeakerRecognition
 # 全域參數設定
 THRESHOLD_LOW = 0.26     # 過於相似，不更新
 THRESHOLD_UPDATE = 0.34  # 下:更新嵌入向量，上:新增一筆聲紋
-THRESHOLD_NEW = 0.385    # 判定為新說話者
+THRESHOLD_NEW = 0.39    # 判定為新說話者
 DEFAULT_SPEAKER_NAME = "未命名說話者"  # 預設的說話者名稱
 
 # Weaviate 連接參數（如果需要可以修改）
