@@ -1,0 +1,102 @@
+{
+  "info": {
+    "name": "語音管理API",
+    "description": "語音轉錄與說話者管理API集合",
+    "version": "1.0.0"
+  },
+  "item": [
+    {
+      "name": "語音轉錄",
+      "request": {
+        "method": "POST",
+        "header": [],
+        "body": {
+          "mode": "formdata",
+          "formdata": [
+            {
+              "key": "file",
+              "type": "file",
+              "src": [],
+              "description": "上傳音訊檔案"
+            }
+          ]
+        },
+        "url": {
+          "raw": "{{base_url}}/transcribe",
+          "host": ["{{base_url}}"],
+          "path": ["transcribe"]
+        },
+        "description": "上傳音訊檔案進行語音轉錄和說話者識別"
+      }
+    },
+    {
+      "name": "說話者改名",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"speaker_id\": \"123e4567-e89b-12d3-a456-426614174000\",\n  \"current_name\": \"王小明\",\n  \"new_name\": \"王大明\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/speaker/rename",
+          "host": ["{{base_url}}"],
+          "path": ["speaker", "rename"]
+        },
+        "description": "更改指定說話者的名稱"
+      }
+    },
+    {
+      "name": "聲紋轉移",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"source_speaker_id\": \"123e4567-e89b-12d3-a456-426614174000\",\n  \"source_speaker_name\": \"錯誤識別的說話者\",\n  \"target_speaker_id\": \"987fcdeb-51d3-12a4-b567-426614174111\",\n  \"target_speaker_name\": \"正確的說話者\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/speaker/transfer",
+          "host": ["{{base_url}}"],
+          "path": ["speaker", "transfer"]
+        },
+        "description": "將來源說話者的所有聲紋轉移到目標說話者"
+      }
+    },
+    {
+      "name": "獲取說話者資訊",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/speaker/{{speaker_id}}",
+          "host": ["{{base_url}}"],
+          "path": ["speaker", "{{speaker_id}}"]
+        },
+        "description": "獲取指定說話者的詳細資訊"
+      }
+    }
+  ],
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8000",
+      "type": "string"
+    },
+    {
+      "key": "speaker_id",
+      "value": "123e4567-e89b-12d3-a456-426614174000",
+      "type": "string"
+    }
+  ]
+}

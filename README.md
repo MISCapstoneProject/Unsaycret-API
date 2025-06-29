@@ -108,21 +108,43 @@ Unsaycret-API/
 
 ## ⚡️ 快速啟動
 
-1. 安裝依賴
-   ```cmd
-   pip install -r requirements.txt
-   ```
+### 1. 安裝依賴
+```cmd
+pip install -r requirements.txt
+```
 
-2. 啟動 FastAPI 伺服器
-   ```cmd
-   uvicorn services.api:app --reload
-   ```
-   - API 文件（Swagger UI）：http://localhost:8000/docs
+### 2. 啟動 Weaviate 資料庫
+```cmd
+docker-compose up -d
+```
 
-3. 測試腳本
-   ```cmd
-   python examples/test_modules.py
-   ```
+### 3. 初始化資料結構
+```cmd
+python weaviate_study/create_collections.py
+```
+
+### 4. 啟動 FastAPI 伺服器
+
+您可以選擇以下任一方式啟動API服務：
+
+```cmd
+# 方法一：使用 main.py 啟動（推薦）
+python main.py
+
+# 方法二：使用 uvicorn 命令啟動
+uvicorn services.api:app --reload
+
+# 方法三：指定主機和端口
+uvicorn services.api:app --host 0.0.0.0 --port 8000 --reload
+```
+
+### 5. 訪問API服務
+
+啟動成功後，您可以通過以下方式訪問API：
+
+- **API 互動式文檔（Swagger UI）**：http://localhost:8000/docs
+- **API 文檔（ReDoc）**：http://localhost:8000/redoc
+- **API 基礎URL**：http://localhost:8000
 
 
 ## 🐳 Docker & Weaviate 部署指南 （2025‑06-16 更新）(必要步驟)
@@ -159,33 +181,19 @@ python weaviate_study/create_collections.py
   - 建議：8GB+ RAM，GPU 加速(CUDA 支援)以提高處理速度
 - **依賴套件**：請參閱 `requirements.txt`
 
-## API 使用範例
+## 🔌 API 使用指南
 
-### 1. 音檔轉錄 API
+### 完整API文檔
 
-```python
-import requests
+詳細的API使用說明、請求格式、回應範例請參考：
+**📖 [API_DOCUMENTATION.md](API_DOCUMENTATION.md)**
 
-# 發送音檔進行處理
-def transcribe_audio(audio_file_path):
-    url = "http://localhost:8000/transcribe"
-    
-    with open(audio_file_path, "rb") as f:
-        files = {"file": f}
-        response = requests.post(url, files=files)
-    
-    if response.status_code == 200:
-        result = response.json()
-        return result
-    else:
-        print(f"錯誤: {response.status_code}")
-        return None
+### 主要API端點
 
-# 使用範例
-result = transcribe_audio("path/to/your/audio.wav")
-print(result["pretty"])  # 人類可讀格式
-print(result["segments"])  # 機器可讀格式(含時間戳)
-```
+1. **語音轉錄**: `POST /transcribe` - 上傳音訊檔案進行語音分離、說話者識別與轉錄
+2. **說話者改名**: `POST /speaker/rename` - 更改說話者名稱
+3. **聲紋轉移**: `POST /speaker/transfer` - 合併錯誤識別的說話者
+4. **說話者查詢**: `GET /speaker/{speaker_id}` - 獲取說話者詳細資訊
 
 ## 其他說明
 
