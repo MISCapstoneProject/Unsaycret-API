@@ -5,8 +5,10 @@ import pathlib
 import tempfile
 import threading
 import time
+import queue
+from pathlib import Path
 from datetime import datetime as dt
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, Future
 
 import torch
 import torchaudio
@@ -183,6 +185,163 @@ def run_pipeline_dir(dir_path: str, max_workers: int = 3) -> str:
     return str(summary_path)
 
 
+def run_pipeline_stream(
+    chunk_secs: float = 6.0,
+    rate: int = 16000,
+    channels: int = 1,
+    frames_per_buffer: int = 1024,
+    max_workers: int = 2,
+    record_secs: float | None = None,
+    queue_out: "queue.Queue[dict] | None" = None,
+    stop_event: threading.Event | None = None
+):
+    """連續錄音，每 `chunk_secs` 秒切片，對**三位說話人**都做 SpeakerID + ASR。"""
+
+    total_start = time.perf_counter()
+    out_root = Path("stream_output") / dt.now().strftime("%Y%m%d_%H%M%S")
+    out_root.mkdir(parents=True, exist_ok=True)
+
+    # ── 1) 執行緒池 ────────────────────────────────────────────────
+    executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=max_workers)
+    futures: list[Future] = []
+
+    def process_chunk(raw_bytes: bytes, idx: int):
+        """對 chunk 內的所有 speaker wav 做 SpeakerID + ASR，回傳段層級 dict"""
+        t0 = idx * chunk_secs
+        t1 = t0 + chunk_secs
+
+        # 1) Tensor
+        waveform = (
+            torch.frombuffer(raw_bytes, dtype=torch.int16).float().view(1, -1) / 32768.0
+        )
+
+        # 2) 輸出資料夾
+        seg_dir = out_root / f"segment_{idx:03d}"
+        seg_dir.mkdir(parents=True, exist_ok=True)
+        mix_path = seg_dir / "mix.wav"
+        torchaudio.save(mix_path.as_posix(), waveform, rate)
+
+        # 3) 語者分離
+        sep.separate_and_save(waveform, seg_dir.as_posix(), segment_index=idx)
+        speaker_paths = sorted(seg_dir.glob("speaker*.wav"))
+        if not speaker_paths:
+            logger.warning("segment %d 無 speaker wav", idx)
+            return None
+
+        # 4) 每位 speaker 做辨識 + ASR
+        speaker_results = []
+        for sp_idx, wav_path in enumerate(speaker_paths, 1):
+            res = process_segment(str(wav_path), t0, t1)
+
+            # --- B. 跳過空白文字 / 低信心 ---
+            if not res["text"].strip() or res["confidence"] < 0.1:
+                continue
+
+
+            res["speaker_index"] = sp_idx
+            speaker_results.append(res)
+        
+        # --- C. 依 speaker name 去重複，只留最高信心 ---
+        unique = {}
+        for item in speaker_results:
+            name = item["speaker"]
+            if name not in unique or item["confidence"] > unique[name]["confidence"]:
+                unique[name] = item
+        speaker_results = list(unique.values())
+
+        seg_dict = {
+            "segment": idx,
+            "start": round(t0, 2),
+            "end": round(t1, 2),
+            "mix": mix_path.as_posix(),
+            "sources": [str(p) for p in speaker_paths],
+            "speakers": speaker_results,
+        }
+
+        with open(seg_dir / "output.json", "w", encoding="utf-8") as f:
+            json.dump(seg_dict, f, ensure_ascii=False, indent=2)
+
+        if queue_out is not None:   # 即時推送給 WS
+            queue_out.put(seg_dict)
+        return seg_dict
+
+    # ── 2) 錄音執行緒 ────────────────────────────────────────────
+    q: queue.Queue[tuple[bytes, int]] = queue.Queue(maxsize=max_workers * 2)
+    stop_flag = threading.Event()
+
+    def recorder():
+        pa = pyaudio.PyAudio()
+        stream = pa.open(
+            format=pyaudio.paInt16,
+            channels=channels,
+            rate=rate,
+            input=True,
+            frames_per_buffer=frames_per_buffer,
+        )
+        frames_needed = int(rate * chunk_secs)
+        buf = bytearray()
+        idx = 0
+        start_time = time.time()
+        try:
+            while not stop_flag.is_set():
+                if stop_event and stop_event.is_set():
+                    break
+                if record_secs is not None and time.time() - start_time >= record_secs:
+                    stop_flag.set(); break
+                buf.extend(stream.read(frames_per_buffer, exception_on_overflow=False))
+                if len(buf) // 2 >= frames_needed:
+                    raw = bytes(buf[: frames_needed * 2]); buf = buf[frames_needed * 2 :]
+                    q.put((raw, idx)); idx += 1
+        finally:
+            stream.stop_stream(); stream.close(); pa.terminate()
+
+    threading.Thread(target=recorder, daemon=True).start()
+    logger.info("🎙 開始錄音 (%s) ...", "Ctrl‑C" if record_secs is None else f"{record_secs}s")
+
+    try:
+        while True:
+            if stop_event and stop_event.is_set():
+                break
+            try:
+                raw, idx = q.get(timeout=0.1)
+            except queue.Empty:
+                # 如果錄音執行緒已停，且佇列也空，就離開迴圈
+                if stop_flag.is_set():
+                    break
+                continue
+            futures.append(executor.submit(process_chunk, raw, idx))
+    except KeyboardInterrupt:
+        logger.info("🛑 Ctrl‑C 偵測到使用者手動停止")
+    finally:
+        stop_flag.set()
+        executor.shutdown(wait=True)
+
+    # ── 3) 聚合結果 ────────────────────────────────────────────
+    bundle = [f.result() for f in futures if f.done() and f.result()]
+    bundle.sort(key=lambda x: x["start"])
+
+    # pretty version：把 speaker list 攤平成行
+    pretty_bundle: list[dict] = []
+    for seg in bundle:
+        for sp in seg["speakers"]:
+            pretty_bundle.append(make_pretty(sp))
+
+    # json_path = out_root / "output.json" # 全域 segment
+    # with open(json_path, "w", encoding="utf-8") as f:
+    #     json.dump({"segments": bundle}, f, ensure_ascii=False, indent=2)
+
+    logger.info(
+        "🚩 stream 結束，共 %d 段，總耗時 %.3fs → %s",
+        len(bundle), time.perf_counter() - total_start, out_root,
+    )
+    return bundle, pretty_bundle
+
+
+# Backwards compatible name
+run_pipeline_FILE = run_pipeline_file
+run_pipeline_DIR = run_pipeline_dir
+run_pipeline_STREAM = run_pipeline_stream
+
 
 def main():
     parser = argparse.ArgumentParser(description="Speech pipeline")
@@ -197,12 +356,18 @@ def main():
     p_dir.add_argument("--workers", type=int, default=4)
     p_dir.add_argument("--out", default="summary.tsv")
 
+    p_stream = sub.add_parser("stream", help="live stream from microphone")
+    p_stream.add_argument("--chunk", type=float, default=6.0, help="seconds per chunk")
+    p_stream.add_argument("--workers", type=int, default=2)
+
     args = parser.parse_args()
 
     if args.mode == "file":
         run_pipeline_file(args.path, args.workers)
     elif args.mode == "dir":
         run_pipeline_dir(args.path, args.workers, args.out)
+    elif args.mode == "stream":
+        run_pipeline_stream(chunk_secs=args.chunk, max_workers=args.workers)
 
 if __name__ == "__main__":
     main()
