@@ -17,12 +17,14 @@ logs/
 *.wav
 ct2_models/
 work_output/
+stream_output/
 pretrained_models/
 embeddingFiles/
 models
 
 # 虛擬環境
 venv
+unsaycret_venv
 .venv
 *.pyc
 
