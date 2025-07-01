@@ -161,7 +161,7 @@ def valid_uuid(value: str) -> bool:
     return bool(UUID_PATTERN.match(value))
 
 # 默認常數
-DEFAULT_SPEAKER_NAME = "未命名說話者"
+DEFAULT_SPEAKER_NAME = "未命名語者"
 
 # ---------------------------------------------------------------------------
 # 資料庫服務類 (單例模式)
@@ -233,17 +233,19 @@ class DatabaseService:
             )
             speakers = []
             for obj in results.objects:
+                voiceprint_ids = obj.properties.get("voiceprint_ids", [])
                 speakers.append({
                     "uuid": str(obj.uuid),
                     "name": obj.properties.get("name", "未命名"),
                     "create_time": obj.properties.get("create_time", "未知"),
                     "last_active_time": obj.properties.get("last_active_time", "未知"),
-                    "voiceprint_count": len(obj.properties.get("voiceprint_ids", [])),
+                    "voiceprint_count": len(voiceprint_ids),
+                    "voiceprint_ids": voiceprint_ids,
                 })
             speakers.sort(key=lambda s: s["last_active_time"], reverse=True)
             return speakers
         except Exception as exc:
-            logger.error(f"列出說話者時發生錯誤: {exc}")
+            logger.error(f"列出語者時發生錯誤: {exc}")
             return []
     
     def get_speaker(self, speaker_id: str) -> Optional[Any]:
@@ -266,7 +268,7 @@ class DatabaseService:
                 .query.fetch_object_by_id(uuid=speaker_id)
             )
         except Exception as exc:
-            logger.error(f"獲取說話者詳細資訊時發生錯誤: {exc}")
+            logger.error(f"獲取語者詳細資訊時發生錯誤: {exc}")
             return None
     
     def create_speaker(self, speaker_name: str = DEFAULT_SPEAKER_NAME) -> str:
@@ -274,19 +276,19 @@ class DatabaseService:
         創建新的語者。
         
         Args:
-            speaker_name: 語者名稱，默認為「未命名說話者」
+            speaker_name: 語者名稱，默認為「未命名語者」
             
         Returns:
             str: 新建立的語者 ID，若建立失敗則返回空字符串
         """
         try:
-            # 創建新的說話者
+            # 創建新的語者
             speaker_collection = self.client.collections.get(self.SPEAKER_CLASS)
             speaker_id = str(uuid.uuid4())
             
             # 如果是默認名稱，生成唯一的名稱 (類似 n1, n2, ...)
             if speaker_name == DEFAULT_SPEAKER_NAME:
-                # 獲取所有說話者
+                # 獲取所有語者
                 results = speaker_collection.query.fetch_objects(
                     limit=100,
                     return_properties=["name"],
@@ -305,7 +307,7 @@ class DatabaseService:
                 next_number = max(numbers) + 1 if numbers else 1
                 speaker_name = f"n{next_number}"
             
-            # 創建說話者
+            # 創建語者
             speaker_collection.data.insert(
                 properties={
                     "name": speaker_name,
@@ -316,11 +318,11 @@ class DatabaseService:
                 uuid=speaker_id
             )
             
-            logger.info(f"已建立新說話者 {speaker_name} (ID: {speaker_id})")
+            logger.info(f"已建立新語者 {speaker_name} (ID: {speaker_id})")
             return speaker_id
             
         except Exception as e:
-            logger.error(f"創建新說話者時發生錯誤: {e}")
+            logger.error(f"創建新語者時發生錯誤: {e}")
             return ""
     
     def update_speaker_name(self, speaker_id: str, new_name: str) -> bool:
@@ -362,7 +364,7 @@ class DatabaseService:
             logger.info(f"已更新語者 {speaker_id} 的名稱為 {new_name}")
             return True
         except Exception as exc:
-            logger.error(f"更改說話者名稱時發生錯誤: {exc}")
+            logger.error(f"更改語者名稱時發生錯誤: {exc}")
             return False
     
     def update_speaker_last_active(self, speaker_id: str, timestamp: Optional[datetime] = None) -> bool:
@@ -439,7 +441,7 @@ class DatabaseService:
             logger.info(f"已刪除語者 {speaker_name} (ID: {speaker_id}) 及其 {deleted_count} 個聲紋")
             return True
         except Exception as exc:
-            logger.error(f"刪除說話者時發生錯誤: {exc}")
+            logger.error(f"刪除語者時發生錯誤: {exc}")
             return False
     
     def add_voiceprint_to_speaker(self, speaker_id: str, voiceprint_id: str) -> bool:
@@ -523,7 +525,7 @@ class DatabaseService:
             dest_obj = collection.query.fetch_object_by_id(uuid=dest_id)
             
             if not src_obj or not dest_obj:
-                logger.warning("來源或目標說話者不存在。")
+                logger.warning("來源或目標語者不存在。")
                 return False
             
             src_vps = set(src_obj.properties.get("voiceprint_ids", []))
@@ -532,7 +534,7 @@ class DatabaseService:
             dest_vps.update(move_set)   #聯集，把 move_set 中的元素加入到 dest_vps 中
             src_vps.difference_update(move_set) #差集，把 move_set 中的元素從 src_vps 中刪除
             
-            # 更新來源與目標說話者的聲紋
+            # 更新來源與目標語者的聲紋
             collection.data.update(uuid=source_id, properties={"voiceprint_ids": list(src_vps)})
             collection.data.update(uuid=dest_id, properties={"voiceprint_ids": list(dest_vps)})
             
@@ -549,13 +551,13 @@ class DatabaseService:
                 except Exception as e:
                     logger.error(f"轉移聲紋 {vp_id} 時發生錯誤: {e}")
             
-            # 若來源說話者已無聲紋，自動刪除
+            # 若來源語者已無聲紋，自動刪除
             if not src_vps:
                 try:
                     collection.data.delete_by_id(uuid=source_id)
-                    logger.info(f"來源說話者 {source_id} 已無聲紋，自動刪除。")
+                    logger.info(f"來源語者 {source_id} 已無聲紋，自動刪除。")
                 except Exception as del_exc:
-                    logger.error(f"自動刪除來源說話者時發生錯誤: {del_exc}")
+                    logger.error(f"自動刪除來源語者時發生錯誤: {del_exc}")
                     
             logger.info(f"已成功將 {len(move_set)} 個聲紋從語者 {source_id} 轉移到語者 {dest_id}")
             return True
@@ -929,7 +931,7 @@ class DatabaseService:
             limit: 返回結果的數量限制
             
         Returns:
-            Tuple: (最佳匹配ID, 最佳匹配說話者名稱, 最小距離, 所有距離列表)
+            Tuple: (最佳匹配ID, 最佳匹配語者名稱, 最小距離, 所有距離列表)
         """
         try:
             voiceprint_collection = self.client.collections.get(self.VOICEPRINT_CLASS)
@@ -964,7 +966,7 @@ class DatabaseService:
                 speaker_name = obj.properties.get("speaker_name")
                 update_count = obj.properties.get("update_count")
                 
-                logger.debug(f"比對 - 說話者: {speaker_name}, "
+                logger.debug(f"比對 - 語者: {speaker_name}, "
                           f"更新次數: {update_count}, 餘弦距離: {distance:.4f}")
                 
                 # 保存距離資訊
