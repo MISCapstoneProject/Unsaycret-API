@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 from utils.logger import get_logger
 import torch
 import torchaudio
@@ -73,3 +74,32 @@ class WhisperASR:
         torch.cuda.empty_cache()
 
         return full_txt, avg_conf, word_info
+
+    def transcribe_dir(self, input_dir: str, output_id: str) -> str:
+        """Transcribe all wav files in a directory and save to JSON.
+
+        Args:
+            input_dir: Directory containing wav files.
+            output_id: Identifier for the output folder under ``data``.
+
+        Returns:
+            Path to the generated JSON file.
+        """
+        dir_path = Path(input_dir)
+        out_dir = Path("data") / output_id
+        out_dir.mkdir(parents=True, exist_ok=True)
+        out_list = []
+        for wav in sorted(dir_path.glob("*.wav")):
+            text, conf, words = self.transcribe(str(wav))
+            out_list.append(
+                {
+                    "file": wav.name,
+                    "text": text,
+                    "confidence": conf,
+                    "words": words,
+                }
+            )
+        out_path = out_dir / "asr.json"
+        with open(out_path, "w", encoding="utf-8") as f:
+            json.dump(out_list, f, ensure_ascii=False, indent=2)
+        return str(out_path)
