@@ -111,6 +111,43 @@ def run_pipeline_file(raw_wav: str, max_workers: int = 3):
 run_pipeline = run_pipeline_file
 
 
+def run_pipeline_dir(dir_path: str, max_workers: int = 3) -> str:
+    """Run pipeline on all audio files in a directory.
+
+    Parameters
+    ----------
+    dir_path: str
+        Directory containing audio files.
+    max_workers: int
+        Number of workers used for each file.
+
+    Returns
+    -------
+    str
+        Path to the summary TSV file aggregating results of all files.
+    """
+    timestamp = dt.now().strftime("%Y%m%d_%H%M%S")
+    out_dir = pathlib.Path("work_output") / f"batch_{timestamp}"
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_path = out_dir / "summary.tsv"
+    with open(summary_path, "w", encoding="utf-8") as summary:
+        summary.write("file\tstart\tend\tspeaker\tdistance\tconfidence\ttext\n")
+        for audio in sorted(pathlib.Path(dir_path).glob("*")):
+            if audio.suffix.lower() not in {".wav", ".mp3", ".flac", ".ogg"}:
+                continue
+            logger.info(f"🔄 Batch process {audio.name}")
+            segments, _ = run_pipeline_file(str(audio), max_workers)
+            for seg in segments:
+                text = str(seg["text"]).replace("\t", " ")
+                summary.write(
+                    f"{audio.name}\t{seg['start']}\t{seg['end']}\t{seg['speaker']}\t{seg['distance']}\t{seg['confidence']}\t{text}\n"
+                )
+
+    logger.info(f"✅ Directory pipeline finished → {summary_path}")
+    return str(summary_path)
+
+
 def main():
     parser = argparse.ArgumentParser(description="Speech pipeline")
     sub = parser.add_subparsers(dest="mode", required=True)
