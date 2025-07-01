@@ -1,5 +1,3 @@
-"""Orchestrate separation, speaker ID and ASR."""
-
 import argparse
 import json
 import os
@@ -7,8 +5,6 @@ import pathlib
 import tempfile
 import threading
 import time
-import uuid
-import math
 from datetime import datetime as dt
 from concurrent.futures import ThreadPoolExecutor
 
@@ -28,7 +24,6 @@ logger.info("🖥 GPU available: %s", torch.cuda.is_available())
 if torch.cuda.is_available():
     logger.info("   Device: %s", torch.cuda.get_device_name(0))
 
-
 # ---------- 1. 自動偵測 GPU ----------
 use_gpu = torch.cuda.is_available()
 logger.info(f"🚀 使用設備: {'cuda' if use_gpu else 'cpu'}")
@@ -37,37 +32,14 @@ sep = AudioSeparator()
 spk = SpeakerIdentifier()
 asr = WhisperASR(model_name="medium", gpu=use_gpu)
 
-
-def is_effective_audio(wav_path: str,
-                       rms_db_threshold: float = -35.0,
-                       voiced_ratio_threshold: float = 0.05) -> bool:
-    """Check if wav contains valid speech based on RMS and voiced ratio."""
-    waveform, sr = torchaudio.load(wav_path)
-    rms = waveform.pow(2).mean().sqrt().item()
-    rms_db = 20 * math.log10(rms + 1e-12)
-
-    amp_thresh = 10 ** (rms_db_threshold / 20)
-    voiced_ratio = (waveform.abs() > amp_thresh).float().mean().item()
-
-    logger.debug(
-        f"檢查 {os.path.basename(wav_path)}: RMS {rms_db:.1f} dBFS, voiced {voiced_ratio:.2%}"
-    )
-
-    return rms_db >= rms_db_threshold and voiced_ratio >= voiced_ratio_threshold
-
-
 def process_segment(seg_path: str, t0: float, t1: float) -> dict:
     """Process a single separated segment."""
     logger.info(
         f"🔧 執行緒 {threading.get_ident()} 處理 ({t0:.2f}-{t1:.2f}) → {os.path.basename(seg_path)}"
     )
-
-    if not is_effective_audio(seg_path):
-        logger.info(f"⏭ 跳過無效音檔: {os.path.basename(seg_path)}")
-        return None
-
+    
     start = time.perf_counter()
-
+    
     t_spk0 = time.perf_counter()
     speaker_id, name, dist = spk.process_audio_file(seg_path)
     t_spk1 = time.perf_counter()
@@ -112,15 +84,18 @@ def run_pipeline_file(raw_wav: str, max_workers: int = 3):
     out_dir = pathlib.Path("work_output") / dt.now().strftime("%Y%m%d_%H%M%S")
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # 1) 分離
     sep_start = time.perf_counter()
     segments = sep.separate_and_save(waveform, str(out_dir), segment_index=0)
     sep_end = time.perf_counter()
     logger.info(f"⏱ 分離耗時 {sep_end - sep_start:.3f}s, 共 {len(segments)} 段")
-    
+
+    # 2) 多執行緒處理所有段
     logger.info(f"🔄 處理 {len(segments)} 段... (max_workers={max_workers})")
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         bundle = [r for r in ex.map(lambda s: process_segment(*s), segments) if r]
 
+    # 3) 輸出結果
     bundle.sort(key=lambda x: x["start"])
     pretty_bundle = [make_pretty(s) for s in bundle]
 
@@ -131,46 +106,6 @@ def run_pipeline_file(raw_wav: str, max_workers: int = 3):
     total_end = time.perf_counter()
     logger.info(f"✅ Pipeline finished → {json_path} (總耗時 {total_end - total_start:.3f}s)")
     return bundle, pretty_bundle
-
-
-# def record_to_wav(path: str, duration: int = 5, rate: int = 44100) -> None:
-#     """Record microphone input for a fixed duration and save to wav."""
-#     pa = pyaudio.PyAudio()
-#     stream = pa.open(
-#         format=pyaudio.paInt16,
-#         channels=1,
-#         rate=rate,
-#         input=True,
-#         frames_per_buffer=1024,
-#     )
-
-#     frames = []
-#     for _ in range(int(rate / 1024 * duration)):
-#         frames.append(stream.read(1024))
-
-#     stream.stop_stream()
-#     stream.close()
-#     pa.terminate()
-
-#     wf = wave.open(path, "wb")
-#     wf.setnchannels(1)
-#     wf.setsampwidth(pa.get_sample_size(pyaudio.paInt16))
-#     wf.setframerate(rate)
-#     wf.writeframes(b"".join(frames))
-#     wf.close()
-
-
-# def run_pipeline_record(duration: int = 5, max_workers: int = 4):
-#     """Record audio then run the standard pipeline."""
-#     with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp:
-#         record_to_wav(tmp.name, duration)
-#         tmp_path = tmp.name
-
-#     try:
-#         return run_pipeline_file(tmp_path, max_workers)
-#     finally:
-#         os.remove(tmp_path)
-
 
 # Backwards compatible name
 run_pipeline = run_pipeline_file
@@ -184,18 +119,10 @@ def main():
     p_file.add_argument("path")
     p_file.add_argument("--workers", type=int, default=4)
 
-    # p_rec = sub.add_parser("record", help="record from microphone")
-    # p_rec.add_argument("--duration", type=int, default=5)
-    # p_rec.add_argument("--workers", type=int, default=4)
-
     args = parser.parse_args()
 
     if args.mode == "file":
         run_pipeline_file(args.path, args.workers)
-    # else:
-    #     run_pipeline_record(args.duration, args.workers)
-
 
 if __name__ == "__main__":
     main()
-
