@@ -423,63 +423,54 @@ class AudioSeparator:
             return mixed_output_file
 
     def separate_and_save(self, audio_tensor, output_dir, segment_index):
-        """分離並儲存音訊"""
+        """分離並儲存音訊，並回傳 (path, start, end) 列表。"""
         try:
-            # —— 新增：初始化累計時間戳
+            # 初始化累計時間戳
             current_t0 = getattr(self, "_current_t0", 0.0)
             results = []   # 用來收 (path, start, end)
 
             with torch.no_grad():
                 separated = self.model.separate_batch(audio_tensor)
                 enhanced_separated = self.enhance_separation(separated)
-                
+
+                # 計算此 segment 的時長 (秒)
+                duration = audio_tensor.shape[-1] / TARGET_RATE
                 timestamp = datetime.now().strftime('%Y%m%d-%H_%M_%S')
+
                 for i in range(enhanced_separated.shape[2]):
                     speaker_audio = enhanced_separated[:, :, i].cpu()
-                    
-                    # 正規化音量
                     max_val = torch.max(torch.abs(speaker_audio))
                     if max_val > 0:
                         speaker_audio = speaker_audio / max_val * 0.9
-                    
+
                     final_audio = speaker_audio[0].numpy()
                     final_tensor = torch.from_numpy(final_audio).unsqueeze(0)
-                    
+
                     output_file = os.path.join(
                         output_dir,
                         f"speaker{i+1}_{timestamp}_{segment_index}.wav"
                     )
-                    
                     torchaudio.save(
                         output_file,
                         final_tensor,
                         TARGET_RATE
                     )
-                    
-                    # —— 新增：計算這段的長度（秒）
-                    duration = final_audio.shape[-1] / TARGET_RATE
 
-                    # —— 新增：把 (路徑, start, end) 收到 results
+                    # 收集 segment 在原始混音檔的 start/end
                     results.append((output_file,
                                     current_t0,
                                     current_t0 + duration))
-
-                    # —— 新增：更新累計時間
-                    current_t0 += duration
-
-                    # 如果你還想保留舊有的 output_files
                     self.output_files.append(output_file)
-                
-            logger.info(f"片段 {segment_index} 處理完成")
 
-            # —— 新增：存回屬性，下次呼叫會接續
+            # 所有 speaker 處理完畢，推進時間戳
+            current_t0 += duration
             self._current_t0 = current_t0
-
-            # —— 新增：把結果回傳
+            logger.info(f"片段 {segment_index} 處理完成")
             return results
 
         except Exception as e:
             logger.error(f"處理片段 {segment_index} 時發生錯誤：{e}")
+
 
     def separate_and_identify(self, audio_tensor: torch.Tensor, output_dir: str, segment_index: int) -> None:
         """

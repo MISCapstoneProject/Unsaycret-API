@@ -37,20 +37,28 @@ def process_segment(seg_path: str, t0: float, t1: float) -> dict:
     logger.info(
         f"🔧 執行緒 {threading.get_ident()} 處理 ({t0:.2f}-{t1:.2f}) → {os.path.basename(seg_path)}"
     )
-    
     start = time.perf_counter()
-    
+
+    # SpeakerID
     t_spk0 = time.perf_counter()
     speaker_id, name, dist = spk.process_audio_file(seg_path)
     t_spk1 = time.perf_counter()
     spk_time = t_spk1 - t_spk0
     logger.info(f"⏱ SpeakerID 耗時 {spk_time:.3f}s")
 
+    # ASR
     t_asr0 = time.perf_counter()
     text, conf, words = asr.transcribe(seg_path)
     t_asr1 = time.perf_counter()
     asr_time = t_asr1 - t_asr0
     logger.info(f"⏱ ASR 耗時 {asr_time:.3f}s")
+
+    # 調整每個詞的時間戳，使其對齊原始混音檔軸
+    adjusted_words = []
+    for w in words:
+        w['start'] = w['start'] + t0
+        w['end']   = w['end'] + t0
+        adjusted_words.append(w)
 
     total = time.perf_counter() - start
     logger.info(f"⏱ segment 總耗時 {total:.3f}s")
@@ -62,7 +70,7 @@ def process_segment(seg_path: str, t0: float, t1: float) -> dict:
         "distance": round(float(dist), 3),
         "text": text,
         "confidence": round(conf, 2),
-        "words": words,
+        "words": adjusted_words,
         "spk_time": spk_time,
         "asr_time": asr_time,
     }
@@ -126,50 +134,44 @@ def run_pipeline_file(raw_wav: str, max_workers: int = 3):
 
 
 def run_pipeline_dir(dir_path: str, max_workers: int = 3) -> str:
-    """
-    Run pipeline on all audio files in a directory,
-    then save a TSV summary with both file-level stats and per-segment details.
+    """一次處理資料夾內所有音檔，並將「檔案層級統計」+「段落層級詳情」寫入同一份 TSV。
 
-    Parameters
-    ----------
-    dir_path: str
-        Directory containing audio files (.wav, .mp3, .flac, .ogg).
-    max_workers: int
-        Number of parallel workers per file.
-
-    Returns
-    -------
-    str
-        Path to the generated summary TSV file.
+    只呼叫 `run_pipeline_file()` 一次就同時拿到 `stats` 與 `segments`，避免重複運算。
+    回傳值為生成之 `summary.tsv` 的路徑（字串）。
     """
-    # 準備輸出目錄
+
+    # === 準備輸出目錄 ===
     timestamp = dt.now().strftime("%Y%m%d_%H%M%S")
     out_dir = pathlib.Path("work_output") / f"batch_{timestamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
-
     summary_path = out_dir / "summary.tsv"
-    # 收集所有支援格式的音檔
-    audio_paths = sorted(pathlib.Path(dir_path).rglob("*"))
-    audio_files = [f for f in audio_paths if f.suffix.lower() in {".wav", ".mp3", ".flac", ".ogg"}]
-    total_files = len(audio_files)
 
+    # === 收集所有支援格式之音檔（含子目錄） ===
+    audio_files = [f for f in pathlib.Path(dir_path).rglob("*") if f.suffix.lower() in {".wav", ".mp3", ".flac", ".ogg"}]
+    if not audio_files:
+        logger.warning("⚠️  目錄內未找到支援格式音檔")
+        return str(summary_path)
+
+    # === 一次處理並暫存結果 ===
+    file_results = []  # [(檔案索引, Path, stats, segments)]
+    for idx, audio in enumerate(sorted(audio_files), start=1):
+        logger.info(f"===== 處理檔案 {audio.name} ({idx}/{len(audio_files)}) =====")
+        segments, pretty, stats = run_pipeline_file(str(audio), max_workers)
+        file_results.append((idx, audio, stats, segments))
+
+    # === 寫入 TSV ===
     with open(summary_path, "w", encoding="utf-8") as f:
-        # 1) 檔案層級統計
+        # -- 檔案層級統計 --
         f.write("編號\t檔名\t音檔長度(s)\t總耗時(s)\t分離耗時(s)\tSpeakerID耗時(s)\tASR耗時(s)\n")
-        for idx, audio in enumerate(audio_files, start=1):
-            logger.info(f"===== 處理檔案 {audio.name} ({idx}/{total_files}) =====")
-            bundle, pretty, stats = run_pipeline_file(str(audio), max_workers)
+        for idx, audio, stats, _ in file_results:
             f.write(
-                f"{idx}\t{audio.name}\t"
-                f"{stats['length']:.2f}\t{stats['total']:.2f}\t{stats['separate']:.2f}\t"
-                f"{stats['speaker']:.2f}\t{stats['asr']:.2f}\n"
+                f"{idx}\t{audio.name}\t{stats['length']:.2f}\t{stats['total']:.2f}\t"
+                f"{stats['separate']:.2f}\t{stats['speaker']:.2f}\t{stats['asr']:.2f}\n"
             )
-
-        # 2) 段落層級詳情
+        # 空行分段
         f.write("\n檔案\t開始(s)\t結束(s)\t說話者\tdistance\tconfidence\t文字\n")
-        for audio in audio_files:
-            # 再次呼叫以取得分段內容
-            segments, pretty, stats = run_pipeline_file(str(audio), max_workers)
+        # -- 段落層級詳情 --
+        for _, audio, _, segments in file_results:
             for seg in segments:
                 text = str(seg.get("text", "")).replace("\t", " ")
                 f.write(
@@ -179,6 +181,7 @@ def run_pipeline_dir(dir_path: str, max_workers: int = 3) -> str:
 
     logger.info(f"✅ Directory pipeline 完成 → {summary_path}")
     return str(summary_path)
+
 
 
 def main():
