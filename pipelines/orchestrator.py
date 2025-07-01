@@ -125,66 +125,59 @@ def run_pipeline_file(raw_wav: str, max_workers: int = 3):
     return bundle, pretty_bundle, stats
 
 
-def run_pipeline_dir(directory: str, max_workers: int = 3, out_path: str = "summary.tsv"):
-    """Run pipeline on every wav file in a directory and save summary."""
-    dir_path = pathlib.Path(directory)
-    wav_files = sorted(dir_path.glob("*.wav"))
-    results = []
-    for idx, wav in enumerate(wav_files, start=1):
-        logger.info(f"===== Processing {wav.name} ({idx}/{len(wav_files)}) =====")
-        _, _, stats = run_pipeline_file(str(wav), max_workers)
-        results.append((idx, stats))
-
-    if results:
-        with open(out_path, "w", encoding="utf-8") as f:
-            f.write("編號\t音檔長度(s)\t總耗時(s)\t分離耗時(s)\tSpeakerID耗時(s)\tASR耗時(s)\n")
-            for idx, st in results:
-                f.write(
-                    f"{idx}\t{st['length']:.2f}\t{st['total']:.2f}\t{st['separate']:.2f}\t{st['speaker']:.2f}\t{st['asr']:.2f}\n"
-                )
-        logger.info(f"📄 Summary saved to {out_path}")
-    else:
-        logger.warning("No wav files found in directory")
-    return results
-
-# Backwards compatible name
-run_pipeline = run_pipeline_file
-
-
 def run_pipeline_dir(dir_path: str, max_workers: int = 3) -> str:
-    """Run pipeline on all audio files in a directory.
+    """
+    Run pipeline on all audio files in a directory,
+    then save a TSV summary with both file-level stats and per-segment details.
 
     Parameters
     ----------
     dir_path: str
-        Directory containing audio files.
+        Directory containing audio files (.wav, .mp3, .flac, .ogg).
     max_workers: int
-        Number of workers used for each file.
+        Number of parallel workers per file.
 
     Returns
     -------
     str
-        Path to the summary TSV file aggregating results of all files.
+        Path to the generated summary TSV file.
     """
+    # 準備輸出目錄
     timestamp = dt.now().strftime("%Y%m%d_%H%M%S")
     out_dir = pathlib.Path("work_output") / f"batch_{timestamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
 
     summary_path = out_dir / "summary.tsv"
-    with open(summary_path, "w", encoding="utf-8") as summary:
-        summary.write("file\tstart\tend\tspeaker\tdistance\tconfidence\ttext\n")
-        for audio in sorted(pathlib.Path(dir_path).glob("*")):
-            if audio.suffix.lower() not in {".wav", ".mp3", ".flac", ".ogg"}:
-                continue
-            logger.info(f"🔄 Batch process {audio.name}")
-            segments, _ = run_pipeline_file(str(audio), max_workers)
+    # 收集所有支援格式的音檔
+    audio_paths = sorted(pathlib.Path(dir_path).rglob("*"))
+    audio_files = [f for f in audio_paths if f.suffix.lower() in {".wav", ".mp3", ".flac", ".ogg"}]
+    total_files = len(audio_files)
+
+    with open(summary_path, "w", encoding="utf-8") as f:
+        # 1) 檔案層級統計
+        f.write("編號\t檔名\t音檔長度(s)\t總耗時(s)\t分離耗時(s)\tSpeakerID耗時(s)\tASR耗時(s)\n")
+        for idx, audio in enumerate(audio_files, start=1):
+            logger.info(f"===== 處理檔案 {audio.name} ({idx}/{total_files}) =====")
+            bundle, pretty, stats = run_pipeline_file(str(audio), max_workers)
+            f.write(
+                f"{idx}\t{audio.name}\t"
+                f"{stats['length']:.2f}\t{stats['total']:.2f}\t{stats['separate']:.2f}\t"
+                f"{stats['speaker']:.2f}\t{stats['asr']:.2f}\n"
+            )
+
+        # 2) 段落層級詳情
+        f.write("\n檔案\t開始(s)\t結束(s)\t說話者\tdistance\tconfidence\t文字\n")
+        for audio in audio_files:
+            # 再次呼叫以取得分段內容
+            segments, pretty, stats = run_pipeline_file(str(audio), max_workers)
             for seg in segments:
-                text = str(seg["text"]).replace("\t", " ")
-                summary.write(
-                    f"{audio.name}\t{seg['start']}\t{seg['end']}\t{seg['speaker']}\t{seg['distance']}\t{seg['confidence']}\t{text}\n"
+                text = str(seg.get("text", "")).replace("\t", " ")
+                f.write(
+                    f"{audio.name}\t{seg['start']:.3f}\t{seg['end']:.3f}\t"
+                    f"{seg['speaker']}\t{seg['distance']:.4f}\t{seg['confidence']:.4f}\t{text}\n"
                 )
 
-    logger.info(f"✅ Directory pipeline finished → {summary_path}")
+    logger.info(f"✅ Directory pipeline 完成 → {summary_path}")
     return str(summary_path)
 
 
