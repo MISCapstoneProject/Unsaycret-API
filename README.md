@@ -190,10 +190,10 @@ python weaviate_study/create_collections.py
 
 ### 主要API端點
 
-1. **語音轉錄**: `POST /transcribe` - 上傳音訊檔案進行語音分離、說話者識別與轉錄
-2. **說話者改名**: `POST /speaker/rename` - 更改說話者名稱
-3. **聲紋轉移**: `POST /speaker/transfer` - 合併錯誤識別的說話者
-4. **說話者查詢**: `GET /speaker/{speaker_id}` - 獲取說話者詳細資訊
+1. **語音轉錄**: `POST /transcribe` - 上傳音訊檔案進行語音分離、語者識別與轉錄
+2. **語者改名**: `POST /speaker/rename` - 更改語者名稱
+3. **聲紋轉移**: `POST /speaker/transfer` - 合併錯誤識別的語者
+4. **語者查詢**: `GET /speaker/{speaker_id}` - 獲取語者詳細資訊
 
 ## 其他說明
 

@@ -7,7 +7,7 @@ Unsaycret API 主要服務入口
 """
 from fastapi import FastAPI, UploadFile, File, HTTPException
 from pydantic import BaseModel
-from typing import Optional
+from typing import Optional, List
 from pipelines.orchestrator import run_pipeline
 from services.handlers.speaker_handler import SpeakerHandler
 import tempfile, shutil, os
@@ -19,7 +19,7 @@ speaker_handler = SpeakerHandler()
 
 # Pydantic 模型定義
 class SpeakerRenameRequest(BaseModel):
-    """說話者改名請求模型"""
+    """語者改名請求模型"""
     speaker_id: str
     current_name: str
     new_name: str
@@ -30,6 +30,14 @@ class SpeakerTransferRequest(BaseModel):
     source_speaker_name: str
     target_speaker_id: str
     target_speaker_name: str
+
+class SpeakerInfo(BaseModel):
+    speaker_id: str
+    name: str
+    first_audio_id: Optional[str] = None
+    created_at: Optional[str] = None
+    updated_at: Optional[str] = None
+    voiceprint_ids: Optional[List[str]] = None
 
 class ApiResponse(BaseModel):
     """統一API回應模型"""
@@ -59,7 +67,7 @@ async def transcribe(file: UploadFile = File(...)):
 @app.post("/speaker/rename", response_model=ApiResponse)
 async def rename_speaker(request: SpeakerRenameRequest):
     """
-    更改說話者名稱的API端點
+    更改語者名稱的API端點
     
     Args:
         request: 包含speaker_id、current_name和new_name的請求
@@ -77,10 +85,10 @@ async def rename_speaker(request: SpeakerRenameRequest):
 @app.post("/speaker/transfer", response_model=ApiResponse)
 async def transfer_voiceprints(request: SpeakerTransferRequest):
     """
-    將聲紋從來源說話者轉移到目標說話者的API端點
+    將聲紋從來源語者轉移到目標語者的API端點
     
     Args:
-        request: 包含來源和目標說話者資訊的請求
+        request: 包含來源和目標語者資訊的請求
         
     Returns:
         ApiResponse: 包含操作結果的回應
@@ -96,6 +104,21 @@ async def transfer_voiceprints(request: SpeakerTransferRequest):
 @app.get("/speaker/{speaker_id}")
 async def get_speaker_info(speaker_id: str):
     """
-    獲取說話者資訊的輔助API（用於前端驗證）
+    獲取語者資訊的輔助API（用於前端驗證）
     """
     return speaker_handler.get_speaker_info(speaker_id)
+
+@app.get("/speakers", response_model=List[SpeakerInfo])
+async def list_speakers():
+    """
+    列出所有語者與完整資訊
+    """
+    return speaker_handler.list_all_speakers()
+
+@app.delete("/speaker/{speaker_id}", response_model=ApiResponse)
+async def delete_speaker(speaker_id: str):
+    """
+    刪除語者及其底下的所有 voiceprints
+    """
+    result = speaker_handler.delete_speaker(speaker_id)
+    return ApiResponse(**result)
