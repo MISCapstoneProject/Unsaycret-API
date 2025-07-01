@@ -99,48 +99,48 @@ class SpeakerManager:
         self._db = DatabaseService()
         
     def list_all_speakers(self) -> List[Dict[str, Any]]:
-        """列出所有說話者。"""
+        """列出所有語者。"""
         try:
             speakers = self._db.list_all_speakers()
             # 使用 DatabaseService 的接口只需排序後返回即可
             speakers.sort(key=lambda s: s.get("last_active_time", ""), reverse=True)
             return speakers
         except Exception as exc:
-            logger.error(f"列出說話者時發生錯誤: {exc}")
+            logger.error(f"列出語者時發生錯誤: {exc}")
             return []
             
     def get_speaker(self, speaker_uuid: str) -> Optional[Any]:
-        """取得單一說話者物件。"""
+        """取得單一語者物件。"""
         try:
             return self._db.get_speaker(speaker_uuid)
         except Exception as exc:
-            logger.error(f"獲取說話者詳細資訊時發生錯誤: {exc}")
+            logger.error(f"獲取語者詳細資訊時發生錯誤: {exc}")
             return None
 
     def update_speaker_name(self, speaker_uuid: str, new_name: str) -> bool:
         """
-        更改說話者名稱，並同步更新所有該語者底下聲紋的 speaker_name。
+        更改語者名稱，並同步更新所有該語者底下聲紋的 speaker_name。
         """
         try:
             return self._db.update_speaker_name(speaker_uuid, new_name)
         except Exception as exc:
-            logger.error(f"更改說話者名稱時發生錯誤: {exc}")
+            logger.error(f"更改語者名稱時發生錯誤: {exc}")
             return False
 
     def delete_speaker(self, speaker_uuid: str) -> bool:
-        """刪除說話者。"""
+        """刪除語者。"""
         try:
             return self._db.delete_speaker(speaker_uuid)
         except Exception as exc:
-            logger.error(f"刪除說話者時發生錯誤: {exc}")
+            logger.error(f"刪除語者時發生錯誤: {exc}")
             return False
 
     def transfer_voiceprints(
         self, source_uuid: str, dest_uuid: str, voiceprint_ids: Optional[List[str]] = None
     ) -> bool:
         """
-        將來源說話者的聲紋轉移到目標說話者，並同步更新聲紋的 speaker_id 與 speaker_name。
-        若來源說話者已無聲紋，則自動刪除該說話者。
+        將來源語者的聲紋轉移到目標語者，並同步更新聲紋的 speaker_id 與 speaker_name。
+        若來源語者已無聲紋，則自動刪除該語者。
         """
         try:
             return self._db.transfer_voiceprints(source_uuid, dest_uuid, voiceprint_ids)
@@ -238,11 +238,11 @@ class SpeakerManagerCLI:
 ============================================================
                        語者與聲紋管理系統
 ============================================================
-1. 列出所有說話者
-2. 檢視說話者詳細資訊
-3. 更改說話者名稱
-4. 轉移聲紋到其他說話者
-5. 刪除說話者
+1. 列出所有語者
+2. 檢視語者詳細資訊
+3. 更改語者名稱
+4. 轉移聲紋到其他語者
+5. 刪除語者
 6. 資料庫清理與修復
 0. 離開
 ------------------------------------------------------------
@@ -273,23 +273,23 @@ class SpeakerManagerCLI:
     def _action_list(self) -> None:
         speakers = self.manager.list_all_speakers()
         if not speakers:
-            print("目前沒有說話者紀錄。")
+            print("目前沒有語者紀錄。")
             return
         self.index2uuid = {str(i): sp["uuid"] for i, sp in enumerate(speakers, start=1)}
         self._print_speakers_table(speakers)
 
     def _action_view(self) -> None:
-        raw = input("請輸入說話者序號或 ID: ")
+        raw = input("請輸入語者序號或 ID: ")
         sp_id = self._resolve_id(raw)
         if not sp_id or not valid_uuid(sp_id):
-            print("❌ 無效的說話者 ID，請重新嘗試。")
+            print("❌ 無效的語者 ID，請重新嘗試。")
             return
         obj = self.manager.get_speaker(sp_id)
         if obj is None:
-            print("❌ 查無此說話者。")
+            print("❌ 查無此語者。")
             return
         props = obj.properties
-        print("\n說話者詳細資訊:")
+        print("\n語者詳細資訊:")
         print(f"UUID            : {obj.uuid}")
         print(f"名稱            : {props.get('name', '未命名')}")
         print(f"建立時間        : {props.get('create_time', '未知')}")
@@ -297,10 +297,10 @@ class SpeakerManagerCLI:
         print(f"聲紋數量        : {len(props.get('voiceprint_ids', []))}\n")
 
     def _action_rename(self) -> None:
-        raw = input("請輸入說話者序號或 ID: ")
+        raw = input("請輸入語者序號或 ID: ")
         sp_id = self._resolve_id(raw)
         if not sp_id or not valid_uuid(sp_id):
-            print("❌ 無效的說話者 ID。")
+            print("❌ 無效的語者 ID。")
             return
         new_name = input("請輸入新名稱: ").strip()
         if not new_name:
@@ -312,36 +312,36 @@ class SpeakerManagerCLI:
             print("❌ 更新失敗。")
 
     def _action_delete(self) -> None:
-        raw = input("請輸入要刪除的說話者序號或 ID: ")
+        raw = input("請輸入要刪除的語者序號或 ID: ")
         sp_id = self._resolve_id(raw)
         if not sp_id or not valid_uuid(sp_id):
-            print("❌ 無效的說話者 ID。")
+            print("❌ 無效的語者 ID。")
             return
-        confirm = input(f"⚠️ 警告：刪除操作不可逆，確定要刪除說話者 {sp_id}？(Y/n): ")
+        confirm = input(f"⚠️ 警告：刪除操作不可逆，確定要刪除語者 {sp_id}？(Y/n): ")
         if confirm.lower() not in ["y", "yes"]:
             print("已取消刪除操作。")
             return
         if self.manager.delete_speaker(sp_id):
-            print("✅ 說話者已刪除。")
+            print("✅ 語者已刪除。")
         else:
             print("❌ 刪除失敗。")
 
     def _action_transfer(self) -> None:
-        src_raw = input("請輸入來源說話者序號或 ID: ")
+        src_raw = input("請輸入來源語者序號或 ID: ")
         src_id = self._resolve_id(src_raw)
         if not src_id or not valid_uuid(src_id):
-            print("❌ 無效的來源說話者 ID。")
+            print("❌ 無效的來源語者 ID。")
             return
-        dest_raw = input("請輸入目標說話者序號或 ID: ")
+        dest_raw = input("請輸入目標語者序號或 ID: ")
         dest_id = self._resolve_id(dest_raw)
         if not dest_id or not valid_uuid(dest_id):
-            print("❌ 無效的目標說話者 ID。")
+            print("❌ 無效的目標語者 ID。")
             return
         if src_id == dest_id:
-            print("❌ 來源和目標說話者不能相同。")
+            print("❌ 來源和目標語者不能相同。")
             return
         confirm = input(
-            f"⚠️ 確定要將來源說話者 {src_id} 的所有聲紋轉移到目標說話者 {dest_id}？(Y/n): "
+            f"⚠️ 確定要將來源語者 {src_id} 的所有聲紋轉移到目標語者 {dest_id}？(Y/n): "
         )
         if confirm.lower() not in ["y", "yes"]:
             print("已取消轉移操作。")

@@ -19,8 +19,8 @@ Voice_ID
  4. 聲紋更新：自動更新語者聲紋向量，提高識別準確率
  5. 語者管理：獨立模組化的語者與聲紋管理功能
 
-** 重要說明 **：目前使用的語者分離模型是 SpeechBrain 的 16kHz 雙說話者 (2人) 預訓練模型，
-因此本系統使用時只能分離兩個說話者的混合語音。若有三人或更多人同時說話的情況，
+** 重要說明 **：目前使用的語者分離模型是 SpeechBrain 的 16kHz 雙語者 (2人) 預訓練模型，
+因此本系統使用時只能分離兩個語者的混合語音。若有三人或更多人同時說話的情況，
 系統會將其合併為兩個主要聲源或可能造成分離效果不佳。
 
 系統模組架構：
@@ -33,7 +33,7 @@ Voice_ID
 -----------
  - 語者分離模型: SpeechBrain Sepformer (16kHz 雙聲道分離)
  - 語者識別模型: SpeechBrain ECAPA-TDNN 模型 (192維特徵向量)
- - 向量資料庫: Weaviate，用於儲存和檢索說話者嵌入向量
+ - 向量資料庫: Weaviate，用於儲存和檢索語者嵌入向量
  - 即時處理: 多執行緒並行處理，邊錄音邊識別
  - 音訊增強: 頻譜閘控降噪，提高分離品質
 
@@ -134,10 +134,10 @@ MIN_ENERGY_THRESHOLD = 0.005
 NOISE_REDUCE_STRENGTH = 0.1
 
 # 全域參數設定，使用 v5 版本的閾值
-EMBEDDING_DIR = "embeddingFiles"  # 所有說話者嵌入資料的根目錄
+EMBEDDING_DIR = "embeddingFiles"  # 所有語者嵌入資料的根目錄
 THRESHOLD_LOW = speaker_id.THRESHOLD_LOW     # 過於相似，不更新
 THRESHOLD_UPDATE = speaker_id.THRESHOLD_UPDATE # 更新嵌入向量
-THRESHOLD_NEW = speaker_id.THRESHOLD_NEW    # 判定為新說話者
+THRESHOLD_NEW = speaker_id.THRESHOLD_NEW    # 判定為新語者
 
 # 輸出目錄
 OUTPUT_DIR = "16K-model/Audios-16K-IDTF"
@@ -574,7 +574,7 @@ class AudioSeparator:
 # ================== 語者識別部分 ======================
 
 class SpeakerIdentifier:
-    """說話者識別類，負責呼叫 v5 版本的語者識別功能，使用單例模式"""
+    """語者識別類，負責呼叫 v5 版本的語者識別功能，使用單例模式"""
     
     _instance = None
     
@@ -586,7 +586,7 @@ class SpeakerIdentifier:
         return cls._instance
     
     def __init__(self) -> None:
-        """初始化說話者識別器，使用 v5 版本的 SpeakerIdentifier"""
+        """初始化語者識別器，使用 v5 版本的 SpeakerIdentifier"""
         # 若已初始化，則跳過
         if hasattr(self, '_initialized') and self._initialized:
             return
@@ -606,14 +606,14 @@ class SpeakerIdentifier:
     
     def process_audio_streams(self, audio_streams: list, timestamp: datetime) -> dict:
         """
-        處理多個音訊流並進行說話者識別
+        處理多個音訊流並進行語者識別
         
         Args:
             audio_streams: 音訊流資料列表，每個元素包含 'audio_data', 'sample_rate', 'name'
             timestamp: 音訊流的時間戳記物件
             
         Returns:
-            dict: 音訊流名稱 -> (說話者名稱, 相似度, 識別結果描述)
+            dict: 音訊流名稱 -> (語者名稱, 相似度, 識別結果描述)
         """
         results = {}
         
@@ -638,17 +638,17 @@ class SpeakerIdentifier:
                     
                     # 根據距離判斷識別結果
                     if distance == -1:
-                        # 距離為 -1 表示新建立的說話者
-                        result_desc = f"新說話者 {speaker_name} \t(已建立新聲紋:{distance:.4f})"
+                        # 距離為 -1 表示新建立的語者
+                        result_desc = f"新語者 {speaker_name} \t(已建立新聲紋:{distance:.4f})"
                     elif distance < THRESHOLD_LOW:
-                        result_desc = f"說話者 {speaker_name} \t(聲音非常相似:{distance:.4f})"
+                        result_desc = f"語者 {speaker_name} \t(聲音非常相似:{distance:.4f})"
                     elif distance < THRESHOLD_UPDATE:
-                        result_desc = f"說話者 {speaker_name} \t(已更新聲紋:{distance:.4f})"
+                        result_desc = f"語者 {speaker_name} \t(已更新聲紋:{distance:.4f})"
                     elif distance < THRESHOLD_NEW:
-                        result_desc = f"說話者 {speaker_name} \t(新增新的聲紋:{distance:.4f})"
+                        result_desc = f"語者 {speaker_name} \t(新增新的聲紋:{distance:.4f})"
                     else:
-                        # 此處不應該執行到，因為距離大於 THRESHOLD_NEW 時應該創建新說話者
-                        result_desc = f"說話者 {speaker_name} \t(判斷不明確):{distance:.4f}"
+                        # 此處不應該執行到，因為距離大於 THRESHOLD_NEW 時應該創建新語者
+                        result_desc = f"語者 {speaker_name} \t(判斷不明確):{distance:.4f}"
                     
                     results[name] = (speaker_name, distance, result_desc)
                     # logger.info(f"結果: {result_desc}")
