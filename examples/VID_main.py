@@ -1,3 +1,7 @@
+# examples/VID_main.py
+
+# 執行 python -m examples.VID_main
+
 from modules.identification import VID_identify_v5 as speaker_id
 from modules.management import VID_manager
 from modules.separation import separator as VID_system

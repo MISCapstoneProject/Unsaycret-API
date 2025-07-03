@@ -239,6 +239,7 @@ class DatabaseService:
                     "name": obj.properties.get("name", "未命名"),
                     "create_time": obj.properties.get("create_time", "未知"),
                     "last_active_time": obj.properties.get("last_active_time", "未知"),
+                    "first_audio_id": obj.properties.get("first_audio_id"),
                     "voiceprint_count": len(voiceprint_ids),
                     "voiceprint_ids": voiceprint_ids,
                 })
@@ -271,12 +272,13 @@ class DatabaseService:
             logger.error(f"獲取語者詳細資訊時發生錯誤: {exc}")
             return None
     
-    def create_speaker(self, speaker_name: str = DEFAULT_SPEAKER_NAME) -> str:
+    def create_speaker(self, speaker_name: str = DEFAULT_SPEAKER_NAME, first_audio_id: Optional[str] = None) -> str:
         """
         創建新的語者。
         
         Args:
             speaker_name: 語者名稱，默認為「未命名語者」
+            first_audio_id: 第一次生成該語者時使用的音檔ID（UUID格式）
             
         Returns:
             str: 新建立的語者 ID，若建立失敗則返回空字符串
@@ -308,13 +310,19 @@ class DatabaseService:
                 speaker_name = f"n{next_number}"
             
             # 創建語者
+            properties = {
+                "name": speaker_name,
+                "create_time": format_rfc3339(),
+                "last_active_time": format_rfc3339(),
+                "voiceprint_ids": []  # 初始時沒有聲紋向量
+            }
+            
+            # 如果提供了 first_audio_id，則加入屬性中
+            if first_audio_id:
+                properties["first_audio_id"] = first_audio_id
+            
             speaker_collection.data.insert(
-                properties={
-                    "name": speaker_name,
-                    "create_time": format_rfc3339(),
-                    "last_active_time": format_rfc3339(),
-                    "voiceprint_ids": []  # 初始時沒有聲紋向量
-                },
+                properties=properties,
                 uuid=speaker_id
             )
             

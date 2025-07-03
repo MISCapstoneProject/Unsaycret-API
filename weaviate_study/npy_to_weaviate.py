@@ -146,16 +146,30 @@ def create_speakers_in_weaviate(client: Any, embedding_files: Dict[str, List[Tup
         # 為每個說話者生成一個 UUID
         speaker_uuid = str(uuid.uuid4())
         
+        # 獲取該語者的第一個音檔名稱作為 first_audio_id
+        first_npy_file = embedding_files[speaker_folder][0][0] if embedding_files[speaker_folder] else None
+        first_audio_id = None
+        if first_npy_file:
+            # 從檔案名稱解析出音檔ID，格式通常是 <speaker>_<file_id>_<update_count>.npy
+            # 這裡我們使用檔案名稱（去除副檔名）作為 audio_id
+            first_audio_id = first_npy_file.replace('.npy', '')
+        
         # 將說話者資料加入到 Speaker 集合
         # 注意：初始時 voiceprint_ids 是空列表，稍後會在匯入完成後更新
         # 修正：使用 format_date_rfc3339 函數格式化日期
+        properties = {
+            "name": speaker_folder,
+            "create_time": format_date_rfc3339(DEFAULT_DATE),
+            "last_active_time": format_date_rfc3339(DEFAULT_DATE),
+            "voiceprint_ids": []  # 最初是空列表，在匯入嵌入向量後再更新
+        }
+        
+        # 如果有 first_audio_id 則加入
+        if first_audio_id:
+            properties["first_audio_id"] = first_audio_id
+        
         speaker_collection.data.insert(
-            properties={
-                "name": speaker_folder,
-                "create_time": format_date_rfc3339(DEFAULT_DATE),
-                "last_active_time": format_date_rfc3339(DEFAULT_DATE),
-                "voiceprint_ids": []  # 最初是空列表，在匯入嵌入向量後再更新
-            },
+            properties=properties,
             uuid=speaker_uuid  # 將 UUID 作為參數傳遞
         )
         

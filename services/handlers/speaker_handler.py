@@ -224,6 +224,7 @@ class SpeakerHandler:
                 "speaker_name": props.get('name', ''),
                 "created_time": props.get('create_time', ''),
                 "last_active_time": props.get('last_active_time', ''),
+                "first_audio_id": props.get('first_audio_id'),
                 "voiceprint_count": len(props.get('voiceprint_ids', []))
             }
         except HTTPException:
@@ -277,8 +278,8 @@ class SpeakerHandler:
                     "created_at": created_at,
                     "updated_at": updated_at,
                     "voiceprint_ids": voiceprint_ids_str,
-                    # 設定 first_audio_id（還未實作）
-                    "first_audio_id": None
+                    # 包含 first_audio_id
+                    "first_audio_id": str(speaker.get("first_audio_id"))
                 }
                 
                 api_speakers.append(api_speaker)
