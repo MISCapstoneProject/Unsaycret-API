@@ -34,6 +34,12 @@ sep = AudioSeparator()
 spk = SpeakerIdentifier()
 asr = WhisperASR(model_name="medium", gpu=use_gpu)
 
+def _timed_call(func, *args):
+    t0 = time.perf_counter()
+    res = func(*args)
+    return res, time.perf_counter() - t0
+
+
 def process_segment(seg_path: str, t0: float, t1: float) -> dict:
     """Process a single separated segment and return metrics."""
     logger.info(
@@ -41,18 +47,14 @@ def process_segment(seg_path: str, t0: float, t1: float) -> dict:
     )
     start = time.perf_counter()
 
-    # SpeakerID
-    t_spk0 = time.perf_counter()
-    speaker_id, name, dist = spk.process_audio_file(seg_path)
-    t_spk1 = time.perf_counter()
-    spk_time = t_spk1 - t_spk0
-    logger.info(f"⏱ SpeakerID 耗時 {spk_time:.3f}s")
+    with ThreadPoolExecutor(max_workers=2) as ex:
+        spk_future = ex.submit(_timed_call, spk.process_audio_file, seg_path)
+        asr_future = ex.submit(_timed_call, asr.transcribe, seg_path)
 
-    # ASR
-    t_asr0 = time.perf_counter()
-    text, conf, words = asr.transcribe(seg_path)
-    t_asr1 = time.perf_counter()
-    asr_time = t_asr1 - t_asr0
+        (speaker_id, name, dist), spk_time = spk_future.result()
+        (text, conf, words), asr_time = asr_future.result()
+
+    logger.info(f"⏱ SpeakerID 耗時 {spk_time:.3f}s")
     logger.info(f"⏱ ASR 耗時 {asr_time:.3f}s")
 
     # 調整每個詞的時間戳，使其對齊原始混音檔軸
@@ -109,8 +111,16 @@ def run_pipeline_file(raw_wav: str, max_workers: int = 3):
     logger.info(f"🔄 處理 {len(segments)} 段... (max_workers={max_workers})")
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         bundle = [r for r in ex.map(lambda s: process_segment(*s), segments) if r]
-    spk_time = sum(s.get("spk_time", 0.0) for s in bundle)
-    asr_time = sum(s.get("asr_time", 0.0) for s in bundle)
+
+    spk_time = max((s.get("spk_time", 0.0) for s in bundle), default=0.0)
+    asr_time = max((s.get("asr_time", 0.0) for s in bundle), default=0.0)
+    pipeline_total = (sep_end - sep_start) + spk_time + asr_time
+
+    stages_path = pathlib.Path("pipeline_stages.csv")
+    if not stages_path.exists():
+        stages_path.write_text("sep_max,sid_max,asr_max,pipeline_total\n", encoding="utf-8")
+    with stages_path.open("a", encoding="utf-8") as f:
+        f.write(f"{sep_end - sep_start:.3f},{spk_time:.3f},{asr_time:.3f},{pipeline_total:.3f}\n")
 
     # 3) 輸出結果
     bundle.sort(key=lambda x: x["start"])
@@ -130,6 +140,7 @@ def run_pipeline_file(raw_wav: str, max_workers: int = 3):
         "separate": sep_end - sep_start,
         "speaker": spk_time,
         "asr": asr_time,
+        "pipeline_total": pipeline_total,
     }
 
     return bundle, pretty_bundle, stats

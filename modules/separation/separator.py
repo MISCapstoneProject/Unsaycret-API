@@ -711,11 +711,12 @@ class AudioSeparator:
             # 初始化累計時間戳
             current_t0 = getattr(self, "_current_t0", 0.0)
             results = []   # 用來收 (path, start, end)
+            seg_duration = audio_tensor.shape[-1] / TARGET_RATE
 
             with torch.no_grad():
                 if len(audio_tensor.shape) == 2:
                     audio_tensor = audio_tensor.unsqueeze(0)
-                
+
                 separated = self.model(audio_tensor)
                 
                 if self.enable_noise_reduction:
@@ -742,6 +743,7 @@ class AudioSeparator:
                     speaker_dim = 0
                 
                 saved_count = 0
+                start_time = current_t0
                 for i in range(min(num_speakers, NUM_SPEAKERS)):
                     try:
                         if speaker_dim == 1:
@@ -779,17 +781,10 @@ class AudioSeparator:
                                 TARGET_RATE
                             )
 
-                            # —— 新增：計算這段的長度（秒）
-                            duration = final_tensor.shape[-1] / TARGET_RATE
-
-                            # —— 新增：把 (路徑, start, end) 收到 results
                             results.append((output_file,
-                                    current_t0,
-                                    current_t0 + duration))
+                                    start_time,
+                                    start_time + seg_duration))
                             self.output_files.append(output_file)
-
-                            # —— 新增：更新累計時間
-                            current_t0 += duration
 
                             saved_count += 1
                     except Exception as e:
@@ -798,6 +793,9 @@ class AudioSeparator:
                 if saved_count > 0:
                     logger.info(f"片段 {segment_index} 完成，儲存 {saved_count} 個檔案")
                 
+            # 更新累計時間到下一段
+            current_t0 += seg_duration
+
             # —— 新增：存回屬性，下次呼叫會接續
             self._current_t0 = current_t0
 

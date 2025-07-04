@@ -1,5 +1,6 @@
 from pathlib import Path
 import json
+import time
 from utils.logger import get_logger
 import torch
 import torchaudio
@@ -23,6 +24,8 @@ class WhisperASR:
         self.beam = beam
         self.lang = lang
         self.model = load_model(model_name=model_name, gpu=self.gpu)
+        self.last_infer_time = 0.0
+        self.last_total_time = 0.0
 
         device_str = "cuda" if self.gpu else "cpu"
         logger.info(f"🧠 Whisper running on device: {device_str}")
@@ -39,7 +42,8 @@ class WhisperASR:
             avg_conf: Average confidence score.
             word_info: List of dicts with keys 'start', 'end', 'word', 'probability'.
         """
-        # Run model inference
+        total_start = time.perf_counter()
+        infer_start = time.perf_counter()
         seg_gen, _ = self.model.transcribe(
             str(wav_path),
             word_timestamps=True,
@@ -47,9 +51,12 @@ class WhisperASR:
             beam_size=self.beam,
             language=None if self.lang == "auto" else self.lang,
         )
+        infer_end = time.perf_counter()
 
         segments = list(seg_gen)
         if not segments:
+            self.last_infer_time = infer_end - infer_start
+            self.last_total_time = time.perf_counter() - total_start
             return "", 0.0, []
 
         # Combine segment texts
@@ -72,6 +79,9 @@ class WhisperASR:
 
         # Clear GPU cache to avoid fragmentation
         torch.cuda.empty_cache()
+
+        self.last_infer_time = infer_end - infer_start
+        self.last_total_time = time.perf_counter() - total_start
 
         return full_txt, avg_conf, word_info
 
