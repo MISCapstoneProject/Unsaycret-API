@@ -535,9 +535,15 @@ class WeaviateRepository:
                 "voiceprint_ids": []  # 初始時沒有聲紋向量
             }
             
-            # 如果提供了 first_audio_id，則加入屬性中
+            # 驗證 first_audio_id 是否為有效的 UUID 格式，如果不是則不設置
             if first_audio_id:
-                properties["first_audio_id"] = first_audio_id
+                try:
+                    # 嘗試將字串解析為 UUID 來驗證格式
+                    uuid.UUID(first_audio_id)
+                    properties["first_audio_id"] = first_audio_id
+                except ValueError:
+                    # 如果不是有效的 UUID 格式，就不設置此屬性
+                    print(f"警告: first_audio_id '{first_audio_id}' 不是有效的 UUID 格式，已跳過")
             
             speaker_collection.data.insert(
                 properties=properties,
@@ -565,8 +571,8 @@ class WeaviateRepository:
             tuple: (語者ID, 聲紋向量ID, 語者名稱)
         """
         try:
-            # 創建新的語者，將 audio_source 作為 first_audio_id
-            speaker_id = self.create_new_speaker(first_audio_id=audio_source if audio_source else None)
+            # 創建新的語者，不傳入 first_audio_id 因為 audio_source 通常不是 UUID
+            speaker_id = self.create_new_speaker()
             
             # 獲取語者名稱
             speaker_collection = self.client.collections.get("Speaker")
@@ -957,8 +963,8 @@ class SpeakerIdentifier:
             # 讀取音檔獲取 signal 和 sr
             signal, sr = sf.read(audio_file)
 
-            # 呼叫新的 stream 處理方法
-            return self.process_audio_stream(signal, sr, audio_source=f"檔案: {os.path.basename(audio_file)}")
+            # 呼叫新的 stream 處理方法，只傳入檔案名稱而不是描述性文字
+            return self.process_audio_stream(signal, sr, audio_source=os.path.basename(audio_file))
 
         except Exception as e:
             self.simplified_print(f"處理音檔 {audio_file} 時發生錯誤: {e}", self.verbose)

@@ -21,6 +21,8 @@ stream_output/
 pretrained_models/
 embeddingFiles/
 models
+R3SI
+pipeline_stages.csv
 
 # 虛擬環境
 venv

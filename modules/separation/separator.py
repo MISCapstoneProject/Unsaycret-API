@@ -6,7 +6,7 @@ Voice_ID
 
 版本：v2.2.0
 作者：EvanLo62, CYouuu
-最後更新：2025-07-01
+最後更新：2025-07-09
 
 功能摘要：
 -----------
@@ -32,7 +32,7 @@ Voice_ID
 -----------
  - 語者分離模型: ConvTasNet (16kHz 三聲道分離)
  - 語者識別模型: SpeechBrain ECAPA-TDNN 模型 (192維特徵向量)
- - 向量資料庫: Weaviate，用於儲存和檢索語者嵌入向量
+ - 向量資料庫: Weaviate，用於儲存和檢索說話者嵌入向量
  - 即時處理: 多執行緒並行處理，邊錄音邊識別
  - 音訊增強: 頻譜閘控降噪、維納濾波、動態範圍壓縮，提高分離品質
 
@@ -114,6 +114,7 @@ import threading
 import time
 from scipy import signal
 from scipy.ndimage import uniform_filter1d
+from enum import Enum
 
 # 修改模型載入方式
 try:
@@ -128,6 +129,27 @@ from utils.logger import get_logger
 
 # 導入 main_identify_v5 模組
 from modules.identification import VID_identify_v5 as speaker_id
+
+# 新增模型類型枚舉
+class SeparationModel(Enum):
+    CONVTASNET_3SPEAKER = "convtasnet_3speaker"  # ConvTasNet 3人模型
+    SEPFORMER_2SPEAKER = "sepformer_2speaker"    # SepFormer 2人模型
+
+# 模型配置
+MODEL_CONFIGS = {
+    SeparationModel.CONVTASNET_3SPEAKER: {
+        "model_name": "JorisCos/ConvTasNet_Libri3Mix_sepnoisy_16k",
+        "num_speakers": 3,
+        "sample_rate": 16000,
+        "use_speechbrain": False
+    },
+    SeparationModel.SEPFORMER_2SPEAKER: {
+        "model_name": "speechbrain/sepformer-whamr16k",
+        "num_speakers": 2,
+        "sample_rate": 16000,
+        "use_speechbrain": True
+    }
+}
 
 # 基本錄音參數
 CHUNK = 1024
@@ -150,15 +172,55 @@ WIENER_FILTER_STRENGTH = 0.01  # 更溫和的維納濾波
 HIGH_FREQ_CUTOFF = 7500  # 提高高頻截止點
 DYNAMIC_RANGE_COMPRESSION = 0.7  # 動態範圍壓縮
 
-# ConvTasNet 模型參數
-MODEL_NAME = "JorisCos/ConvTasNet_Libri3Mix_sepnoisy_16k"
-NUM_SPEAKERS = 3
+# ConvTasNet 模型參數 (修改為動態配置)
+DEFAULT_MODEL = SeparationModel.SEPFORMER_2SPEAKER
+MODEL_NAME = MODEL_CONFIGS[DEFAULT_MODEL]["model_name"]
+NUM_SPEAKERS = MODEL_CONFIGS[DEFAULT_MODEL]["num_speakers"]
+
+# 新增: 便利的模型選擇函式
+def set_default_model(model_type: SeparationModel):
+    """設定預設模型類型"""
+    global DEFAULT_MODEL, MODEL_NAME, NUM_SPEAKERS
+    DEFAULT_MODEL = model_type
+    MODEL_NAME = MODEL_CONFIGS[model_type]["model_name"]
+    NUM_SPEAKERS = MODEL_CONFIGS[model_type]["num_speakers"]
+    logger.info(f"預設模型已設定為: {model_type.value}")
+
+def get_available_models():
+    """取得可用的模型列表"""
+    return {
+        "convtasnet_3speaker": "ConvTasNet 3人語者分離模型",
+        "sepformer_2speaker": "SepFormer 2人語者分離模型"
+    }
+
+def create_separator(model_name: str = None, **kwargs):
+    """
+    建立 AudioSeparator 實例的便利函式
+    
+    Args:
+        model_name: 模型名稱 ("convtasnet_3speaker" 或 "sepformer_2speaker")
+        **kwargs: 其他參數傳遞給 AudioSeparator
+    
+    Returns:
+        AudioSeparator 實例
+    """
+    if model_name:
+        if model_name == "convtasnet_3speaker":
+            model_type = SeparationModel.CONVTASNET_3SPEAKER
+        elif model_name == "sepformer_2speaker":
+            model_type = SeparationModel.SEPFORMER_2SPEAKER
+        else:
+            raise ValueError(f"不支援的模型: {model_name}。可用模型: {list(get_available_models().keys())}")
+    else:
+        model_type = DEFAULT_MODEL
+    
+    return AudioSeparator(model_type=model_type, **kwargs)
 
 # 全域參數設定，使用 v5 版本的閾值
-EMBEDDING_DIR = "embeddingFiles"  # 所有語者嵌入資料的根目錄
+EMBEDDING_DIR = "embeddingFiles"  # 所有說話者嵌入資料的根目錄
 THRESHOLD_LOW = speaker_id.THRESHOLD_LOW     # 過於相似，不更新
 THRESHOLD_UPDATE = speaker_id.THRESHOLD_UPDATE # 更新嵌入向量
-THRESHOLD_NEW = speaker_id.THRESHOLD_NEW    # 判定為新語者
+THRESHOLD_NEW = speaker_id.THRESHOLD_NEW    # 判定為新說話者
 
 # 輸出目錄
 OUTPUT_DIR = "R3SI/Audio-storage"  # 儲存分離後音訊的目錄
@@ -171,13 +233,18 @@ logger = get_logger(__name__)
 # ================== 語者分離部分 ======================
 
 class AudioSeparator:
-    def __init__(self, enable_noise_reduction=True, snr_threshold=SNR_THRESHOLD):
+    def __init__(self, model_type: SeparationModel = DEFAULT_MODEL, enable_noise_reduction=True, snr_threshold=SNR_THRESHOLD):
         self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        self.model_type = model_type
+        self.model_config = MODEL_CONFIGS[model_type]
+        self.num_speakers = self.model_config["num_speakers"]
         self.enable_noise_reduction = enable_noise_reduction
         self.snr_threshold = snr_threshold
         
         logger.info(f"使用設備: {self.device}")
-        logger.info(f"模型: {MODEL_NAME}")
+        logger.info(f"模型類型: {model_type.value}")
+        logger.info(f"模型: {self.model_config['model_name']}")
+        logger.info(f"支援語者數: {self.num_speakers}")
         
         # 設計更溫和的低通濾波器
         nyquist = TARGET_RATE // 2
@@ -219,32 +286,50 @@ class AudioSeparator:
         logger.info("AudioSeparator 初始化完成")
 
     def _load_model(self):
-        """載入 ConvTasNet 模型"""
-        if USE_ASTEROID:
+        """載入語者分離模型"""
+        model_name = self.model_config["model_name"]
+        
+        if self.model_config["use_speechbrain"]:
+            # 使用 SpeechBrain SepFormer 模型
             try:
-                model = ConvTasNet.from_pretrained(MODEL_NAME)
+                logger.info(f"載入 SpeechBrain 模型: {model_name}")
+                model = separator.from_hparams(
+                    source=model_name,
+                    savedir=f"models/{self.model_type.value}",
+                    run_opts={"device": self.device}
+                )
+                logger.info("SpeechBrain 模型載入成功")
+                return model
+            except Exception as e:
+                logger.error(f"SpeechBrain 模型載入失敗: {e}")
+                raise
+        else:
+            # 使用 ConvTasNet 模型（原有邏輯）
+            if USE_ASTEROID:
+                try:
+                    model = ConvTasNet.from_pretrained(model_name)
+                    model = model.to(self.device)
+                    model.eval()
+                    return model
+                except Exception as e:
+                    logger.warning(f"Asteroid 載入失敗，嘗試其他方法...")
+            
+            try:
+                model = AutoModel.from_pretrained(
+                    model_name,
+                    trust_remote_code=True
+                )
                 model = model.to(self.device)
                 model.eval()
                 return model
             except Exception as e:
-                logger.warning(f"Asteroid 載入失敗，嘗試其他方法...")
-        
-        try:
-            model = AutoModel.from_pretrained(
-                MODEL_NAME,
-                trust_remote_code=True
-            )
-            model = model.to(self.device)
-            model.eval()
-            return model
-        except Exception as e:
-            logger.info("嘗試 torch.hub 載入...")
-            return self._manual_load_model()
+                logger.info("嘗試 torch.hub 載入...")
+                return self._manual_load_model()
 
     def _manual_load_model(self):
-        """手動載入模型"""
+        """手動載入 ConvTasNet 模型"""
         try:
-            model_dir = "models/ConvTasNet"
+            model_dir = f"models/{self.model_type.value}"
             os.makedirs(model_dir, exist_ok=True)
             model = torch.hub.load('JorisCos/ConvTasNet', 'ConvTasNet_Libri3Mix_sepnoisy_16k', pretrained=True)
             model = model.to(self.device)
@@ -257,12 +342,26 @@ class AudioSeparator:
     def _test_model(self):
         """測試模型"""
         try:
-            test_audio = torch.randn(1, 1, 16000).to(self.device)
             with torch.no_grad():
-                output = self.model(test_audio)
-                logger.info("模型測試通過")
+                if self.model_config["use_speechbrain"]:
+                    # SpeechBrain SepFormer 模型測試
+                    # SepFormer 期望輸入格式為 [batch, samples]
+                    test_audio = torch.randn(1, 16000).to(self.device)
+                    logger.debug(f"SpeechBrain 測試音訊形狀: {test_audio.shape}")
+                    output = self.model.separate_batch(test_audio)
+                else:
+                    # ConvTasNet 模型測試
+                    # ConvTasNet 期望輸入格式為 [batch, channels, samples]
+                    test_audio = torch.randn(1, 1, 16000).to(self.device)
+                    logger.debug(f"ConvTasNet 測試音訊形狀: {test_audio.shape}")
+                    output = self.model(test_audio)
+                    
+            logger.info("模型測試通過")
+            logger.debug(f"輸出形狀: {output.shape if hasattr(output, 'shape') else type(output)}")
+            
         except Exception as e:
             logger.error(f"模型測試失敗: {e}")
+            logger.error(f"測試音訊形狀: {test_audio.shape if 'test_audio' in locals() else 'N/A'}")
             raise
 
     def estimate_snr(self, signal):
@@ -306,7 +405,7 @@ class AudioSeparator:
     def smooth_audio(self, audio_signal):
         """音訊平滑處理"""
         try:
-            # 移除突然的跳躍
+            # 移除突然的跳疊
             diff = np.diff(audio_signal)
             threshold = np.std(diff) * 3  # 更寬鬆的閾值
             artifact_indices = np.where(np.abs(diff) > threshold)[0]
@@ -370,38 +469,54 @@ class AudioSeparator:
         if not self.enable_noise_reduction:
             return separated_signals
         
-        # 處理形狀
-        if len(separated_signals.shape) == 3:
-            if separated_signals.shape[1] == NUM_SPEAKERS:
+        # 處理形狀 - 根據不同模型調整
+        if self.model_config["use_speechbrain"]:
+            # SpeechBrain 模型輸出格式處理
+            if len(separated_signals.shape) == 3:
+                # 格式通常為 [batch, time, speakers]
                 enhanced_signals = torch.zeros_like(separated_signals)
-                speaker_dim = 1
-                time_dim = 2
-            elif separated_signals.shape[2] == NUM_SPEAKERS:
-                separated_signals = separated_signals.transpose(1, 2)
-                enhanced_signals = torch.zeros_like(separated_signals)
-                speaker_dim = 1
-                time_dim = 2
+                speaker_dim = 2
+                time_dim = 1
             else:
+                separated_signals = separated_signals.unsqueeze(0)
                 enhanced_signals = torch.zeros_like(separated_signals)
                 speaker_dim = 2
                 time_dim = 1
         else:
-            if separated_signals.shape[0] == NUM_SPEAKERS:
-                separated_signals = separated_signals.unsqueeze(0)
-                enhanced_signals = torch.zeros_like(separated_signals)
-                speaker_dim = 1
-                time_dim = 2
+            # ConvTasNet 模型輸出格式處理（原有邏輯）
+            if len(separated_signals.shape) == 3:
+                if separated_signals.shape[1] == self.num_speakers:
+                    enhanced_signals = torch.zeros_like(separated_signals)
+                    speaker_dim = 1
+                    time_dim = 2
+                elif separated_signals.shape[2] == self.num_speakers:
+                    separated_signals = separated_signals.transpose(1, 2)
+                    enhanced_signals = torch.zeros_like(separated_signals)
+                    speaker_dim = 1
+                    time_dim = 2
+                else:
+                    enhanced_signals = torch.zeros_like(separated_signals)
+                    speaker_dim = 2
+                    time_dim = 1
             else:
-                separated_signals = separated_signals.unsqueeze(0).transpose(1, 2)
-                enhanced_signals = torch.zeros_like(separated_signals)
-                speaker_dim = 1
-                time_dim = 2
+                if separated_signals.shape[0] == self.num_speakers:
+                    separated_signals = separated_signals.unsqueeze(0)
+                    enhanced_signals = torch.zeros_like(separated_signals)
+                    speaker_dim = 1
+                    time_dim = 2
+                else:
+                    separated_signals = separated_signals.unsqueeze(0).transpose(1, 2)
+                    enhanced_signals = torch.zeros_like(separated_signals)
+                    speaker_dim = 1
+                    time_dim = 2
         
         num_speakers = separated_signals.shape[speaker_dim]
         
-        for i in range(num_speakers):
+        for i in range(min(num_speakers, self.num_speakers)):
             if speaker_dim == 1:
                 current_signal = separated_signals[0, i, :].cpu().numpy()
+            elif speaker_dim == 2:
+                current_signal = separated_signals[0, :, i].cpu().numpy()
             else:
                 current_signal = separated_signals[0, :, i].cpu().numpy()
             
@@ -432,6 +547,8 @@ class AudioSeparator:
             
             if speaker_dim == 1:
                 enhanced_signals[0, i, :length] = torch.from_numpy(processed_signal[:length]).to(self.device)
+            elif speaker_dim == 2:
+                enhanced_signals[0, :length, i] = torch.from_numpy(processed_signal[:length]).to(self.device)
             else:
                 enhanced_signals[0, :length, i] = torch.from_numpy(processed_signal[:length]).to(self.device)
         
@@ -572,7 +689,7 @@ class AudioSeparator:
                     if audio_tensor is not None:
                         logger.info(f"處理片段 {segment_index}")
                         future = self.executor.submit(
-                            self.separate_and_identify,
+                            self.separate_and_save,
                             audio_tensor,
                             output_dir,
                             segment_index
@@ -698,10 +815,21 @@ class AudioSeparator:
             seg_duration = audio_tensor.shape[-1] / TARGET_RATE
             
             with torch.no_grad():
-                if len(audio_tensor.shape) == 2:
-                    audio_tensor = audio_tensor.unsqueeze(0)
                 
-                separated = self.model(audio_tensor)
+                # 根據模型類型選擇不同的分離方法
+                # 在分離方法中，確保 SpeechBrain 模型得到正確格式
+                if self.model_config["use_speechbrain"]:
+                    # 確保輸入是 [batch, samples] 格式
+                    if len(audio_tensor.shape) == 3:
+                        # 如果是 [batch, channels, samples]，需要去掉 channels 維度
+                        if audio_tensor.shape[1] == 1:
+                            audio_tensor = audio_tensor.squeeze(1)  # 變成 [batch, samples]
+                    separated = self.model.separate_batch(audio_tensor)
+                else:
+                    # ConvTasNet 需要 [batch, channels, samples] 格式
+                    if len(audio_tensor.shape) == 2:
+                        audio_tensor = audio_tensor.unsqueeze(0)  # 加上 batch 維度
+                    separated = self.model(audio_tensor)
                 
                 if self.enable_noise_reduction:
                     enhanced_separated = self.enhance_separation(separated)
@@ -715,20 +843,30 @@ class AudioSeparator:
                 timestamp = datetime.now().strftime('%Y%m%d-%H_%M_%S')
                 
                 # 處理輸出格式
-                if len(enhanced_separated.shape) == 3:
-                    if enhanced_separated.shape[1] == NUM_SPEAKERS:
-                        num_speakers = enhanced_separated.shape[1]
-                        speaker_dim = 1
-                    else:
+                if self.model_config["use_speechbrain"]:
+                    # SpeechBrain 模型輸出處理
+                    if len(enhanced_separated.shape) == 3:
                         num_speakers = enhanced_separated.shape[2]
                         speaker_dim = 2
+                    else:
+                        num_speakers = 1
+                        speaker_dim = 0
                 else:
-                    num_speakers = 1
-                    speaker_dim = 0
+                    # ConvTasNet 模型輸出處理（原有邏輯）
+                    if len(enhanced_separated.shape) == 3:
+                        if enhanced_separated.shape[1] == self.num_speakers:
+                            num_speakers = enhanced_separated.shape[1]
+                            speaker_dim = 1
+                        else:
+                            num_speakers = enhanced_separated.shape[2]
+                            speaker_dim = 2
+                    else:
+                        num_speakers = 1
+                        speaker_dim = 0
                 
                 saved_count = 0
                 start_time = current_t0
-                for i in range(min(num_speakers, NUM_SPEAKERS)):
+                for i in range(min(num_speakers, self.num_speakers)):
                     try:
                         if speaker_dim == 1:
                             speaker_audio = enhanced_separated[0, i, :].cpu()
@@ -779,14 +917,11 @@ class AudioSeparator:
                 
             # 更新累計時間到下一段
             current_t0 += seg_duration
-
-            # —— 新增：存回屬性，下次呼叫會接續
             self._current_t0 = current_t0
 
             if not results:
                 raise RuntimeError("Speaker separation produced no valid tracks")
 
-            # —— 新增：把結果回傳
             return results
 
         except Exception as e:
@@ -810,8 +945,11 @@ class AudioSeparator:
                 if len(audio_tensor.shape) == 2:
                     audio_tensor = audio_tensor.unsqueeze(0)
                 
-                # 步驟1: 語者分離
-                separated = self.model(audio_tensor)
+                # 步驟1: 語者分離 - 根據模型類型選擇不同方法
+                if self.model_config["use_speechbrain"]:
+                    separated = self.model.separate_batch(audio_tensor)
+                else:
+                    separated = self.model(audio_tensor)
                 
                 if self.enable_noise_reduction:
                     enhanced_separated = self.enhance_separation(separated)
@@ -823,19 +961,29 @@ class AudioSeparator:
                     torch.cuda.empty_cache()
                 
                 # 處理輸出格式
-                if len(enhanced_separated.shape) == 3:
-                    if enhanced_separated.shape[1] == NUM_SPEAKERS:
-                        num_speakers = enhanced_separated.shape[1]
-                        speaker_dim = 1
-                    else:
+                if self.model_config["use_speechbrain"]:
+                    # SpeechBrain 模型輸出處理
+                    if len(enhanced_separated.shape) == 3:
                         num_speakers = enhanced_separated.shape[2]
                         speaker_dim = 2
+                    else:
+                        num_speakers = 1
+                        speaker_dim = 0
                 else:
-                    num_speakers = 1
-                    speaker_dim = 0
+                    # ConvTasNet 模型輸出處理（原有邏輯）
+                    if len(enhanced_separated.shape) == 3:
+                        if enhanced_separated.shape[1] == self.num_speakers:
+                            num_speakers = enhanced_separated.shape[1]
+                            speaker_dim = 1
+                        else:
+                            num_speakers = enhanced_separated.shape[2]
+                            speaker_dim = 2
+                    else:
+                        num_speakers = 1
+                        speaker_dim = 0
                 
                 saved_count = 0
-                for i in range(min(num_speakers, NUM_SPEAKERS)):
+                for i in range(min(num_speakers, self.num_speakers)):
                     try:
                         if speaker_dim == 1:
                             speaker_audio = enhanced_separated[0, i, :].cpu()
@@ -942,7 +1090,7 @@ class AudioSeparator:
 # ================== 語者識別部分 ======================
 
 class SpeakerIdentifier:
-    """語者識別類，負責呼叫 v5 版本的語者識別功能，使用單例模式"""
+    """說話者識別類，負責呼叫 v5 版本的語者識別功能，使用單例模式"""
     
     _instance = None
     
@@ -954,7 +1102,7 @@ class SpeakerIdentifier:
         return cls._instance
     
     def __init__(self) -> None:
-        """初始化語者識別器，使用 v5 版本的 SpeakerIdentifier"""
+        """初始化說話者識別器，使用 v5 版本的 SpeakerIdentifier"""
         # 若已初始化，則跳過
         if hasattr(self, '_initialized') and self._initialized:
             return
@@ -974,14 +1122,14 @@ class SpeakerIdentifier:
     
     def process_audio_streams(self, audio_streams: list, timestamp: datetime) -> dict:
         """
-        處理多個音訊流並進行語者識別
+        處理多個音訊流並進行說話者識別
         
         Args:
             audio_streams: 音訊流資料列表，每個元素包含 'audio_data', 'sample_rate', 'name'
             timestamp: 音訊流的時間戳記物件
             
         Returns:
-            dict: 音訊流名稱 -> (語者名稱, 相似度, 識別結果描述)
+            dict: 音訊流名稱 -> (說話者名稱, 相似度, 識別結果描述)
         """
         results = {}
         
@@ -1006,17 +1154,17 @@ class SpeakerIdentifier:
                     
                     # 根據距離判斷識別結果
                     if distance == -1:
-                        # 距離為 -1 表示新建立的語者
-                        result_desc = f"新語者 {speaker_name} \t(已建立新聲紋:{distance:.4f})"
+                        # 距離為 -1 表示新建立的說話者
+                        result_desc = f"新說話者 {speaker_name} \t(已建立新聲紋:{distance:.4f})"
                     elif distance < THRESHOLD_LOW:
-                        result_desc = f"語者 {speaker_name} \t(聲音非常相似:{distance:.4f})"
+                        result_desc = f"說話者 {speaker_name} \t(聲音非常相似:{distance:.4f})"
                     elif distance < THRESHOLD_UPDATE:
-                        result_desc = f"語者 {speaker_name} \t(已更新聲紋:{distance:.4f})"
+                        result_desc = f"說話者 {speaker_name} \t(已更新聲紋:{distance:.4f})"
                     elif distance < THRESHOLD_NEW:
-                        result_desc = f"語者 {speaker_name} \t(新增新的聲紋:{distance:.4f})"
+                        result_desc = f"說話者 {speaker_name} \t(新增新的聲紋:{distance:.4f})"
                     else:
-                        # 此處不應該執行到，因為距離大於 THRESHOLD_NEW 時應該創建新語者
-                        result_desc = f"語者 {speaker_name} \t(判斷不明確):{distance:.4f}"
+                        # 此處不應該執行到，因為距離大於 THRESHOLD_NEW 時應該創建新說話者
+                        result_desc = f"說話者 {speaker_name} \t(判斷不明確):{distance:.4f}"
                     
                     results[name] = (speaker_name, distance, result_desc)
                     # logger.info(f"結果: {result_desc}")
@@ -1050,15 +1198,28 @@ def check_weaviate_connection() -> bool:
         logger.error(f"Weaviate 連線失敗：{e}")
         return False
     
-def run_realtime(output_dir: str = OUTPUT_DIR) -> str:
-    """方便外部呼叫的錄音處理函式"""
-    separator = AudioSeparator()
+def run_realtime(output_dir: str = OUTPUT_DIR, model_type: SeparationModel = None, model_name: str = None) -> str:
+    """方便外部呼叫的錄音處理函式，支援模型選擇"""
+    if model_name:
+        separator = create_separator(model_name)
+    elif model_type:
+        separator = AudioSeparator(model_type=model_type)
+    else:
+        separator = AudioSeparator(model_type=DEFAULT_MODEL)
     return separator.record_and_process(output_dir)
 
 
-def run_offline(file_path: str, output_dir: str = OUTPUT_DIR, save_files: bool = True) -> None:
-    """方便外部呼叫的離線音檔處理函式"""
-    separator = AudioSeparator()
+def run_offline(file_path: str, output_dir: str = OUTPUT_DIR, save_files: bool = True, 
+                model_type: SeparationModel = None, model_name: str = None) -> None:
+    """方便外部呼叫的離線音檔處理函式，支援模型選擇"""
+    if model_name:
+        separator = create_separator(model_name)
+    elif model_type:
+        separator = AudioSeparator(model_type=model_type)
+    else:
+        separator = AudioSeparator(model_type=DEFAULT_MODEL)
     separator.set_save_audio_files(save_files)
     separator.process_audio_file(file_path, output_dir)
 
+# if __name__ == '__main__':
+#     run_realtime(output_dir=OUTPUT_DIR, model_type=SeparationModel.SEPFORMER_2SPEAKER)
