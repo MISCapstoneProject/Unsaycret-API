@@ -5,14 +5,19 @@ Unsaycret API 主要服務入口
 此模組定義了 FastAPI 應用程式的 HTTP 路由，
 負責處理客戶端請求並委託給相應的業務邏輯處理器。
 """
-from fastapi import FastAPI, Request, UploadFile, File, HTTPException
+from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Form
 from pydantic import BaseModel
-from typing import Optional, List, WebSocket, WebSocketDisconnect
+from typing import Optional, List
+from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 import asyncio, threading, queue, json
-from pipelines.orchestrator import run_pipeline_FILE, run_pipeline_STREAM
+from pipelines.orchestrator import (
+    run_pipeline_FILE,
+    run_pipeline_STREAM,
+    run_pipeline_DIR,
+)
 from services.handlers.speaker_handler import SpeakerHandler
-import tempfile, shutil, os
+import tempfile, shutil, os, zipfile
 
 app = FastAPI(title="Unsaycret API")
 
@@ -55,7 +60,7 @@ async def transcribe(file: UploadFile = File(...)):
         tmp_path = tmp.name
 
     # 2. 跑 pipeline，拿 raw + pretty
-    raw, pretty = run_pipeline_FILE(tmp_path)
+    raw, pretty, stats = run_pipeline_FILE(tmp_path)
 
     # 3. 刪暫存檔
     os.remove(tmp_path)

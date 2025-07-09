@@ -3,11 +3,6 @@ import json
 import os
 import pathlib
 import tempfile
-import argparse
-import json
-import os
-import pathlib
-import tempfile
 import threading
 import time
 import queue
@@ -18,18 +13,11 @@ from concurrent.futures import ThreadPoolExecutor, Future
 import torch
 import torchaudio
 import pyaudio  # type: ignore
-import wave
 
 from utils.logger import get_logger
 from modules.separation.separator import AudioSeparator
 from modules.identification.VID_identify_v5 import SpeakerIdentifier
 from modules.asr.whisper_asr import WhisperASR
-
-logger = get_logger(__name__)
-
-logger.info("🖥 GPU available: %s", torch.cuda.is_available())
-if torch.cuda.is_available():
-    logger.info("   Device: %s", torch.cuda.get_device_name(0))
 
 logger = get_logger(__name__)
 
@@ -82,7 +70,6 @@ def process_segment(seg_path: str, t0: float, t1: float) -> dict:
     return {
         "start": round(t0, 2),
         "end": round(t1, 2),
-        "end": round(t1, 2),
         "speaker": name,
         "distance": round(float(dist), 3),
         "text": text,
@@ -111,11 +98,6 @@ def run_pipeline_file(raw_wav: str, max_workers: int = 3):
     """Run pipeline on an existing wav file."""
     total_start = time.perf_counter()
 
-
-def run_pipeline_file(raw_wav: str, max_workers: int = 3):
-    """Run pipeline on an existing wav file."""
-    total_start = time.perf_counter()
-
     waveform, sr = torchaudio.load(raw_wav)
     # ← 把 waveform 傳到 separator 設定的裝置 (cuda or cpu)
     waveform = waveform.to(sep.device)
@@ -125,8 +107,6 @@ def run_pipeline_file(raw_wav: str, max_workers: int = 3):
 
     # 1) 分離
     sep_start = time.perf_counter()
-    # 1) 分離
-    sep_start = time.perf_counter()
     segments = sep.separate_and_save(waveform, str(out_dir), segment_index=0)
     if not segments:                           # ← 新增
         logger.error("🚨 語者分離失敗：回傳空值 / None")
@@ -134,7 +114,6 @@ def run_pipeline_file(raw_wav: str, max_workers: int = 3):
     sep_end = time.perf_counter()
     logger.info(f"⏱ 分離耗時 {sep_end - sep_start:.3f}s, 共 {len(segments)} 段")
 
-    # 2) 多執行緒處理所有段
     # 2) 多執行緒處理所有段
     logger.info(f"🔄 處理 {len(segments)} 段... (max_workers={max_workers})")
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -413,6 +392,7 @@ def run_pipeline_stream(
 # Backwards compatible name
 run_pipeline_FILE = run_pipeline_file
 run_pipeline_STREAM = run_pipeline_stream
+run_pipeline_DIR = run_pipeline_dir
 
 
 def main():
@@ -435,5 +415,4 @@ def main():
     elif args.mode == "stream":
         run_pipeline_stream(chunk_secs=args.chunk, max_workers=args.workers)
 
-if __name__ == "__main__":
-    main()
+if __name__ == "__main__":    main()
