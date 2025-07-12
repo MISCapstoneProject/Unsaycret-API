@@ -490,13 +490,13 @@ class WeaviateRepository:
             print(f"添加嵌入向量時發生錯誤: {e}")
             raise
     
-    def create_new_speaker(self, speaker_name: str = DEFAULT_SPEAKER_NAME, first_audio_id: Optional[str] = None) -> str:
+    def create_new_speaker(self, speaker_name: str = DEFAULT_SPEAKER_NAME, first_audio: Optional[str] = None) -> str:
         """
         創建新的語者
         
         Args:
             speaker_name: 語者名稱，默認為「未命名語者」
-            first_audio_id: 第一次生成該語者時使用的音檔ID（UUID格式）
+            first_audio: 第一次生成該語者時使用的音檔路徑（如 "20250709_185516\segment_001\speaker1.wav"）
             
         Returns:
             str: 新建立的語者 ID
@@ -535,15 +535,10 @@ class WeaviateRepository:
                 "voiceprint_ids": []  # 初始時沒有聲紋向量
             }
             
-            # 驗證 first_audio_id 是否為有效的 UUID 格式，如果不是則不設置
-            if first_audio_id:
-                try:
-                    # 嘗試將字串解析為 UUID 來驗證格式
-                    uuid.UUID(first_audio_id)
-                    properties["first_audio_id"] = first_audio_id
-                except ValueError:
-                    # 如果不是有效的 UUID 格式，就不設置此屬性
-                    print(f"警告: first_audio_id '{first_audio_id}' 不是有效的 UUID 格式，已跳過")
+            # 如果提供了 first_audio 路徑，則直接存儲
+            if first_audio:
+                properties["first_audio"] = first_audio
+                print(f"設置語者 {speaker_name} 的第一個音檔路徑: {first_audio}")
             
             speaker_collection.data.insert(
                 properties=properties,
@@ -563,7 +558,7 @@ class WeaviateRepository:
         
         Args:
             new_embedding: 新的嵌入向量
-            audio_source: 音訊來源名稱，例如檔案名稱或識別碼
+            audio_source: 音訊來源，例如檔案名稱或路徑
             create_time: 自訂創建時間，如果為 None 則使用當前時間
             updated_time: 自訂更新時間，如果為 None 則使用當前時間
             
@@ -571,8 +566,8 @@ class WeaviateRepository:
             tuple: (語者ID, 聲紋向量ID, 語者名稱)
         """
         try:
-            # 創建新的語者，不傳入 first_audio_id 因為 audio_source 通常不是 UUID
-            speaker_id = self.create_new_speaker()
+            # 創建新的語者，傳入音檔路徑作為 first_audio
+            speaker_id = self.create_new_speaker(first_audio=audio_source)
             
             # 獲取語者名稱
             speaker_collection = self.client.collections.get("Speaker")
@@ -963,8 +958,10 @@ class SpeakerIdentifier:
             # 讀取音檔獲取 signal 和 sr
             signal, sr = sf.read(audio_file)
 
-            # 呼叫新的 stream 處理方法，只傳入檔案名稱而不是描述性文字
-            return self.process_audio_stream(signal, sr, audio_source=os.path.basename(audio_file))
+            # 直接使用完整路徑，統一轉換為正斜線格式
+            audio_source = audio_file.replace('\\', '/')
+            
+            return self.process_audio_stream(signal, sr, audio_source=audio_source)
 
         except Exception as e:
             self.simplified_print(f"處理音檔 {audio_file} 時發生錯誤: {e}", self.verbose)
