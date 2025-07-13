@@ -46,8 +46,8 @@ idtf.add_voiceprint_to_speaker("voice.wav", speaker_uuid)
 距離範圍         動作
 < 0.26          距離極小 → 跳過（認定同一檔）
 0.26 – 0.34     更新 現有聲紋（加權平均）
-0.34 – 0.385    新增聲紋 至同語者
-> 0.385         新語者，建立 Speaker & VoicePrint
+0.34 – 0.4      新增聲紋 至同語者
+> 0.4           新語者，建立 Speaker & VoicePrint
 
 自訂：
 idtf.threshold_low = 0.25

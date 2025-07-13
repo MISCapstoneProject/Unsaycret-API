@@ -37,7 +37,7 @@ def create_weaviate_collections() -> bool:
                 wc.Property(name="create_time", data_type=wc.DataType.DATE),
                 wc.Property(name="last_active_time", data_type=wc.DataType.DATE),
                 wc.Property(name="voiceprint_ids", data_type=wc.DataType.UUID_ARRAY),
-                wc.Property(name="first_audio", data_type=wc.DataType.UUID),
+                wc.Property(name="first_audio", data_type=wc.DataType.TEXT),  # 修改為 TEXT 型別
             ],
             vectorizer_config=wc.Configure.Vectorizer.none()
         )

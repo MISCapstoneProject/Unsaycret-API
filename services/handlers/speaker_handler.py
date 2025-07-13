@@ -8,6 +8,8 @@
 from typing import Dict, Any, Optional, List
 from fastapi import HTTPException
 from modules.management.VID_manager import SpeakerManager
+from modules.identification.VID_identify_v5 import AudioProcessor
+from modules.database.database import DatabaseService
 from utils.logger import get_logger
 
 logger = get_logger(__name__)
@@ -18,6 +20,9 @@ class SpeakerHandler:
     def __init__(self) -> None:
         """初始化語者處理器"""
         self.speaker_manager = SpeakerManager()
+        # 初始化語音處理器和資料庫服務（用於純讀取的語音驗證）
+        self.audio_processor = AudioProcessor()
+        self.database = DatabaseService()
     
     def rename_speaker(
         self, 
@@ -349,6 +354,116 @@ class SpeakerHandler:
             raise
         except Exception as e:
             logger.error(f"刪除語者發生未預期錯誤：{str(e)}")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"伺服器內部錯誤：{str(e)}"
+            )
+    
+    def verify_speaker_voice(
+        self, 
+        audio_file_path: str,
+        threshold: float = 0.39,
+        max_results: int = 3
+    ) -> Dict[str, Any]:
+        """
+        驗證音檔中的語者身份，純讀取操作，不會修改任何資料
+        
+        Args:
+            audio_file_path: 音檔的暫存路徑
+            threshold: 比對閾值，距離小於此值才認為是匹配
+            max_results: 返回最相似的結果數量
+            
+        Returns:
+            Dict[str, Any]: 包含識別結果的字典
+            
+        Raises:
+            HTTPException: 當操作失敗時拋出相應的 HTTP 異常
+        """
+        try:
+            logger.info(f"開始驗證音檔: {audio_file_path}")
+            
+            # 1. 從音檔提取語音特徵向量
+            try:
+                embedding = self.audio_processor.extract_embedding(audio_file_path)
+                logger.debug(f"成功提取語音特徵向量，維度: {embedding.shape}")
+            except Exception as e:
+                logger.error(f"提取語音特徵失敗: {str(e)}")
+                raise HTTPException(
+                    status_code=400, 
+                    detail=f"音檔處理失敗：{str(e)}"
+                )
+            
+            # 2. 與資料庫中的聲紋進行比對（純讀取操作）
+            try:
+                best_id, best_name, best_distance, all_distances = self.database.find_similar_voiceprints(
+                    embedding=embedding,
+                    limit=max_results
+                )
+                logger.debug(f"比對完成，找到 {len(all_distances)} 個候選結果")
+            except Exception as e:
+                logger.error(f"聲紋比對失敗: {str(e)}")
+                raise HTTPException(
+                    status_code=500, 
+                    detail=f"聲紋比對失敗：{str(e)}"
+                )
+            
+            # 3. 處理比對結果
+            if not all_distances:
+                logger.info("資料庫中沒有任何聲紋資料")
+                return {
+                    "success": True,
+                    "message": "資料庫中沒有任何聲紋資料",
+                    "is_known_speaker": False,
+                    "best_match": None,
+                    "all_candidates": [],
+                    "threshold": threshold,
+                    "total_candidates": 0
+                }
+            
+            # 4. 判斷是否為已知語者
+            is_known_speaker = best_distance < threshold
+            
+            # 5. 準備返回的候選結果
+            candidates = []
+            for voice_id, speaker_name, distance, update_count in all_distances:
+                candidates.append({
+                    "voiceprint_id": str(voice_id),
+                    "speaker_name": speaker_name,
+                    "distance": float(distance),
+                    "update_count": update_count,
+                    "is_match": distance < threshold
+                })
+            
+            # 6. 準備最佳匹配結果
+            best_match = None
+            if best_id and best_name:
+                best_match = {
+                    "voiceprint_id": str(best_id),
+                    "speaker_name": best_name,
+                    "distance": float(best_distance),
+                    "is_match": is_known_speaker
+                }
+            
+            # 7. 記錄驗證結果
+            if is_known_speaker:
+                logger.info(f"驗證成功 - 識別為語者: {best_name}, 距離: {best_distance:.4f}")
+            else:
+                logger.info(f"驗證結果 - 未知語者, 最相似語者: {best_name if best_name else '無'}, 距離: {best_distance:.4f}")
+            
+            return {
+                "success": True,
+                "message": "語音驗證完成" if is_known_speaker else "未找到匹配的語者",
+                "is_known_speaker": is_known_speaker,
+                "best_match": best_match,
+                "all_candidates": candidates,
+                "threshold": threshold,
+                "total_candidates": len(candidates)
+            }
+                
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"語音驗證過程發生未預期錯誤：{str(e)}")
             raise HTTPException(
                 status_code=500, 
                 detail=f"伺服器內部錯誤：{str(e)}"

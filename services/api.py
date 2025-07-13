@@ -38,6 +38,31 @@ class SpeakerTransferRequest(BaseModel):
     target_speaker_id: str
     target_speaker_name: str
 
+class VoiceCandidate(BaseModel):
+    """語音驗證候選者模型"""
+    voiceprint_id: str
+    speaker_name: str
+    distance: float
+    update_count: int
+    is_match: bool
+
+class VoiceMatch(BaseModel):
+    """語音匹配結果模型"""
+    voiceprint_id: str
+    speaker_name: str
+    distance: float
+    is_match: bool
+
+class VoiceVerificationResponse(BaseModel):
+    """語音驗證響應模型"""
+    success: bool
+    message: str
+    is_known_speaker: bool
+    best_match: Optional[VoiceMatch] = None
+    all_candidates: List[VoiceCandidate] = []
+    threshold: float
+    total_candidates: int
+
 class SpeakerInfo(BaseModel):
     speaker_id: str
     name: str
@@ -131,6 +156,65 @@ async def delete_speaker(speaker_id: str):
     """
     result = speaker_handler.delete_speaker(speaker_id)
     return ApiResponse(**result)
+
+@app.post("/speaker/verify", response_model=VoiceVerificationResponse)
+async def verify_speaker_voice(
+    file: UploadFile = File(...),
+    max_results: int = Form(3),
+    threshold: float = Form(0.4)
+):
+    """
+    語音驗證API端點 - 純讀取操作，判斷音檔中的語者身份
+    
+    Args:
+        file: 要驗證的音檔
+        max_results: 返回最相似的結果數量 (預設 3)
+        threshold: 比對閾值，距離小於此值才認為是匹配到語者 (預設 0.4)
+        
+    Returns:
+        VoiceVerificationResponse: 包含驗證結果的回應
+    """
+    # 1. 驗證檔案類型
+    if not file.filename or not file.filename.lower().endswith(('.wav', '.mp3', '.flac', '.m4a')):
+        raise HTTPException(
+            status_code=400, 
+            detail="不支援的音檔格式，請使用 WAV、MP3、FLAC 或 M4A 格式"
+        )
+    
+    # 2. 驗證參數範圍
+    if not 0.0 <= threshold <= 1.0:
+        raise HTTPException(
+            status_code=400, 
+            detail="比對閾值必須在 0.0 到 1.0 之間"
+        )
+    
+    if not 1 <= max_results <= 10:
+        raise HTTPException(
+            status_code=400, 
+            detail="最大結果數量必須在 1 到 10 之間"
+        )
+    
+    # 3. 儲存暫存檔案
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+        shutil.copyfileobj(file.file, tmp_file)
+        tmp_path = tmp_file.name
+    
+    try:
+        # 4. 執行語音驗證
+        result = speaker_handler.verify_speaker_voice(
+            audio_file_path=tmp_path,
+            threshold=threshold,
+            max_results=max_results
+        )
+        
+        return VoiceVerificationResponse(**result)
+        
+    finally:
+        # 5. 清理暫存檔案
+        try:
+            os.remove(tmp_path)
+        except:
+            pass  # 忽略刪除暫存檔案的錯誤
 
 
 @app.post("/transcribe_dir")

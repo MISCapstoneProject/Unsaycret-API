@@ -60,7 +60,7 @@ curl -X POST "http://localhost:8000/transcribe" \
      -F "file=@your_audio_file.wav"
 ```
 
-### 1. 語者列表查詢
+### 2. 語者列表查詢
 
 **端點**: `GET /speakers`
 
@@ -111,7 +111,7 @@ curl -X GET "http://localhost:8000/speakers" \
      -H "accept: application/json"
 ```
 
-### 2. 語者資訊查詢
+### 3. 單一語者資訊查詢
 
 **端點**: `GET /speaker/{speaker_id}`
 
@@ -137,9 +137,7 @@ curl -X GET "http://localhost:8000/speaker/81d60ed8-3c8b-43b8-808d-2dd4409ca814"
      -H "accept: application/json"
 ```
 
-### 1. 語者改名功能
-
-### 3. 語者改名功能
+### 4. 語者改名功能
 
 **端點**: `POST /speaker/rename`
 
@@ -178,7 +176,7 @@ curl -X POST "http://localhost:8000/speaker/rename" \
      }'
 ```
 
-### 4. 聲紋轉移功能
+### 5. 聲紋轉移功能
 
 **端點**: `POST /speaker/transfer`
 
@@ -220,7 +218,7 @@ curl -X POST "http://localhost:8000/speaker/transfer" \
      }'
 ```
 
-### 5. 語者刪除功能
+### 6. 語者刪除功能
 
 **端點**: `DELETE /speaker/{speaker_id}`
 
@@ -253,22 +251,84 @@ curl -X DELETE "http://localhost:8000/speaker/81d60ed8-3c8b-43b8-808d-2dd4409ca8
 - 會同時刪除語者本身和其所有聲紋資料
 - 請謹慎使用此功能
 
-### 3. 語者資訊查詢
+### 7. 語音身份驗證
 
-**端點**: `GET /speaker/{speaker_id}`
+**端點**: `POST /speaker/verify`
 
-**功能**: 獲取指定語者的詳細資訊
+**功能**: 查詢聲音是否為資料庫已有的語者 (純讀取操作 - 上傳音檔驗證語者身份，不會對資料庫進行任何修改或新增操作)
+
+**請求格式**: `multipart/form-data`
+- **file** (required): 要驗證的音檔 (支援 `.wav` 格式)
+- **threshold** (optional): 比對閾值，距離小於此值才認為是匹配到語者，預設 0.4 (範圍 0.0-1.0)
+- **max_results** (optional): 返回最相似的結果數量，預設 3 (範圍 1-10)
 
 **回應格式**:
 ```json
 {
-  "speaker_id": "語者的UUID",
-  "speaker_name": "語者名稱",
-  "created_time": "創建時間",
-  "last_active_time": "最後活躍時間",
-  "voiceprint_count": 5
+  "success": true,
+  "message": "語音驗證完成",
+  "is_known_speaker": true,
+  "best_match": {
+    "voiceprint_id": "9a123520-db14-4b98-b0f5-c27470632946",
+    "speaker_name": "王小明",
+    "distance": 0.23,
+    "is_match": true
+  },
+  "all_candidates": [
+    {
+      "voiceprint_id": "9a123520-db14-4b98-b0f5-c27470632946",
+      "speaker_name": "王小明",
+      "distance": 0.23,
+      "update_count": 5,
+      "is_match": true
+    },
+    {
+      "voiceprint_id": "f9d94903-6748-4cef-b89e-7f2d359e764b",
+      "speaker_name": "李小華",
+      "distance": 0.68,
+      "update_count": 3,
+      "is_match": false
+    }
+  ],
+  "threshold": 0.4,
+  "total_candidates": 2
 }
 ```
+
+**回應欄位說明**:
+- `is_known_speaker`: 是否為已知語者（基於比對閾值）
+- `best_match`: 最佳匹配結果，包含語者資訊和相似度
+- `all_candidates`: 所有候選結果，按相似度排序
+- `distance`: 餘弦距離（越小越相似，0.0-1.0）
+- `threshold`: 比對閾值，距離小於此值才認為是匹配
+- `is_match`: 該候選是否超過比對閾值
+- `update_count`: 該聲紋的更新次數
+- `total_candidates`: 候選結果總數
+
+**使用範例**:
+```bash
+# 基本驗證
+curl -X POST "http://localhost:8000/speaker/verify" \
+     -H "accept: application/json" \
+     -H "Content-Type: multipart/form-data" \
+     -F "file=@voice_to_verify.wav"
+
+# 自訂閾值和結果數量
+curl -X POST "http://localhost:8000/speaker/verify" \
+     -H "accept: application/json" \
+     -H "Content-Type: multipart/form-data" \
+     -F "file=@voice_to_verify.wav" \
+     -F "threshold=0.3" \
+     -F "max_results=5"
+```
+
+**特點說明**:
+- ✅ **純讀取操作**: 不會修改、新增或刪除任何資料庫內容
+- ✅ **即時驗證**: 快速判斷音檔中的語者身份
+- ✅ **多格式支援**: 支援常見的音檔格式
+- ✅ **靈活閾值**: 可調整比對嚴格程度
+- ✅ **詳細結果**: 提供完整的比對信息和候選列表
+
 
 ## ⚠️ 錯誤處理
 

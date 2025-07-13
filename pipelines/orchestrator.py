@@ -51,7 +51,15 @@ def process_segment(seg_path: str, t0: float, t1: float) -> dict:
         spk_future = ex.submit(_timed_call, spk.process_audio_file, seg_path)
         asr_future = ex.submit(_timed_call, asr.transcribe, seg_path)
 
-        (speaker_id, name, dist), spk_time = spk_future.result()
+        # 安全地取得語者識別結果
+        spk_result = spk_future.result()
+        if spk_result is None:
+            logger.error(f"語者識別失敗: {seg_path}")
+            speaker_id, name, dist = "unknown", "Unknown", 999.0
+            spk_time = 0.0
+        else:
+            (speaker_id, name, dist), spk_time = spk_result
+            
         (text, conf, words), asr_time = asr_future.result()
 
     logger.info(f"⏱ SpeakerID 耗時 {spk_time:.3f}s")

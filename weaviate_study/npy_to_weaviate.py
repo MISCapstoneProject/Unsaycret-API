@@ -19,7 +19,10 @@ import weaviate.classes.config as wc # type: ignore
 from typing import Dict, List, Tuple, Optional, Any
 
 # 全域常數
-EMBEDDING_DIR = "../embeddingFiles"
+# 動態計算 embeddingFiles 目錄的絕對路徑
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))  # 獲取腳本所在目錄
+PROJECT_ROOT = os.path.dirname(SCRIPT_DIR)  # 上一層即為專案根目錄
+EMBEDDING_DIR = os.path.join(PROJECT_ROOT, "embeddingFiles")
 # 修正：將日期格式設定為台北時區（UTC+8）
 TAIPEI_TIMEZONE = timezone(timedelta(hours=8))
 DEFAULT_DATE = datetime(2025, 1, 1, 0, 0, 0, tzinfo=TAIPEI_TIMEZONE)
@@ -205,9 +208,12 @@ def import_embeddings_to_weaviate(client: Any, embedding_files: Dict[str, List[T
             
             # 從 .npy 檔案中讀取嵌入向量
             embedding_vector = np.load(full_path)
-
+            
             # 檢查維度
             print(f"向量維度為: {embedding_vector.shape}")  
+            
+            # 轉換 NumPy array 為 Python list（Weaviate 要求）
+            embedding_list = embedding_vector.tolist()
             
             # 為嵌入向量生成一個 UUID
             voiceprint_uuid = str(uuid.uuid4())
@@ -229,7 +235,7 @@ def import_embeddings_to_weaviate(client: Any, embedding_files: Dict[str, List[T
                         "speaker": [speaker_uuid]  # 修正：參照格式為列表，每個項目是 UUID
                     },
                     uuid=voiceprint_uuid,
-                    vector=embedding_vector
+                    vector=embedding_list  # 使用轉換後的 Python list
                 )
                 print(f"已匯入嵌入向量: {speaker_folder}/{file_name} (更新次數: {update_count})")
             except Exception as e:
