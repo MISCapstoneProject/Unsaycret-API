@@ -4,7 +4,6 @@
 Unsaycret-API 是一套模組化的語音處理系統，整合語音分離、說者辨識、語音辨識、API 服務，並支援向量資料庫串接。
 這專案執行後會架起 API 伺服器，以供呼叫使用。
 
-
 ## 🚀 主要功能
 
 - 🎙 **語者分離**：採用 SpeechBrain Sepformer，支援雙人語音分離。
@@ -12,7 +11,6 @@ Unsaycret-API 是一套模組化的語音處理系統，整合語音分離、說
 - 🗣 **說話人辨識**：ECAPA-TDNN 語者聲紋比對，支援聲紋自動更新。
 - 🛜 **API 服務**：FastAPI 提供 RESTful 與 WebSocket 介面。
 - 🧠 **Weaviate 整合**：語音向量與辨識結果可存入 Weaviate，支援語者搜尋與比對。
-
 
 ## 📂 目錄結構與模組說明
 
@@ -44,9 +42,10 @@ Unsaycret-API/
 │   └── api.py                   # API 入口
 ├── utils/                   # 其他輔助腳本
 │   ├── logger.py
+│   ├── init_collections.py      # Weaviate 集合初始化
 │   └── sync_npy_username.py
 ├── weaviate_study/          # Weaviate 向量資料庫整合與測試
-│   ├── create_collections.py
+│   ├── create_reset_collections.py
 │   ├── docker-compose.yml
 │   ├── npy_to_weaviate.py
 │   ├── test_create_collection_1.py
@@ -63,7 +62,6 @@ Unsaycret-API/
 ├── README.md                # 本說明文件
 └── ...
 ```
-
 
 ### 各資料夾/模組詳細說明
 
@@ -83,8 +81,9 @@ Unsaycret-API/
   - `database/`：資料庫操作（如 Weaviate）。
     - `database.py`：資料庫連線與查詢。
   - `identification/`：說話人辨識。
-    - `VID_identify_v5.py`：語者辨識主程式，聲紋比對與管理。  - `management/`：語者與資料管理。
-    - `VID_manager.py`：語者資料管理輔助。
+    - `VID_identify_v5.py`：語者辨識主程式，聲紋比對與管理。
+  - `management/`：語者與資料管理。
+    - `manager.py`：語者資料管理輔助。
   - `separation/`：語者分離。
     - `separator.py`：語音分離主流程，呼叫 SpeechBrain。
   - `utils/`：工具模組。
@@ -105,7 +104,6 @@ Unsaycret-API/
 - **work_output/**  
   每次語音處理的結果資料夾，包含分離音檔與辨識結果（output.json）。
 
-
 ## ⚡️ 快速啟動
 
 ### 1. 安裝依賴
@@ -118,63 +116,74 @@ pip install -r requirements.txt
 docker-compose up -d
 ```
 
-### 3. 初始化資料結構
+### 3. 啟動 API 服務
 ```cmd
-python weaviate_study/create_collections.py
-```
-
-### 4. 啟動 FastAPI 伺服器
-
-您可以選擇以下任一方式啟動API服務：
-
-```cmd
-# 方法一：使用 main.py 啟動（推薦）
 python main.py
-
-# 方法二：使用 uvicorn 命令啟動
-uvicorn services.api:app --reload
-
-# 方法三：指定主機和端口
-uvicorn services.api:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-### 5. 訪問API服務
+**注意**：系統會自動初始化 Weaviate 資料庫結構，無需手動執行任何初始化腳本。
 
-啟動成功後，您可以通過以下方式訪問API：
+### 4. 訪問 API 服務
+
+啟動成功後，您可以通過以下方式訪問 API：
 
 - **API 互動式文檔（Swagger UI）**：http://localhost:8000/docs
 - **API 文檔（ReDoc）**：http://localhost:8000/redoc
 - **API 基礎URL**：http://localhost:8000
 
+### 其他啟動方式（進階用戶）
 
-## 🐳 Docker & Weaviate 部署指南 （2025‑06-16 更新）(必要步驟)
+如果你需要更多控制，可以使用以下方式：
 
-### 1 啟動 Weaviate + Console
+```cmd
+# 使用 uvicorn 直接啟動（需要手動初始化資料庫）
+python utils/init_collections.py  # 初始化 Weaviate 集合
+uvicorn services.api:app --reload
 
-```bash
-# 於專案根目錄
-docker compose up -d
+# 指定主機和端口
+uvicorn services.api:app --host 0.0.0.0 --port 8000 --reload
 ```
 
-> 第一次啟動需 30–60 秒；執行 `docker compose ps`，待 `STATUS` 顯示 **Up (healthy)** 即完成。
+## 🐳 Docker 部署指南
 
+### 基本部署步驟
 
-### 2 初始化資料結構（**只需一次**）
-
+1. **啟動 Weaviate 資料庫**
 ```bash
-python weaviate_study/create_collections.py
+docker-compose up -d
 ```
 
-將為語者資訊、向量索引等建立必要 Class；除非想重置資料庫全部，否則不必重跑。
+2. **等待服務就緒**
+```bash
+# 檢查服務狀態
+docker-compose ps
+```
+> 第一次啟動需 30–60 秒，待 `STATUS` 顯示 **Up (healthy)** 即完成。
 
+3. **啟動 API 服務**
+```bash
+python main.py
+```
 
-### 📦 資料庫備份、還原與轉移功能
+### 進階配置
 
-已實現資料庫的資料進行備份、還原與轉移功能，方便進行資料保護與環境遷移。詳細操作步驟與指令將於後續文件補充。
+如需自定義 Weaviate 配置，請編輯 `docker-compose.yml` 文件。
+
+### 資料庫管理工具（選用）
+
+- **重置資料庫**：如需清空所有資料並重新初始化
+```bash
+python weaviate_study/create_reset_collections.py
+```
+
+- **手動初始化集合**：如需單獨初始化（通常不需要）
+```bash
+python utils/init_collections.py
+```
 
 ## 系統需求
 
-- **Python 版本**：Python 3.8+ (建議使用 Python 3.10)
+- **Python 版本**：Python 3.8+ (建議使用 Python 3.12)
 - **作業系統**：Windows 10/11, Linux, macOS
 - **硬體需求**：
   - 最低：4GB RAM，4核心 CPU
@@ -191,34 +200,14 @@ python weaviate_study/create_collections.py
 ### 主要API端點
 
 1. **語音轉錄**: `POST /transcribe` - 上傳音訊檔案進行語音分離、語者識別與轉錄
-2. **語者改名**: `POST /speaker/rename` - 更改語者名稱
-3. **聲紋轉移**: `POST /speaker/transfer` - 合併錯誤識別的語者
-4. **語者查詢**: `GET /speaker/{speaker_id}` - 獲取語者詳細資訊
-
-### 2. 資料夾批次轉錄 API
-
-可以一次處理數個音檔。僅需傳入路徑或上傳 ZIP 檔就可以啟動。
-
-```python
-import requests
-
-# 傳入路徑
-resp = requests.post("http://localhost:8000/transcribe_dir", data={"path": "/path/to/wavs"})
-print(resp.json()["summary_tsv"])
-
-# 以 ZIP 檔上傳
-with open("audios.zip", "rb") as f:
-    resp = requests.post("http://localhost:8000/transcribe_dir", files={"zip_file": f})
-print(resp.json()["summary_tsv"])
-```
-
-## 其他說明
-
-- **模型快取**：ASR 與分離模型會自動下載至 `models/` 相關資料夾。
-- **日誌系統**：所有模組統一使用 `utils/logger.py`，支援多檔案與顏色輸出。
-- **Weaviate**：如需向量資料庫功能，請先啟動 docker-compose 並建立集合。
-- **聲紋管理**：系統會自動儲存語者聲紋，可用於後續辨識與比對。
-- **輸出目錄**：處理結果會儲存在 `work_output/<日期時間>/` 目錄下。
+2. **批次轉錄**: `POST /transcribe_dir` - 批次處理目錄或ZIP檔案中的音訊檔案
+3. **語音驗證**: `POST /speaker/verify` - 驗證音檔中的語者身份
+4. **語者改名**: `POST /speaker/rename` - 更改語者名稱
+5. **聲紋轉移**: `POST /speaker/transfer` - 合併錯誤識別的語者
+6. **語者查詢**: `GET /speaker/{speaker_id}` - 獲取語者詳細資訊
+7. **語者列表**: `GET /speakers` - 列出所有語者
+8. **刪除語者**: `DELETE /speaker/{speaker_id}` - 刪除語者及其聲紋
+9. **即時處理**: `WebSocket /ws/stream` - 即時語音處理（WebSocket）
 
 ## 系統工作流程
 
@@ -243,3 +232,12 @@ print(resp.json()["summary_tsv"])
               │ 整合結果 (Output)  │
               └────────────────────┘
 ```
+
+## 其他說明
+
+- **模型快取**：ASR 與分離模型會自動下載至 `models/` 相關資料夾。
+- **日誌系統**：所有模組統一使用 `utils/logger.py`，支援多檔案與顏色輸出。
+- **資料庫自動初始化**：使用 `python main.py` 啟動時會自動初始化 Weaviate 集合。
+- **聲紋管理**：系統會自動儲存語者聲紋，可用於後續辨識與比對。
+- **輸出目錄**：處理結果會儲存在 `work_output/<日期時間>/` 目錄下。
+- **資料備份與還原**：已實現資料庫的資料進行備份、還原與轉移功能，方便進行資料保護與環境遷移。
