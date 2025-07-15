@@ -1,7 +1,7 @@
 ---
-version: '3.8'
 
 services:
+  # Weaviate 向量資料庫
   weaviate:
     command:
     - --host
@@ -12,7 +12,7 @@ services:
     - http
     image: cr.weaviate.io/semitechnologies/weaviate:1.30.0
     ports:
-    - 8080:8080
+    - 8200:8080
     - 50051:50051
     volumes:
     - weaviate_data:/var/lib/weaviate
@@ -32,17 +32,46 @@ services:
       BACKUP_FILESYSTEM_PATH: '/var/lib/weaviate/backups'
       CLUSTER_HOSTNAME: 'node1'
 
+  # Weaviate 管理界面
   weaviate_console:
     image: semitechnologies/weaviate-console:latest
     ports:
-      - "8081:80"
+      - "18081:80"
     depends_on:
       - weaviate
     environment:
       - WEAVIATE_URL=http://weaviate:8080
 
+  # 語音處理 API 服務
+  unsaycret-api:
+    build: .
+    container_name: unsaycret-api
+    ports:
+      - "18000:8000"
+    depends_on:
+      - weaviate
+    environment:
+      - WEAVIATE_HOST=weaviate
+      - WEAVIATE_PORT=8080
+      - WEAVIATE_SCHEME=http
+      - FASTAPI_HOST=0.0.0.0
+      - FASTAPI_PORT=8000
+      - LOG_LEVEL=INFO
+      - MAX_WORKERS=3
+      - GPU_ENABLED=false
+      - PYTHONPATH=/app
+      - PYTHONUNBUFFERED=1
+    volumes:
+      - ./models:/app/models
+      - ./stream_output:/app/stream_output
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/docs"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+
 volumes:
   weaviate_data:
   weaviate_backups:
-
-...

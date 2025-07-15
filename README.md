@@ -127,9 +127,9 @@ python main.py
 
 啟動成功後，您可以通過以下方式訪問 API：
 
-- **API 互動式文檔（Swagger UI）**：http://localhost:8000/docs
-- **API 文檔（ReDoc）**：http://localhost:8000/redoc
-- **API 基礎URL**：http://localhost:8000
+- **API 互動式文檔（Swagger UI）**：http://localhost:18000/docs
+- **API 文檔（ReDoc）**：http://localhost:18000/redoc
+- **API 基礎URL**：http://localhost:18000
 
 ### 其他啟動方式（進階用戶）
 
@@ -141,7 +141,7 @@ python utils/init_collections.py  # 初始化 Weaviate 集合
 uvicorn services.api:app --reload
 
 # 指定主機和端口
-uvicorn services.api:app --host 0.0.0.0 --port 8000 --reload
+uvicorn services.api:app --host 0.0.0.0 --port 18000 --reload
 ```
 
 ## 🐳 Docker 部署指南

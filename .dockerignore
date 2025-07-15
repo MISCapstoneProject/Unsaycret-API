@@ -1,0 +1,90 @@
+####################  Python 編譯產物 / Python build artefacts  ####################
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+*.egg-info/
+dist/
+build/
+*.egg
+__pypackages__/                     # PEP 582
+site/                               # pip -t
+
+####################  虛擬環境與套件管理 / Virtual env & pkg managers ##############
+.venv*/                             # .venv/、.venv.bak/…
+venv*/
+env*/
+ENV*/
+env.bak*/
+.pdm/
+.poetry/
+
+####################  機密與環境變數檔 / Secrets & runtime config ##################
+*.env
+.env
+
+####################  IDE／編輯器雜檔 / IDE & editor junk #########################
+.vscode/
+.idea/
+*.sw?                               # .swp / .swo
+*~
+.DS_Store                           # macOS 系統檔案
+
+####################  日誌與測試報告 / Logs & coverage reports ####################
+*.log
+logs/
+system_output.log
+coverage.*
+.pytest_cache/
+htmlcov/
+.coverage
+.nyc_output/
+junit.xml
+
+####################  大型資料與模型 / Large data & model files ###################
+models/
+*.bin
+*.pt
+*.ckpt
+*.onnx
+*.model
+16K-model/
+R3SI/
+work_output/
+stream_output/
+ct2_models/
+pretrained_models/
+embeddingFiles/
+*.wav
+*.mp3
+*.flac
+*.ogg
+
+####################  專案雜項／不需打包 / Project-specific misc. ###################
+weaviate_study/
+examples/
+
+####################  版本控制與文件 / VCS & documentation ########################
+.git/
+.gitignore
+.github/
+README*.md
+LICENSE
+*.md
+
+####################  CI／腳本與中繼資料 / CI, scripts & metadata ###############
+pipeline_stages.csv
+deploy.*
+DOCKER_DEPLOYMENT.md
+Unsaycret_API.postman_collection.json
+uv.lock
+pyproject.toml
+*.tmp
+*.temp
+*.bak
+*.old
+
+####################  Docker 本身檔案 / Docker-related files ######################
+.dockerignore
+Dockerfile
+docker-compose*.yml

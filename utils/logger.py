@@ -124,7 +124,7 @@ class CustomFormatter(logging.Formatter):
 
 def get_logger(
     name: str = "test",
-    log_file: Optional[str] = "system_output.log",
+    log_file: Optional[str] = None,
     console_level: int = logging.INFO,
     file_level: int = logging.DEBUG,
     append_mode: bool = True
@@ -173,6 +173,21 @@ def get_logger(
             datefmt='%Y-%m-%d %H:%M:%S'
         ))
         logger.addHandler(file_handler)
+    elif log_file is None:
+        # 如果沒有指定日誌檔案，使用 Docker 友好的預設路徑
+        try:
+            from .docker_config import get_log_file_path
+            default_log_file = get_log_file_path()
+            file_mode = 'a' if append_mode else 'w'
+            file_handler = logging.FileHandler(default_log_file, mode=file_mode, encoding='utf-8')
+            file_handler.setLevel(file_level)
+            file_handler.setFormatter(logging.Formatter(
+                f'[%(asctime)s] [{name}] %(levelname)s: %(message)s',
+                datefmt='%Y-%m-%d %H:%M:%S'
+            ))
+            logger.addHandler(file_handler)
+        except ImportError:
+            pass  # 如果無法導入 docker_config，就不添加文件處理器
     
     # 保存日誌器引用
     _LOGGERS[name] = logger

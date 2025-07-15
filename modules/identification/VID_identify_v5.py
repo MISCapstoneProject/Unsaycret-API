@@ -192,9 +192,16 @@ THRESHOLD_UPDATE = 0.34  # 下:更新嵌入向量，上:新增一筆聲紋
 THRESHOLD_NEW = 0.4    # 判定為新語者
 DEFAULT_SPEAKER_NAME = "未命名語者"  # 預設的語者名稱
 
-# Weaviate 連接參數（如果需要可以修改）
-WEAVIATE_HOST = "localhost"
-WEAVIATE_PORT = "8080"
+# Weaviate 連接參數（從環境變數讀取）
+try:
+    from utils.docker_config import get_env_config
+    env_config = get_env_config()
+    WEAVIATE_HOST = env_config["WEAVIATE_HOST"]
+    WEAVIATE_PORT = env_config["WEAVIATE_PORT"]
+except ImportError:
+    # 如果無法導入 docker_config，使用預設值
+    WEAVIATE_HOST = "localhost"
+    WEAVIATE_PORT = "8200"
 
 
 class AudioProcessor:

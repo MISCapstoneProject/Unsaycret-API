@@ -54,7 +54,7 @@
 **使用範例**:
 ```bash
 # 使用 curl 上傳音訊檔案
-curl -X POST "http://localhost:8000/transcribe" \
+curl -X POST "http://localhost:18000/transcribe" \
      -H "accept: application/json" \
      -H "Content-Type: multipart/form-data" \
      -F "file=@your_audio_file.wav"
@@ -107,7 +107,7 @@ curl -X POST "http://localhost:8000/transcribe" \
 
 **使用範例**:
 ```bash
-curl -X GET "http://localhost:8000/speakers" \
+curl -X GET "http://localhost:18000/speakers" \
      -H "accept: application/json"
 ```
 
@@ -133,7 +133,7 @@ curl -X GET "http://localhost:8000/speakers" \
 
 **使用範例**:
 ```bash
-curl -X GET "http://localhost:8000/speaker/81d60ed8-3c8b-43b8-808d-2dd4409ca814" \
+curl -X GET "http://localhost:18000/speaker/81d60ed8-3c8b-43b8-808d-2dd4409ca814" \
      -H "accept: application/json"
 ```
 
@@ -167,7 +167,7 @@ curl -X GET "http://localhost:8000/speaker/81d60ed8-3c8b-43b8-808d-2dd4409ca814"
 
 **使用範例**:
 ```bash
-curl -X POST "http://localhost:8000/speaker/rename" \
+curl -X POST "http://localhost:18000/speaker/rename" \
      -H "Content-Type: application/json" \
      -d '{
        "speaker_id": "123e4567-e89b-12d3-a456-426614174000",
@@ -208,7 +208,7 @@ curl -X POST "http://localhost:8000/speaker/rename" \
 
 **使用範例**:
 ```bash
-curl -X POST "http://localhost:8000/speaker/transfer" \
+curl -X POST "http://localhost:18000/speaker/transfer" \
      -H "Content-Type: application/json" \
      -d '{
        "source_speaker_id": "123e4567-e89b-12d3-a456-426614174000",
@@ -242,7 +242,7 @@ curl -X POST "http://localhost:8000/speaker/transfer" \
 
 **使用範例**:
 ```bash
-curl -X DELETE "http://localhost:8000/speaker/81d60ed8-3c8b-43b8-808d-2dd4409ca814" \
+curl -X DELETE "http://localhost:18000/speaker/81d60ed8-3c8b-43b8-808d-2dd4409ca814" \
      -H "accept: application/json"
 ```
 
@@ -308,13 +308,13 @@ curl -X DELETE "http://localhost:8000/speaker/81d60ed8-3c8b-43b8-808d-2dd4409ca8
 **使用範例**:
 ```bash
 # 基本驗證
-curl -X POST "http://localhost:8000/speaker/verify" \
+curl -X POST "http://localhost:18000/speaker/verify" \
      -H "accept: application/json" \
      -H "Content-Type: multipart/form-data" \
      -F "file=@voice_to_verify.wav"
 
 # 自訂閾值和結果數量
-curl -X POST "http://localhost:8000/speaker/verify" \
+curl -X POST "http://localhost:18000/speaker/verify" \
      -H "accept: application/json" \
      -H "Content-Type: multipart/form-data" \
      -F "file=@voice_to_verify.wav" \
@@ -373,12 +373,12 @@ python main.py
 uvicorn services.api:app --reload
 
 # 方法三：指定主機和端口
-uvicorn services.api:app --host 0.0.0.0 --port 8000 --reload
+uvicorn services.api:app --host 0.0.0.0 --port 18000 --reload
 ```
 
 ### 3. 訪問API文檔
-- **Swagger UI**: http://localhost:8000/docs
-- **ReDoc**: http://localhost:8000/redoc
+- **Swagger UI**: http://localhost:18000/docs
+- **ReDoc**: http://localhost:18000/redoc
 
 
 ## 🔐 安全注意事項
@@ -409,8 +409,8 @@ python examples/test_speaker_api.py
 ```
 
 ### API測試工具
-- **Swagger UI**: http://localhost:8000/docs
-- **ReDoc**: http://localhost:8000/redoc
+- **Swagger UI**: http://localhost:18000/docs
+- **ReDoc**: http://localhost:18000/redoc
 
 ### 除錯建議
 1. 檢查日誌檔案 `system_output.log` 獲取詳細錯誤資訊

@@ -19,7 +19,7 @@ logger = get_logger(__name__)
 class WeaviateCollectionManager:
     """Weaviate 集合管理器"""
     
-    def __init__(self, host: str = "localhost", port: int = 8080):
+    def __init__(self, host: str = "localhost", port: int = 8200):
         """
         初始化 Weaviate 集合管理器
         
@@ -27,8 +27,13 @@ class WeaviateCollectionManager:
             host: Weaviate 服務器主機地址
             port: Weaviate 服務器端口
         """
-        self.host = host
-        self.port = port
+        # 支援環境變數配置
+        from .docker_config import get_env_config
+        env_config = get_env_config()
+        
+        self.host = host if host != "localhost" else env_config["WEAVIATE_HOST"]
+        self.port = port if port != 8200 else int(env_config["WEAVIATE_PORT"])
+        self.scheme = env_config["WEAVIATE_SCHEME"]
         self.client: Optional[weaviate.WeaviateClient] = None
     
     def __enter__(self):
@@ -216,7 +221,7 @@ class WeaviateCollectionManager:
         return results
 
 
-def ensure_weaviate_collections(host: str = "localhost", port: int = 8080) -> bool:
+def ensure_weaviate_collections(host: str = "localhost", port: int = 8200) -> bool:
     """
     確認 Weaviate collections 存在，若不存在則建立
     
@@ -272,7 +277,7 @@ def main() -> None:
     
     parser = argparse.ArgumentParser(description="初始化 Weaviate 集合")
     parser.add_argument("--host", default="localhost", help="Weaviate 服務器主機地址")
-    parser.add_argument("--port", type=int, default=8080, help="Weaviate 服務器端口")
+    parser.add_argument("--port", type=int, default=8200, help="Weaviate 服務器端口")
     
     args = parser.parse_args()
     

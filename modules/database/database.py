@@ -190,8 +190,27 @@ class DatabaseService:
             return
             
         try:
-            self.client = weaviate.connect_to_local()
-            logger.info("成功連接到 Weaviate 資料庫")
+            # 從環境變數讀取 Weaviate 配置
+            from utils.docker_config import get_env_config
+            config = get_env_config()
+            
+            weaviate_host = config["WEAVIATE_HOST"]
+            weaviate_port = config["WEAVIATE_PORT"]
+            weaviate_scheme = config["WEAVIATE_SCHEME"]
+            
+            # 根據環境選擇連接方式
+            if weaviate_host == "localhost":
+                # 本地開發環境
+                self.client = weaviate.connect_to_local()
+                logger.info("成功連接到本地 Weaviate 資料庫")
+            else:
+                # Docker 環境或遠端連接
+                self.client = weaviate.connect_to_custom(
+                    http_host=weaviate_host,
+                    http_port=weaviate_port,
+                    http_secure=weaviate_scheme == "https"
+                )
+                logger.info(f"成功連接到 Weaviate 資料庫 ({weaviate_scheme}://{weaviate_host}:{weaviate_port})")
             
             # 檢查必要的集合是否存在
             if not self.client.collections.exists(self.SPEAKER_CLASS) or \

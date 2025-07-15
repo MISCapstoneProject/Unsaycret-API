@@ -55,9 +55,21 @@ if __name__ == "__main__":
     print("  📚 GET  /redoc             - API文檔（ReDoc）")
     print("-" * 50)
     
+    # 從環境變數讀取配置
+    try:
+        from utils.docker_config import get_env_config
+        config = get_env_config()
+        host = config["FASTAPI_HOST"]
+        port = config["FASTAPI_PORT"]
+        print(f"🚀 啟動服務於 {host}:{port}")
+    except ImportError:
+        host = "0.0.0.0"
+        port = 18000
+        print(f"🚀 啟動服務於 {host}:{port} (使用預設配置)")
+    
     uvicorn.run(
         app, 
-        host="0.0.0.0", 
-        port=8000,
+        host=host, 
+        port=port,
         log_level="info"
     )
