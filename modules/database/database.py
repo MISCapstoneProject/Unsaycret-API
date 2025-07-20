@@ -1,36 +1,44 @@
 """
 ===============================================================================
-語者與聲紋資料庫接口 (Speaker and Voiceprint Database Interface)
+語者與聲紋資料庫接口 (Speaker and Voiceprint Database Interface) V2
 ===============================================================================
 
-版本：v1.0.1 
-作者：CYouuu
-最後更新：2025-05-19
+版本：v2.0.0
+作者：CYouuu  
+最後更新：2025-07-21
+
+⚠️ 重要變更 ⚠️
+本版本已升級為V2資料庫結構，與V1版本不相容！
+- Speaker: 新增speaker_id (INT)、full_name、nickname、gender、meet_count、meet_days
+- VoicePrint V2: sample_count (預留欄位，可為空值)、quality_score (可為None)
+- 時間欄位重命名: create_time -> created_at, updated_time -> updated_at
 
 主要功能接口：
 -----------
 【語者管理】
 - list_all_speakers()：列出所有語者
-- get_speaker(speaker_id)：獲取語者信息
-- create_speaker(speaker_name)：創建新語者
-- update_speaker_name(speaker_id, new_name)：更新語者名稱
-- update_speaker_last_active(speaker_id, timestamp)：更新活動時間
-- delete_speaker(speaker_id)：刪除語者
+- get_speaker(speaker_uuid)：獲取語者信息（使用UUID）
+- get_speaker_by_id(speaker_id)：獲取語者信息（使用speaker_id）
+- create_speaker(full_name, nickname, gender)：創建新語者
+- update_speaker_name(speaker_uuid, new_full_name, new_nickname)：更新語者名稱
+- update_speaker_last_active(speaker_uuid, timestamp)：更新活動時間
+- update_speaker_stats(speaker_uuid, meet_count, meet_days)：更新統計資訊
+- delete_speaker(speaker_uuid)：刪除語者
 
 【聲紋管理】
-- create_voiceprint(speaker_id, embedding, audio_source, timestamp)：建立聲紋
-- get_voiceprint(voiceprint_id, include_vector)：獲取聲紋
-- update_voiceprint(voiceprint_id, new_embedding, update_count)：更新聲紋
-- delete_voiceprint(voiceprint_id)：刪除聲紋
-- get_speaker_voiceprints(speaker_id, include_vectors)：獲取語者的所有聲紋
-- get_speaker_id_from_voiceprint(voiceprint_id)：獲取聲紋關聯的語者
+- create_voiceprint(speaker_uuid, embedding, audio_source, timestamp)：建立聲紋
+- get_voiceprint(voiceprint_uuid, include_vector)：獲取聲紋
+- update_voiceprint(voiceprint_uuid, new_embedding, update_count)：更新聲紋
+- delete_voiceprint(voiceprint_uuid)：刪除聲紋
+- get_speaker_voiceprints(speaker_uuid, include_vectors)：獲取語者的所有聲紋
+- get_speaker_uuid_from_voiceprint(voiceprint_uuid)：獲取聲紋關聯的語者
 
 【向量搜索】
 - find_similar_voiceprints(embedding, limit)：搜索相似聲紋
 
 【語者與聲紋關聯】
-- add_voiceprint_to_speaker(speaker_id, voiceprint_id)：添加聲紋到語者
-- transfer_voiceprints(source_id, dest_id, voiceprint_ids)：轉移聲紋
+- add_voiceprint_to_speaker(speaker_uuid, voiceprint_uuid)：添加聲紋到語者
+- transfer_voiceprints(source_uuid, dest_uuid, voiceprint_uuids)：轉移聲紋
 
 【其他工具】
 - check_database_connection()：檢查數據庫連接
@@ -79,10 +87,12 @@
 3. 聲紋操作：
    ```python
    # 添加聲紋向量到語者
-   voiceprint_id = db.add_voiceprint(speaker_id, embedding_vector)
+   # 新增聲紋向量 (Weaviate會自動分配UUID)
+   voiceprint_uuid = db.create_voiceprint(speaker_uuid, embedding_vector)
    
    # 更新聲紋向量
-   db.update_voiceprint(voiceprint_id, new_embedding)
+   # 更新聲紋向量 
+   db.update_voiceprint(voiceprint_uuid, new_embedding)
    ```
 
 4. 向量搜索：
@@ -162,6 +172,7 @@ def valid_uuid(value: str) -> bool:
 
 # 默認常數
 DEFAULT_SPEAKER_NAME = "未命名語者"
+DEFAULT_FULL_NAME_PREFIX = "n"  # 預設full_name前綴
 
 # ---------------------------------------------------------------------------
 # 資料庫服務類 (單例模式)
@@ -193,11 +204,20 @@ class DatabaseService:
             self.client = weaviate.connect_to_local()
             logger.info("成功連接到 Weaviate 資料庫")
             
-            # 檢查必要的集合是否存在
+            # 檢查必要的集合是否存在（V2版本）
             if not self.client.collections.exists(self.SPEAKER_CLASS) or \
                not self.client.collections.exists(self.VOICEPRINT_CLASS):
-                logger.warning(f"Weaviate 中缺少必要的集合 ({self.SPEAKER_CLASS} / {self.VOICEPRINT_CLASS})!")
-                logger.warning("請先運行 weaviate_study/create_collections.py 建立所需的集合")
+                logger.warning(f"Weaviate 中缺少必要的V2集合 ({self.SPEAKER_CLASS} / {self.VOICEPRINT_CLASS})!")
+                logger.warning("請先運行 modules/database/init_v2_collections.py 建立所需的V2集合")
+                # 嘗試自動初始化V2集合
+                try:
+                    from modules.database.init_v2_collections import ensure_weaviate_v2_collections
+                    if ensure_weaviate_v2_collections():
+                        logger.info("已自動初始化V2集合")
+                    else:
+                        logger.error("自動初始化V2集合失敗")
+                except ImportError:
+                    logger.error("無法導入V2集合初始化模組")
             
         except Exception as e:
             logger.error(f"連接 Weaviate 資料庫失敗: {e}")
@@ -221,10 +241,10 @@ class DatabaseService:
     
     def list_all_speakers(self) -> List[Dict[str, Any]]:
         """
-        列出所有語者及其基本資訊。
+        列出所有語者及其基本資訊（V2版本）。
         
         Returns:
-            List[Dict[str, Any]]: 語者列表，每個項目包含 uuid、name、create_time 等資訊
+            List[Dict[str, Any]]: 語者列表，每個項目包含 uuid、speaker_id、full_name、nickname 等V2資訊
         """
         try:
             results = (
@@ -236,167 +256,244 @@ class DatabaseService:
                 voiceprint_ids = obj.properties.get("voiceprint_ids", [])
                 speakers.append({
                     "uuid": str(obj.uuid),
-                    "name": obj.properties.get("name", "未命名"),
-                    "create_time": obj.properties.get("create_time", "未知"),
-                    "last_active_time": obj.properties.get("last_active_time", "未知"),
-                    "first_audio_id": obj.properties.get("first_audio_id"),
+                    "speaker_id": obj.properties.get("speaker_id", -1),  # 改為-1表示未設定
+                    "full_name": obj.properties.get("full_name", "未命名"),
+                    "nickname": obj.properties.get("nickname") or "",  # None會變成空字串
+                    "gender": obj.properties.get("gender") or "",  # None會變成空字串
+                    "created_at": obj.properties.get("created_at", "未知"),
+                    "last_active_at": obj.properties.get("last_active_at", "未知"),
+                    "meet_count": obj.properties.get("meet_count"),  # 保持None或原值，不設預設值
+                    "meet_days": obj.properties.get("meet_days"),  # 保持None或原值，不設預設值
+                    "first_audio": obj.properties.get("first_audio") or "",  # None會變成空字串
                     "voiceprint_count": len(voiceprint_ids),
                     "voiceprint_ids": voiceprint_ids,
                 })
-            speakers.sort(key=lambda s: s["last_active_time"], reverse=True)
+            speakers.sort(key=lambda s: s["last_active_at"], reverse=True)
             return speakers
         except Exception as exc:
             logger.error(f"列出語者時發生錯誤: {exc}")
             return []
     
-    def get_speaker(self, speaker_id: str) -> Optional[Any]:
+    def get_speaker(self, speaker_uuid: str) -> Optional[Any]:
         """
-        獲取特定語者的詳細資訊。
+        獲取特定語者的詳細資訊（V2版本，使用UUID）。
         
         Args:
-            speaker_id: 語者的 UUID
+            speaker_uuid: 語者的 UUID
             
         Returns:
             Optional[Any]: 語者物件，若找不到則返回 None
         """
         try:
-            if not valid_uuid(speaker_id):
-                logger.error(f"無效的語者 ID 格式: {speaker_id}")
+            if not valid_uuid(speaker_uuid):
+                logger.error(f"無效的語者 UUID 格式: {speaker_uuid}")
                 return None
                 
             return (
                 self.client.collections.get(self.SPEAKER_CLASS)
-                .query.fetch_object_by_id(uuid=speaker_id)
+                .query.fetch_object_by_id(uuid=speaker_uuid)
             )
         except Exception as exc:
             logger.error(f"獲取語者詳細資訊時發生錯誤: {exc}")
             return None
     
-    def create_speaker(self, speaker_name: str = DEFAULT_SPEAKER_NAME, first_audio_id: Optional[str] = None) -> str:
+    def get_speaker_by_id(self, speaker_id: int) -> Optional[Any]:
         """
-        創建新的語者。
+        獲取特定語者的詳細資訊（V2版本，使用speaker_id）。
         
         Args:
-            speaker_name: 語者名稱，默認為「未命名語者」
-            first_audio_id: 第一次生成該語者時使用的音檔ID（UUID格式）
+            speaker_id: 語者的 speaker_id (INT)
             
         Returns:
-            str: 新建立的語者 ID，若建立失敗則返回空字符串
+            Optional[Any]: 語者物件，若找不到則返回 None
         """
         try:
-            # 創建新的語者
-            speaker_collection = self.client.collections.get(self.SPEAKER_CLASS)
-            speaker_id = str(uuid.uuid4())
+            from weaviate.classes.query import Filter
             
-            # 如果是默認名稱，生成唯一的名稱 (類似 n1, n2, ...)
-            if speaker_name == DEFAULT_SPEAKER_NAME:
-                # 獲取所有語者
-                results = speaker_collection.query.fetch_objects(
-                    limit=100,
-                    return_properties=["name"],
+            results = (
+                self.client.collections.get(self.SPEAKER_CLASS)
+                .query.fetch_objects(
+                    where=Filter.by_property("speaker_id").equal(speaker_id),
+                    limit=1
                 )
-                
-                # 提取所有以 'n' 開頭的數字
-                numbers = []
-                pattern = re.compile(r'^n(\d+)')
-                for obj in results.objects:
-                    name = obj.properties.get("name", "")
-                    match = pattern.match(name)
-                    if match:
-                        numbers.append(int(match.group(1)))
-                
-                # 生成下一個編號
-                next_number = max(numbers) + 1 if numbers else 1
-                speaker_name = f"n{next_number}"
+            )
+            
+            return results.objects[0] if results.objects else None
+        except Exception as exc:
+            logger.error(f"根據speaker_id獲取語者詳細資訊時發生錯誤: {exc}")
+            return None
+    
+    def _get_next_speaker_id(self) -> int:
+        """
+        獲取下一個可用的speaker_id（從1開始）
+        
+        Returns:
+            int: 下一個speaker_id
+        """
+        try:
+            # 獲取所有Speaker的speaker_id
+            results = (
+                self.client.collections.get(self.SPEAKER_CLASS)
+                .query.fetch_objects(
+                    return_properties=["speaker_id"],
+                    limit=1000  # 假設不會超過1000個語者
+                )
+            )
+            
+            # 提取所有現有的speaker_id
+            existing_ids = []
+            for obj in results.objects:
+                speaker_id = obj.properties.get("speaker_id")
+                if speaker_id is not None:
+                    existing_ids.append(speaker_id)
+            
+            # 找出下一個可用的ID
+            next_id = max(existing_ids) + 1 if existing_ids else 1
+            return next_id
+            
+        except Exception as e:
+            logger.error(f"獲取下一個speaker_id時發生錯誤: {e}")
+            # 發生錯誤時返回一個默認值
+            return 1
+
+    def create_speaker(
+        self, 
+        full_name: Optional[str] = None, 
+        nickname: Optional[str] = None,
+        gender: Optional[str] = None,
+        first_audio: Optional[str] = None
+    ) -> str:
+        """
+        創建新的語者（V2版本）。
+        
+        Args:
+            full_name: 語者全名，若為None則自動生成（如n1, n2, ...）
+            nickname: 語者暱稱，可為None
+            gender: 語者性別，可為None
+            first_audio: 第一次生成該語者時使用的音檔來源
+            
+        Returns:
+            str: 新建立的語者 UUID，若建立失敗則返回空字符串
+        """
+        try:
+            # 生成新的UUID和speaker_id
+            speaker_uuid = str(uuid.uuid4())
+            speaker_id = self._get_next_speaker_id()
+            
+            # 如果未提供full_name，自動生成
+            if not full_name:
+                full_name = f"{DEFAULT_FULL_NAME_PREFIX}{speaker_id}"
             
             # 創建語者
-            properties = {
-                "name": speaker_name,
-                "create_time": format_rfc3339(),
-                "last_active_time": format_rfc3339(),
-                "voiceprint_ids": []  # 初始時沒有聲紋向量
-            }
+            speaker_collection = self.client.collections.get(self.SPEAKER_CLASS)
             
-            # 如果提供了 first_audio_id，則加入屬性中
-            if first_audio_id:
-                properties["first_audio_id"] = first_audio_id
+            properties = {
+                "speaker_id": speaker_id,
+                "full_name": full_name,
+                "nickname": nickname or "",
+                "gender": gender or "",
+                "created_at": format_rfc3339(),
+                "last_active_at": format_rfc3339(),
+                "meet_count": None,
+                "meet_days": None,
+                "voiceprint_ids": [],  # 初始時沒有聲紋向量
+                "first_audio": first_audio or ""
+            }
             
             speaker_collection.data.insert(
                 properties=properties,
-                uuid=speaker_id
+                uuid=speaker_uuid
             )
             
-            logger.info(f"已建立新語者 {speaker_name} (ID: {speaker_id})")
-            return speaker_id
+            logger.info(f"已建立新語者 {full_name} (UUID: {speaker_uuid}, ID: {speaker_id})")
+            return speaker_uuid
             
         except Exception as e:
             logger.error(f"創建新語者時發生錯誤: {e}")
             return ""
     
-    def update_speaker_name(self, speaker_id: str, new_name: str) -> bool:
+    def update_speaker_name(
+        self, 
+        speaker_uuid: str, 
+        new_full_name: Optional[str] = None,
+        new_nickname: Optional[str] = None
+    ) -> bool:
         """
-        更改語者名稱，並同步更新所有該語者底下聲紋的 speaker_name。
+        更改語者名稱（V2版本），並同步更新所有該語者底下聲紋的 speaker_name。
         
         Args:
-            speaker_id: 語者 ID
-            new_name: 新的語者名稱
+            speaker_uuid: 語者 UUID
+            new_full_name: 新的全名，若為None則不更新
+            new_nickname: 新的暱稱，若為None則不更新
             
         Returns:
             bool: 是否更新成功
         """
         try:
-            if not valid_uuid(speaker_id):
-                logger.error(f"無效的語者 ID 格式: {speaker_id}")
+            if not valid_uuid(speaker_uuid):
+                logger.error(f"無效的語者 UUID 格式: {speaker_uuid}")
+                return False
+            
+            # 準備要更新的屬性
+            update_properties = {}
+            if new_full_name is not None:
+                update_properties["full_name"] = new_full_name
+            if new_nickname is not None:
+                update_properties["nickname"] = new_nickname
+                
+            if not update_properties:
+                logger.warning("沒有提供任何要更新的名稱")
                 return False
                 
             # 1.先更新 Speaker 本身
             sp_col = self.client.collections.get(self.SPEAKER_CLASS)
-            sp_col.data.update(uuid=speaker_id, properties={"name": new_name})
+            sp_col.data.update(uuid=speaker_uuid, properties=update_properties)
 
-            # 2.拿回這個 Speaker 物件，讀出 voiceprint_ids
-            sp_obj = sp_col.query.fetch_object_by_id(uuid=speaker_id)
+            # 2.拿回這個 Speaker 物件，讀出 voiceprint_ids 和更新後的 full_name
+            sp_obj = sp_col.query.fetch_object_by_id(uuid=speaker_uuid)
             if not sp_obj:
-                logger.error(f"找不到語者 (ID: {speaker_id})")
+                logger.error(f"找不到語者 (UUID: {speaker_uuid})")
                 return False
                 
             vp_ids = sp_obj.properties.get("voiceprint_ids", [])
+            updated_full_name = sp_obj.properties.get("full_name", "未命名")
 
-            # 3.逐一更新每支 VoicePrint
+            # 3.逐一更新每支 VoicePrint 的 speaker_name
             vp_col = self.client.collections.get(self.VOICEPRINT_CLASS)
             for vp_id in vp_ids:
                 vp_col.data.update(
                     uuid=vp_id,
-                    properties={"speaker_name": new_name}
+                    properties={"speaker_name": updated_full_name}
                 )
 
-            logger.info(f"已更新語者 {speaker_id} 的名稱為 {new_name}")
+            logger.info(f"已更新語者 {speaker_uuid} 的名稱")
             return True
         except Exception as exc:
             logger.error(f"更改語者名稱時發生錯誤: {exc}")
             return False
     
-    def update_speaker_last_active(self, speaker_id: str, timestamp: Optional[datetime] = None) -> bool:
+    def update_speaker_last_active(self, speaker_uuid: str, timestamp: Optional[datetime] = None) -> bool:
         """
-        更新語者的最後活動時間。
+        更新語者的最後活動時間（V2版本）。
         
         Args:
-            speaker_id: 語者 ID
+            speaker_uuid: 語者 UUID
             timestamp: 時間戳記，若為 None 則使用當前時間
             
         Returns:
             bool: 是否更新成功
         """
         try:
-            if not valid_uuid(speaker_id):
-                logger.error(f"無效的語者 ID 格式: {speaker_id}")
+            if not valid_uuid(speaker_uuid):
+                logger.error(f"無效的語者 UUID 格式: {speaker_uuid}")
                 return False
                 
             time_str = format_rfc3339(timestamp) if timestamp else format_rfc3339()
             
             sp_col = self.client.collections.get(self.SPEAKER_CLASS)
             sp_col.data.update(
-                uuid=speaker_id, 
-                properties={"last_active_time": time_str}
+                uuid=speaker_uuid, 
+                properties={"last_active_at": time_str}
             )
             
             return True
@@ -404,33 +501,79 @@ class DatabaseService:
             logger.error(f"更新語者最後活動時間時發生錯誤: {exc}")
             return False
     
-    def delete_speaker(self, speaker_id: str) -> bool:
+    def update_speaker_stats(
+        self, 
+        speaker_uuid: str, 
+        meet_count: Optional[int] = None,
+        meet_days: Optional[int] = None
+    ) -> bool:
         """
-        刪除語者，同時刪除該語者底下的所有聲紋。
+        更新語者的統計資訊（V2版本新增）。
         
         Args:
-            speaker_id: 語者 ID
+            speaker_uuid: 語者 UUID
+            meet_count: 會議次數，若為None則不更新
+            meet_days: 會議天數，若為None則不更新
+            
+        Returns:
+            bool: 是否更新成功
+        """
+        try:
+            if not valid_uuid(speaker_uuid):
+                logger.error(f"無效的語者 UUID 格式: {speaker_uuid}")
+                return False
+            
+            # 準備要更新的屬性
+            update_properties = {}
+            if meet_count is not None:
+                update_properties["meet_count"] = meet_count
+            if meet_days is not None:
+                update_properties["meet_days"] = meet_days
+                
+            if not update_properties:
+                logger.warning("沒有提供任何要更新的統計資訊")
+                return False
+            
+            sp_col = self.client.collections.get(self.SPEAKER_CLASS)
+            sp_col.data.update(
+                uuid=speaker_uuid, 
+                properties=update_properties
+            )
+            
+            logger.info(f"已更新語者 {speaker_uuid} 的統計資訊")
+            return True
+        except Exception as exc:
+            logger.error(f"更新語者統計資訊時發生錯誤: {exc}")
+            return False
+    
+    def delete_speaker(self, speaker_uuid: str) -> bool:
+        """
+        刪除語者（V2版本），同時刪除該語者底下的所有聲紋。
+        
+        Args:
+            speaker_uuid: 語者 UUID
             
         Returns:
             bool: 是否刪除成功
         """
         try:
-            if not valid_uuid(speaker_id):
-                logger.error(f"無效的語者 ID 格式: {speaker_id}")
+            if not valid_uuid(speaker_uuid):
+                logger.error(f"無效的語者 UUID 格式: {speaker_uuid}")
                 return False
             
             # 1. 獲取語者的所有聲紋
             speaker_collection = self.client.collections.get(self.SPEAKER_CLASS)
             speaker_obj = speaker_collection.query.fetch_object_by_id(
-                uuid=speaker_id,
-                return_properties=["name", "voiceprint_ids"]
+                uuid=speaker_uuid,
+                return_properties=["full_name", "speaker_id", "voiceprint_ids"]
             )
             
             if not speaker_obj:
-                logger.error(f"找不到語者 (ID: {speaker_id})")
+                logger.error(f"找不到語者 (UUID: {speaker_uuid})")
                 return False
                 
-            speaker_name = speaker_obj.properties.get("name", "未命名")
+            speaker_name = speaker_obj.properties.get("full_name", "未命名")
+            speaker_id = speaker_obj.properties.get("speaker_id", "未知")
             voiceprint_ids = speaker_obj.properties.get("voiceprint_ids", [])
             
             # 2. 刪除語者的所有聲紋
@@ -444,64 +587,64 @@ class DatabaseService:
                     logger.error(f"刪除聲紋 {vp_id} 時發生錯誤: {vp_exc}")
             
             # 3. 刪除語者本身
-            speaker_collection.data.delete_by_id(uuid=speaker_id)
+            speaker_collection.data.delete_by_id(uuid=speaker_uuid)
             
-            logger.info(f"已刪除語者 {speaker_name} (ID: {speaker_id}) 及其 {deleted_count} 個聲紋")
+            logger.info(f"已刪除語者 {speaker_name} (UUID: {speaker_uuid}, ID: {speaker_id}) 及其 {deleted_count} 個聲紋")
             return True
         except Exception as exc:
             logger.error(f"刪除語者時發生錯誤: {exc}")
             return False
     
-    def add_voiceprint_to_speaker(self, speaker_id: str, voiceprint_id: str) -> bool:
+    def add_voiceprint_to_speaker(self, speaker_uuid: str, voiceprint_uuid: str) -> bool:
         """
-        將聲紋向量添加到語者的聲紋列表中。
+        將聲紋向量添加到語者的聲紋列表中（V2版本）。
         
         Args:
-            speaker_id: 語者 ID
-            voiceprint_id: 聲紋向量 ID
+            speaker_uuid: 語者 UUID
+            voiceprint_uuid: 聲紋向量 UUID
             
         Returns:
             bool: 是否添加成功
         """
         try:
-            if not valid_uuid(speaker_id) or not valid_uuid(voiceprint_id):
-                logger.error(f"無效的 ID 格式: speaker_id={speaker_id}, voiceprint_id={voiceprint_id}")
+            if not valid_uuid(speaker_uuid) or not valid_uuid(voiceprint_uuid):
+                logger.error(f"無效的 UUID 格式: speaker_uuid={speaker_uuid}, voiceprint_uuid={voiceprint_uuid}")
                 return False
                 
             # 獲取語者的聲紋列表
             speaker_collection = self.client.collections.get(self.SPEAKER_CLASS)
             speaker_obj = speaker_collection.query.fetch_object_by_id(
-                uuid=speaker_id,
-                return_properties=["voiceprint_ids", "name"]
+                uuid=speaker_uuid,
+                return_properties=["voiceprint_ids", "full_name"]
             )
             
             if not speaker_obj:
-                logger.error(f"找不到語者 (ID: {speaker_id})")
+                logger.error(f"找不到語者 (UUID: {speaker_uuid})")
                 return False
                 
             # 更新語者的聲紋列表
             voiceprint_ids = speaker_obj.properties.get("voiceprint_ids", [])
-            if voiceprint_id not in voiceprint_ids:
-                voiceprint_ids.append(voiceprint_id)
+            if voiceprint_uuid not in voiceprint_ids:
+                voiceprint_ids.append(voiceprint_uuid)
                 
                 speaker_collection.data.update(
-                    uuid=speaker_id,
+                    uuid=speaker_uuid,
                     properties={
                         "voiceprint_ids": voiceprint_ids,
-                        "last_active_time": format_rfc3339()
+                        "last_active_at": format_rfc3339()
                     }
                 )
                 
                 # 更新聲紋的語者名稱
-                speaker_name = speaker_obj.properties.get("name", DEFAULT_SPEAKER_NAME)
+                speaker_name = speaker_obj.properties.get("full_name", DEFAULT_SPEAKER_NAME)
                 voiceprint_collection = self.client.collections.get(self.VOICEPRINT_CLASS)
                 voiceprint_collection.data.update(
-                    uuid=voiceprint_id,
+                    uuid=voiceprint_uuid,
                     properties={"speaker_name": speaker_name},
-                    references={"speaker": [speaker_id]}
+                    references={"speaker": [speaker_uuid]}
                 )
                 
-                logger.info(f"已將聲紋 {voiceprint_id} 添加到語者 {speaker_id} 的聲紋列表")
+                logger.info(f"已將聲紋 {voiceprint_uuid} 添加到語者 {speaker_uuid} 的聲紋列表")
             
             return True
             
@@ -510,27 +653,27 @@ class DatabaseService:
             return False
     
     def transfer_voiceprints(
-        self, source_id: str, dest_id: str, voiceprint_ids: Optional[List[str]] = None
+        self, source_uuid: str, dest_uuid: str, voiceprint_uuids: Optional[List[str]] = None
     ) -> bool:
         """
-        將聲紋從一個語者轉移到另一個語者。
+        將聲紋從一個語者轉移到另一個語者（V2版本）。
         
         Args:
-            source_id: 來源語者 ID
-            dest_id: 目標語者 ID
-            voiceprint_ids: 要轉移的聲紋 ID 列表，若為 None 則轉移全部
+            source_uuid: 來源語者 UUID
+            dest_uuid: 目標語者 UUID
+            voiceprint_uuids: 要轉移的聲紋 UUID 列表，若為 None 則轉移全部
             
         Returns:
             bool: 是否轉移成功
         """
         try:
-            if not valid_uuid(source_id) or not valid_uuid(dest_id):
-                logger.error(f"無效的語者 ID 格式: source_id={source_id}, dest_id={dest_id}")
+            if not valid_uuid(source_uuid) or not valid_uuid(dest_uuid):
+                logger.error(f"無效的語者 UUID 格式: source_uuid={source_uuid}, dest_uuid={dest_uuid}")
                 return False
                 
             collection = self.client.collections.get(self.SPEAKER_CLASS)
-            src_obj = collection.query.fetch_object_by_id(uuid=source_id)
-            dest_obj = collection.query.fetch_object_by_id(uuid=dest_id)
+            src_obj = collection.query.fetch_object_by_id(uuid=source_uuid)
+            dest_obj = collection.query.fetch_object_by_id(uuid=dest_uuid)
             
             if not src_obj or not dest_obj:
                 logger.warning("來源或目標語者不存在。")
@@ -538,36 +681,36 @@ class DatabaseService:
             
             src_vps = set(src_obj.properties.get("voiceprint_ids", []))
             dest_vps = set(dest_obj.properties.get("voiceprint_ids", []))
-            move_set = set(src_vps) if voiceprint_ids is None else set(voiceprint_ids).intersection(src_vps)
+            move_set = set(src_vps) if voiceprint_uuids is None else set(voiceprint_uuids).intersection(src_vps)
             dest_vps.update(move_set)   #聯集，把 move_set 中的元素加入到 dest_vps 中
             src_vps.difference_update(move_set) #差集，把 move_set 中的元素從 src_vps 中刪除
             
             # 更新來源與目標語者的聲紋
-            collection.data.update(uuid=source_id, properties={"voiceprint_ids": list(src_vps)})
-            collection.data.update(uuid=dest_id, properties={"voiceprint_ids": list(dest_vps)})
+            collection.data.update(uuid=source_uuid, properties={"voiceprint_ids": list(src_vps)})
+            collection.data.update(uuid=dest_uuid, properties={"voiceprint_ids": list(dest_vps)})
             
-            # 取得目標語者名稱
-            dest_name = dest_obj.properties.get("name", "未命名")
+            # 取得目標語者名稱（V2使用full_name）
+            dest_name = dest_obj.properties.get("full_name", "未命名")
             
-            # 批次更新被轉移聲紋的 speaker_id 與 speaker_name
+            # 批次更新被轉移聲紋的 speaker_uuid 與 speaker_name
             vp_collection = self.client.collections.get(self.VOICEPRINT_CLASS)
             for vp_id in move_set:
                 try:
                     vp_collection.data.update(uuid=vp_id, properties={
                         "speaker_name": dest_name
-                    }, references={"speaker": [dest_id]})
+                    }, references={"speaker": [dest_uuid]})
                 except Exception as e:
                     logger.error(f"轉移聲紋 {vp_id} 時發生錯誤: {e}")
             
             # 若來源語者已無聲紋，自動刪除
             if not src_vps:
                 try:
-                    collection.data.delete_by_id(uuid=source_id)
-                    logger.info(f"來源語者 {source_id} 已無聲紋，自動刪除。")
+                    collection.data.delete_by_id(uuid=source_uuid)
+                    logger.info(f"來源語者 {source_uuid} 已無聲紋，自動刪除。")
                 except Exception as del_exc:
                     logger.error(f"自動刪除來源語者時發生錯誤: {del_exc}")
                     
-            logger.info(f"已成功將 {len(move_set)} 個聲紋從語者 {source_id} 轉移到語者 {dest_id}")
+            logger.info(f"已成功將 {len(move_set)} 個聲紋從語者 {source_uuid} 轉移到語者 {dest_uuid}")
             return True
         except Exception as exc:
             logger.error(f"轉移聲紋時發生錯誤: {exc}")
@@ -579,40 +722,42 @@ class DatabaseService:
     
     def create_voiceprint(
         self, 
-        speaker_id: str, 
+        speaker_uuid: str, 
         embedding: np.ndarray,
         audio_source: str = "",
-        timestamp: Optional[datetime] = None
+        timestamp: Optional[datetime] = None,
+        quality_score: Optional[float] = None
     ) -> str:
         """
-        為語者創建新的聲紋向量。
+        為語者創建新的聲紋向量（V2版本）。
         
         Args:
-            speaker_id: 語者 ID
+            speaker_uuid: 語者 UUID
             embedding: 聲紋嵌入向量
             audio_source: 音訊來源描述
             timestamp: 時間戳記，用於設定聲紋的創建時間和更新時間
+            quality_score: 聲紋品質評分，可為None
             
         Returns:
-            str: 新建立的聲紋向量 ID，若創建失敗則返回空字符串
+            str: 新建立的聲紋向量 UUID，若創建失敗則返回空字符串
         """
         try:
-            if not valid_uuid(speaker_id):
-                logger.error(f"無效的語者 ID 格式: {speaker_id}")
+            if not valid_uuid(speaker_uuid):
+                logger.error(f"無效的語者 UUID 格式: {speaker_uuid}")
                 return ""
                 
             # 獲取語者資訊
             speaker_collection = self.client.collections.get(self.SPEAKER_CLASS)
             speaker_obj = speaker_collection.query.fetch_object_by_id(
-                uuid=speaker_id,
-                return_properties=["name", "voiceprint_ids"]
+                uuid=speaker_uuid,
+                return_properties=["full_name", "voiceprint_ids"]
             )
             
             if not speaker_obj:
-                logger.error(f"找不到語者 (ID: {speaker_id})")
+                logger.error(f"找不到語者 (UUID: {speaker_uuid})")
                 return ""
                 
-            speaker_name = speaker_obj.properties.get("name", DEFAULT_SPEAKER_NAME)
+            speaker_name = speaker_obj.properties.get("full_name", DEFAULT_SPEAKER_NAME)
             voiceprint_ids = speaker_obj.properties.get("voiceprint_ids", [])
             
             # 格式化時間或使用當前時間
@@ -620,92 +765,93 @@ class DatabaseService:
             
             # 創建新的聲紋向量
             voiceprint_collection = self.client.collections.get(self.VOICEPRINT_CLASS)
-            voiceprint_id = str(uuid.uuid4())
+            voiceprint_uuid = str(uuid.uuid4())
             
             voiceprint_collection.data.insert(
                 properties={
-                    "create_time": time_str,
-                    "updated_time": time_str,
+                    "created_at": time_str,
+                    "updated_at": time_str,
                     "update_count": 1,
+                    "sample_count": None,  # 預留欄位，可為空值
+                    "quality_score": quality_score,  # 可為None
                     "speaker_name": speaker_name,
-                    "audio_source": audio_source
                 },
-                uuid=voiceprint_id,
+                uuid=voiceprint_uuid,
                 vector=embedding.tolist(),
                 references={
-                    "speaker": [speaker_id]
+                    "speaker": [speaker_uuid]
                 }
             )
             
             # 更新語者的聲紋列表
-            voiceprint_ids.append(voiceprint_id)
+            voiceprint_ids.append(voiceprint_uuid)
             speaker_collection.data.update(
-                uuid=speaker_id,
+                uuid=speaker_uuid,
                 properties={
                     "voiceprint_ids": voiceprint_ids,
-                    "last_active_time": time_str
+                    "last_active_at": time_str
                 }
             )
             
-            logger.info(f"已為語者 {speaker_name} 創建新的聲紋向量 (ID: {voiceprint_id})")
-            return voiceprint_id
+            logger.info(f"已為語者 {speaker_name} 創建新的聲紋向量 (UUID: {voiceprint_uuid})")
+            return voiceprint_uuid
             
         except Exception as e:
             logger.error(f"創建聲紋向量時發生錯誤: {e}")
             return ""
     
     
-    def get_voiceprint(self, voiceprint_id: str,
+    def get_voiceprint(self, voiceprint_uuid: str,
                 include_vector: bool = False,
                 include_refs: bool = False)-> Optional[Any]:
         """
-            獲取特定聲紋向量的詳細資訊。
+        獲取特定聲紋向量的詳細資訊（V2版本）。
+        
+        Args:
+            voiceprint_uuid: 聲紋向量 UUID
+            include_vector: 是否包含向量數據
+            include_refs: 是否包含引用的語者 UUID
             
-            Args:
-                voiceprint_id: 聲紋向量 ID
-                include_vector: 是否包含向量數據
-                include_refs: 是否包含引用的語者 ID
-                
-            Returns:
-                Optional[Any]: 聲紋向量物件，若找不到則返回 None
-            """
-        if not valid_uuid(voiceprint_id):
-            logger.error("無效的 VoicePrint UUID: %s", voiceprint_id)
+        Returns:
+            Optional[Any]: 聲紋向量物件，若找不到則返回 None
+        """
+        if not valid_uuid(voiceprint_uuid):
+            logger.error("無效的 VoicePrint UUID: %s", voiceprint_uuid)
             return None
 
         coll = self.client.collections.get(self.VOICEPRINT_CLASS)
 
         try:
             return coll.query.fetch_object_by_id(
-                uuid=voiceprint_id,
+                uuid=voiceprint_uuid,
                 include_vector=include_vector,
                 return_references=(
                     QueryReference(link_on="speaker") if include_refs else None
                 ),
             )
         except Exception as e:
-            logger.error("抓取 VoicePrint %s 失敗: %s", voiceprint_id[:8], e)
+            logger.error("抓取 VoicePrint %s 失敗: %s", voiceprint_uuid[:8], e)
             return None
     
-    def get_voiceprint_properties(self, voiceprint_id: str, properties: List[str]) -> Optional[Dict[str, Any]]:
+    def get_voiceprint_properties(self, voiceprint_uuid: str, properties: List[str]) -> Optional[Dict[str, Any]]:
         """
-        獲取聲紋向量的特定屬性。
+        獲取聲紋向量的特定屬性（V2版本）。
         
         Args:
-            voiceprint_id: 聲紋向量 ID
+            voiceprint_uuid: 聲紋向量 UUID
             properties: 需要獲取的屬性列表
             
         Returns:
             Optional[Dict[str, Any]]: 屬性字典，若找不到則返回 None
         """
         try:
-            if not valid_uuid(voiceprint_id):
-                logger.error(f"無效的聲紋向量 ID 格式: {voiceprint_id}")
+            if not valid_uuid(voiceprint_uuid):
+                logger.error(f"無效的聲紋向量 UUID 格式: {voiceprint_uuid}")
                 return None
                 
             voiceprint_collection = self.client.collections.get(self.VOICEPRINT_CLASS)
             result = voiceprint_collection.query.fetch_object_by_id(
-                uuid=voiceprint_id,
+                uuid=voiceprint_uuid,
                 return_properties=properties
             )
             
@@ -718,127 +864,146 @@ class DatabaseService:
             logger.error(f"獲取聲紋向量屬性時發生錯誤: {e}")
             return None
     
-    def update_voiceprint(self, voiceprint_id: str, new_embedding: np.ndarray, update_count: Optional[int] = None) -> int:
+    def update_voiceprint(
+        self, 
+        voiceprint_uuid: str, 
+        new_embedding: np.ndarray, 
+        update_count: Optional[int] = None,
+        quality_score: Optional[float] = None
+    ) -> int:
         """
-        使用加權移動平均更新現有的聲紋向量。
+        使用加權移動平均更新現有的聲紋向量（V2版本）。
         
         Args:
-            voiceprint_id: 聲紋向量 ID
+            voiceprint_uuid: 聲紋向量 UUID
             new_embedding: 新的嵌入向量
-            update_count: 當前更新次數，若為 None 則從資料庫讀取
+            update_count: 更新次數，若為 None 則從資料庫讀取並+1
+            quality_score: 新的品質分數，若為None則不更新
             
         Returns:
-            int: 更新後的次數，若更新失敗則返回 0
+            int: 更新後的更新次數，若更新失敗則返回 0
         """
         try:
-            if not valid_uuid(voiceprint_id):
-                logger.error(f"無效的聲紋向量 ID 格式: {voiceprint_id}")
+            if not valid_uuid(voiceprint_uuid):
+                logger.error(f"無效的聲紋向量 UUID 格式: {voiceprint_uuid}")
                 return 0
                 
             # 獲取現有的嵌入向量
             voiceprint_collection = self.client.collections.get(self.VOICEPRINT_CLASS)
             existing_object = voiceprint_collection.query.fetch_object_by_id(
-                uuid=voiceprint_id,
+                uuid=voiceprint_uuid,
                 include_vector=True
             )
             
             if not existing_object:
-                logger.error(f"找不到 ID 為 {voiceprint_id} 的聲紋向量")
+                logger.error(f"找不到 UUID 為 {voiceprint_uuid} 的聲紋向量")
                 return 0
             
-            # 如果未提供 update_count，則從資料庫讀取
+            # 如果未提供 update_count，則從資料庫讀取並+1
             if update_count is None:
-                update_count = existing_object.properties.get("update_count")
-                if update_count is None:
-                    logger.error(f"無法獲取聲紋向量 {voiceprint_id} 的更新計數")
+                current_update_count = existing_object.properties.get("update_count")
+                if current_update_count is None:
+                    logger.error(f"無法獲取聲紋向量 {voiceprint_uuid} 的更新次數")
                     return 0
+                update_count = current_update_count + 1
             
             # 獲取現有的嵌入向量            
             vec_dict = existing_object.vector
             raw_old = vec_dict["default"] if isinstance(vec_dict, dict) else vec_dict
             old_embedding = np.array(raw_old, dtype=float)
             
-            # 使用加權移動平均更新嵌入向量
-            updated_embedding = (old_embedding * update_count + new_embedding) / (update_count + 1)
-            new_update_count = update_count + 1
+            # 使用加權移動平均更新嵌入向量（基於更新次數）
+            weight_old = update_count - 1
+            updated_embedding = (old_embedding * weight_old + new_embedding) / update_count
+            
+            # 準備更新屬性
+            update_properties = {
+                "updated_at": format_rfc3339(),
+                "update_count": update_count
+            }
+            
+            # sample_count 獨立維護，保持原值不變或為空值
+            if existing_object.properties.get("sample_count") is not None:
+                update_properties["sample_count"] = existing_object.properties.get("sample_count")
+            
+            # 如果提供了quality_score則更新
+            if quality_score is not None:
+                update_properties["quality_score"] = quality_score
             
             # 更新資料庫中的向量
             voiceprint_collection.data.update(
-                uuid=voiceprint_id,
-                properties={
-                    "updated_time": format_rfc3339(),
-                    "update_count": new_update_count
-                },
+                uuid=voiceprint_uuid,
+                properties=update_properties,
                 vector=updated_embedding.tolist()
             )
             
-            logger.info(f"已更新聲紋向量 {voiceprint_id}，新的更新次數: {new_update_count}")
-            return new_update_count
+            logger.info(f"已更新聲紋向量 {voiceprint_uuid}，新的更新次數: {update_count}")
+            return update_count
             
         except Exception as e:
             logger.error(f"更新聲紋向量時發生錯誤: {e}")
             return 0
     
-    def delete_voiceprint(self, voiceprint_id: str) -> bool:
+    def delete_voiceprint(self, voiceprint_uuid: str) -> bool:
         """
-        刪除聲紋向量，並從相關語者的列表中移除。
+        刪除聲紋向量（V2版本），並從相關語者的列表中移除。
         
         Args:
-            voiceprint_id: 聲紋向量 ID
+            voiceprint_uuid: 聲紋向量 UUID
             
         Returns:
             bool: 是否刪除成功
         """
         try:
-            if not valid_uuid(voiceprint_id):
-                logger.error(f"無效的聲紋向量 ID 格式: {voiceprint_id}")
+            if not valid_uuid(voiceprint_uuid):
+                logger.error(f"無效的聲紋向量 UUID 格式: {voiceprint_uuid}")
                 return False
                 
-            # 獲取聲紋關聯的語者 ID
-            speaker_id = self.get_speaker_id_from_voiceprint(voiceprint_id)
+            # 獲取聲紋關聯的語者 UUID
+            speaker_uuid = self.get_speaker_uuid_from_voiceprint(voiceprint_uuid)
             
             # 如果找到關聯的語者，從語者的聲紋列表中移除
-            if speaker_id:
+            if speaker_uuid:
                 speaker_collection = self.client.collections.get(self.SPEAKER_CLASS)
                 speaker_obj = speaker_collection.query.fetch_object_by_id(
-                    uuid=speaker_id,
+                    uuid=speaker_uuid,
                     return_properties=["voiceprint_ids"]
                 )
                 
                 if speaker_obj:
                     voiceprint_ids = speaker_obj.properties.get("voiceprint_ids", [])
-                    if voiceprint_id in voiceprint_ids:
-                        voiceprint_ids.remove(voiceprint_id)
+                    if voiceprint_uuid in voiceprint_ids:
+                        voiceprint_ids.remove(voiceprint_uuid)
                         
                         speaker_collection.data.update(
-                            uuid=speaker_id,
+                            uuid=speaker_uuid,
                             properties={"voiceprint_ids": voiceprint_ids}
                         )
             
             # 刪除聲紋向量
             voiceprint_collection = self.client.collections.get(self.VOICEPRINT_CLASS)
-            voiceprint_collection.data.delete_by_id(uuid=voiceprint_id)
+            voiceprint_collection.data.delete_by_id(uuid=voiceprint_uuid)
             
-            logger.info(f"已刪除聲紋向量 {voiceprint_id}")
+            logger.info(f"已刪除聲紋向量 {voiceprint_uuid}")
             return True
             
         except Exception as e:
             logger.error(f"刪除聲紋向量時發生錯誤: {e}")
             return False
     
-    def get_speaker_id_from_voiceprint(self, voiceprint_id: str) -> str:
+    def get_speaker_uuid_from_voiceprint(self, voiceprint_uuid: str) -> str:
         """
-        根據聲紋向量 ID 獲取關聯的語者 ID。
+        根據聲紋向量 UUID 獲取關聯的語者 UUID（V2版本）。
         
         Args:
-            voiceprint_id: 聲紋向量 ID
+            voiceprint_uuid: 聲紋向量 UUID
             
         Returns:
-            str: 語者 ID，若找不到則返回空字符串
+            str: 語者 UUID，若找不到則返回空字符串
         """
         try:
-            if not valid_uuid(voiceprint_id):
-                logger.error(f"無效的聲紋向量 ID 格式: {voiceprint_id}")
+            if not valid_uuid(voiceprint_uuid):
+                logger.error(f"無效的聲紋向量 UUID 格式: {voiceprint_uuid}")
                 return ""
                 
             voiceprint_collection = self.client.collections.get(self.VOICEPRINT_CLASS)
@@ -848,39 +1013,42 @@ class DatabaseService:
             )
             
             voiceprint_obj = voiceprint_collection.query.fetch_object_by_id(
-                uuid=voiceprint_id,
+                uuid=voiceprint_uuid,
                 return_references=qr
             )
             
+            if not voiceprint_obj:
+                return ""
+                
             refs = voiceprint_obj.references.get("speaker", []).objects
             if not refs:
                 return ""
                 
             return refs[0].uuid
         except Exception as e:
-            logger.error(f"獲取聲紋關聯的語者 ID 時發生錯誤: {e}")
+            logger.error(f"獲取聲紋關聯的語者 UUID 時發生錯誤: {e}")
             return ""
     
-    def get_speaker_voiceprints(self, speaker_id: str, include_vectors: bool = False) -> List[Dict[str, Any]]:
+    def get_speaker_voiceprints(self, speaker_uuid: str, include_vectors: bool = False) -> List[Dict[str, Any]]:
         """
-        獲取語者的所有聲紋向量。
+        獲取語者的所有聲紋向量（V2版本）。
         
         Args:
-            speaker_id: 語者 ID
+            speaker_uuid: 語者 UUID
             include_vectors: 是否包含向量數據
             
         Returns:
             List[Dict[str, Any]]: 聲紋向量列表
         """
         try:
-            if not valid_uuid(speaker_id):
-                logger.error(f"無效的語者 ID 格式: {speaker_id}")
+            if not valid_uuid(speaker_uuid):
+                logger.error(f"無效的語者 UUID 格式: {speaker_uuid}")
                 return []
                 
             # 獲取語者的聲紋列表
-            speaker_obj = self.get_speaker(speaker_id)
+            speaker_obj = self.get_speaker(speaker_uuid)
             if not speaker_obj:
-                logger.error(f"找不到語者 (ID: {speaker_id})")
+                logger.error(f"找不到語者 (UUID: {speaker_uuid})")
                 return []
                 
             voiceprint_ids = speaker_obj.properties.get("voiceprint_ids", [])
@@ -901,11 +1069,12 @@ class DatabaseService:
                     if vp_obj:
                         vp_data = {
                             "uuid": vp_obj.uuid,
-                            "create_time": vp_obj.properties.get("create_time"),
-                            "updated_time": vp_obj.properties.get("updated_time"),
-                            "update_count": vp_obj.properties.get("update_count"),
-                            "speaker_name": vp_obj.properties.get("speaker_name"),
-                            "audio_source": vp_obj.properties.get("audio_source", "")
+                            "created_at": vp_obj.properties.get("created_at"),
+                            "updated_at": vp_obj.properties.get("updated_at"),
+                            "update_count": vp_obj.properties.get("update_count", -1),
+                            "sample_count": vp_obj.properties.get("sample_count"),
+                            "quality_score": vp_obj.properties.get("quality_score"),
+                            "speaker_name": vp_obj.properties.get("speaker_name")
                         }
                         
                         if include_vectors:
@@ -948,7 +1117,7 @@ class DatabaseService:
             results = voiceprint_collection.query.near_vector(
                 near_vector=embedding.tolist(),
                 limit=limit,
-                return_properties=["speaker_name", "update_count", "create_time", "updated_time"],
+                return_properties=["speaker_name", "update_count", "created_at", "updated_at"],
                 return_metadata=MetadataQuery(distance=True)
             )
             
@@ -1205,7 +1374,6 @@ class DatabaseService:
         except Exception as e:
             logger.error(f"檢查集合 {collection_name} 是否存在時發生錯誤: {e}")
             return False
-
 
 # 單元測試代碼
 if __name__ == "__main__":

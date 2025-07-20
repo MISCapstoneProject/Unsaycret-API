@@ -1,11 +1,17 @@
 """
 ===============================================================================
-語者識別引擎 (Speaker Identification Engine)
+語者識別引擎 (Speaker Identification Engine) V2
 ===============================================================================
 
-版本：v5.1.2    (可從外部傳入時間戳、新增多聲紋映射到單個語者的功能)
+版本：v5.2.0 - V2資料庫版本  
 作者：CYouuu
-最後更新：2025-05-07
+最後更新：2025-07-21
+
+⚠️ 重要變更 ⚠️
+本版本已升級為V2資料庫結構，與V1版本不相容！
+- Speaker: 新增speaker_id (INT)、full_name、nickname、gender等欄位  
+- VoicePrint: 移除冗餘的voiceprint_id，直接使用Weaviate UUID、sample_count、quality_score等欄位
+- 時間欄位重命名: create_time -> created_at, updated_time -> updated_at
 
 功能摘要：
 -----------
@@ -188,9 +194,10 @@ from speechbrain.inference import SpeakerRecognition
 
 # 全域參數設定
 THRESHOLD_LOW = 0.26     # 過於相似，不更新
-THRESHOLD_UPDATE = 0.34  # 下:更新嵌入向量，上:新增一筆聲紋
+THRESHOLD_UPDATE = 0.34  # 下:更新聲紋向量，上:新增一筆聲紋
 THRESHOLD_NEW = 0.4    # 判定為新語者
 DEFAULT_SPEAKER_NAME = "未命名語者"  # 預設的語者名稱
+DEFAULT_FULL_NAME_PREFIX = "n"  # V2版本：預設full_name前綴
 
 # Weaviate 連接參數（如果需要可以修改）
 WEAVIATE_HOST = "localhost"
@@ -309,22 +316,35 @@ class AudioProcessor:
 
 
 class WeaviateRepository:
-    """Weaviate 資料存取庫類別，負責與 Weaviate 資料庫的交互"""
+    """Weaviate 資料存取庫類別，負責與 Weaviate V2 資料庫的交互"""
     
     def __init__(self) -> None:
-        """初始化 Weaviate 連接"""
+        """初始化 Weaviate 連接（V2版本）"""
         try:
             self.client = weaviate.connect_to_local()
-            print("成功連接到 Weaviate 資料庫！")
+            print("成功連接到 Weaviate V2 資料庫！")
             
-            # 檢查必要的集合是否存在
+            # 檢查必要的V2集合是否存在
             if not self.client.collections.exists("VoicePrint") or not self.client.collections.exists("Speaker"):
-                print("警告：Weaviate 中缺少必要的集合 (VoicePrint / Speaker)!")
-                print("請先運行 weaviate_study/create_collections.py 建立所需的集合")
-                print("正在嘗試繼續執行，但可能會發生錯誤...")
+                print("警告：Weaviate 中缺少必要的V2集合 (VoicePrint / Speaker)!")
+                print("請先運行 modules/database/init_v2_collections.py 建立所需的V2集合")
+                print("正在嘗試自動初始化V2集合...")
+                
+                # 嘗試自動初始化V2集合
+                try:
+                    from modules.database.init_v2_collections import ensure_weaviate_v2_collections
+                    if ensure_weaviate_v2_collections():
+                        print("✅ 已自動初始化V2集合！")
+                    else:
+                        print("❌ 自動初始化V2集合失敗！")
+                        raise RuntimeError("無法初始化V2集合")
+                except ImportError:
+                    print("無法導入V2集合初始化模組")
+                    print("使用命令 'python -m modules.database.init_v2_collections' 手動初始化V2集合")
+                    raise
         
         except Exception as e:
-            print(f"無法連接到 Weaviate 資料庫：{e}")
+            print(f"無法連接到 Weaviate V2 資料庫：{e}")
             print("請確認：")
             print("1. Docker 服務是否正在運行")
             print("2. Weaviate 容器是否已經啟動")
@@ -349,7 +369,7 @@ class WeaviateRepository:
             results = voice_print_collection.query.near_vector(
                 near_vector=new_embedding.tolist(),
                 limit=3,  # 測試! 返回前 3 個最相似的結果
-                return_properties=["speaker_name", "update_count", "create_time", "updated_time"],
+                return_properties=["speaker_name", "update_count", "sample_count", "created_at", "updated_at"],  # V2屬性
                 return_metadata=MetadataQuery(distance=True)
             )
             
@@ -374,14 +394,14 @@ class WeaviateRepository:
                 
                 object_id = obj.uuid
                 speaker_name = obj.properties.get("speaker_name")
-                update_count = obj.properties.get("update_count")
+                update_count = obj.properties.get("update_count")  # 恢復使用update_count
                 
                 # 使用安全的格式化方法，避免 None 值導致錯誤
                 distance_str = f"{distance:.4f}" if distance is not None else "未知"
                 print(f"比對 - 語者: {speaker_name}, "
                       f"更新次數: {update_count}, 餘弦距離: {distance_str}")
                 
-                # 保存距離資訊
+                # 保存距離資訊（使用update_count作為第4個參數）
                 distances.append((object_id, speaker_name, distance, update_count))
             
             # 找出最小距離
@@ -400,15 +420,15 @@ class WeaviateRepository:
     
     def update_embedding(self, voice_print_id: str, new_embedding: np.ndarray, update_count: int) -> int:
         """
-        使用加權移動平均更新現有的嵌入向量
+        使用加權移動平均更新現有的嵌入向量（V2版本）
         
         Args:
-            voice_print_id: 要更新的聲紋向量 ID
+            voice_print_id: 要更新的聲紋向量 UUID
             new_embedding: 新的嵌入向量
-            update_count: 當前更新次數
+            update_count: 新的更新次數
             
         Returns:
-            int: 更新後的次數
+            int: 更新後的更新次數
         """
         try:
             # 獲取現有的嵌入向量
@@ -419,28 +439,29 @@ class WeaviateRepository:
             )
             
             if not existing_object:
-                raise ValueError(f"找不到 ID 為 {voice_print_id} 的聲紋向量")
+                raise ValueError(f"找不到 UUID 為 {voice_print_id} 的聲紋向量")
             
             # 獲取現有的嵌入向量            
             vec_dict = existing_object.vector   # 取出 Weaviate 回傳的 named vector
             raw_old = vec_dict["default"] if isinstance(vec_dict, dict) else vec_dict   # 如果是 dict，就用 "default" 這組；否則直接當 list 處理
             old_embedding = np.array(raw_old, dtype=float)
             
-            # 使用加權移動平均更新嵌入向量
-            updated_embedding = (old_embedding * update_count + new_embedding) / (update_count + 1)
-            new_update_count = update_count + 1
+            # 使用加權移動平均更新嵌入向量（基於更新次數）
+            weight_old = update_count - 1
+            updated_embedding = (old_embedding * weight_old + new_embedding) / update_count
+            new_update_count = update_count
             
-            # 更新數據庫中的向量
+            # 更新數據庫中的向量（V2屬性名稱）
             voice_print_collection.data.update(
                 uuid=voice_print_id,
                 properties={
-                    "updated_time": format_rfc3339(),
-                    "update_count": new_update_count
+                    "updated_at": format_rfc3339(),  # V2: updated_at
+                    "update_count": new_update_count  # 使用update_count
                 },
                 vector=updated_embedding.tolist()
             )
             
-            print(f"(更新) 聲紋ID {voice_print_id} 已更新，新的更新次數: {new_update_count}")
+            print(f"(更新) 聲紋UUID {voice_print_id} 已更新，新的更新次數: {new_update_count}")
             return new_update_count
             
         except Exception as e:
@@ -449,15 +470,15 @@ class WeaviateRepository:
     
     def add_embedding_without_averaging(self, speaker_name: str, new_embedding: np.ndarray, speaker_id: Optional[str] = None) -> str:
         """
-        為現有語者添加新的嵌入向量（不進行加權平均）
+        為現有語者添加新的嵌入向量（不進行加權平均）（V2版本）
         
         Args:
             speaker_name: 語者名稱
             new_embedding: 新的嵌入向量
-            speaker_id: 現有語者 ID，如果為 None 則創建新語者
+            speaker_id: 現有語者 UUID，如果為 None 則創建新語者
             
         Returns:
-            str: 新建立的聲紋向量 ID
+            str: 新建立的聲紋向量 UUID
         """
         try:
             # 如果沒有提供 speaker_id，則創建新的語者
@@ -466,25 +487,27 @@ class WeaviateRepository:
             
             # 添加新的嵌入向量
             voice_print_collection = self.client.collections.get("VoicePrint")
-            voice_print_id = str(uuid.uuid4())
+            voice_print_uuid = str(uuid.uuid4())
             
-            # 創建新的聲紋向量
+            # 創建新的聲紋向量（V2屬性）
             voice_print_collection.data.insert(
                 properties={
-                    "create_time": format_rfc3339(),
-                    "updated_time": format_rfc3339(),
+                    "created_at": format_rfc3339(),  # V2: created_at
+                    "updated_at": format_rfc3339(),  # V2: updated_at
                     "update_count": 1,
+                    "sample_count": None,  # V2: sample_count（預留，可為空值）
+                    "quality_score": None,  # V2: quality_score（預留，可為空值）
                     "speaker_name": speaker_name
                 },
-                uuid=voice_print_id,
+                uuid=voice_print_uuid,
                 vector=new_embedding.tolist(),
                 references={
                     "speaker": [speaker_id]
                 }
             )
             
-            print(f"(新嵌入) 為語者 {speaker_name} 添加了新的聲紋向量 (ID: {voice_print_id})")
-            return voice_print_id
+            print(f"(新嵌入) 為語者 {speaker_name} 添加了新的聲紋向量 (UUID: {voice_print_uuid})")
+            return voice_print_uuid
             
         except Exception as e:
             print(f"添加嵌入向量時發生錯誤: {e}")
@@ -492,69 +515,90 @@ class WeaviateRepository:
     
     def create_new_speaker(self, speaker_name: str = DEFAULT_SPEAKER_NAME, first_audio: Optional[str] = None) -> str:
         """
-        創建新的語者
+        創建新的語者（V2版本）
         
         Args:
             speaker_name: 語者名稱，默認為「未命名語者」
             first_audio: 第一次生成該語者時使用的音檔路徑（如 "20250709_185516\segment_001\speaker1.wav"）
             
         Returns:
-            str: 新建立的語者 ID
+            str: 新建立的語者 UUID
         """
         try:
             # 創建新的語者
             speaker_collection = self.client.collections.get("Speaker")
-            speaker_id = str(uuid.uuid4())
+            speaker_uuid = str(uuid.uuid4())
+            
+            # 獲取下一個speaker_id
+            speaker_id = self._get_next_speaker_id()
             
             # 如果是默認名稱，生成唯一的名稱 (類似 n1, n2, ...)
             if speaker_name == DEFAULT_SPEAKER_NAME:
-                # 獲取所有語者
-                results = speaker_collection.query.fetch_objects(
-                    limit=100,
-                    return_properties=["name"],
-                )
-                
-                # 提取所有以 'n' 開頭的數字
-                numbers = []
-                pattern = re.compile(r'^n(\d+)')
-                for obj in results.objects:
-                    name = obj.properties.get("name", "")
-                    match = pattern.match(name)
-                    if match:
-                        numbers.append(int(match.group(1)))
-                
-                # 生成下一個編號
-                next_number = max(numbers) + 1 if numbers else 1
-                speaker_name = f"n{next_number}"
+                speaker_name = f"{DEFAULT_FULL_NAME_PREFIX}{speaker_id}"
             
-            # 創建語者
+            # 創建語者（V2屬性）
             properties = {
-                "name": speaker_name,
-                "create_time": format_rfc3339(),
-                "last_active_time": format_rfc3339(),
-                "voiceprint_ids": []  # 初始時沒有聲紋向量
+                "speaker_id": speaker_id,  # V2: speaker_id (INT)
+                "full_name": speaker_name,  # V2: full_name
+                "nickname": None,  # V2: nickname（可為空值）
+                "gender": None,  # V2: gender（可為空值）
+                "created_at": format_rfc3339(),  # V2: created_at
+                "last_active_at": format_rfc3339(),  # V2: last_active_at
+                "meet_count": None,  # V2: meet_count（可為空值）
+                "meet_days": None,  # V2: meet_days（可為空值）
+                "voiceprint_ids": [],  # 初始時沒有聲紋向量
+                "first_audio": first_audio or ""  # V2: first_audio
             }
-            
-            # 如果提供了 first_audio 路徑，則直接存儲
-            if first_audio:
-                properties["first_audio"] = first_audio
-                print(f"設置語者 {speaker_name} 的第一個音檔路徑: {first_audio}")
             
             speaker_collection.data.insert(
                 properties=properties,
-                uuid=speaker_id
+                uuid=speaker_uuid
             )
             
-            print(f"(新語者) 建立新語者 {speaker_name} (ID: {speaker_id})")
-            return speaker_id
+            print(f"(新語者) 建立新語者 {speaker_name} (UUID: {speaker_uuid}, ID: {speaker_id})")
+            if first_audio:
+                print(f"設置語者 {speaker_name} 的第一個音檔路徑: {first_audio}")
+            
+            return speaker_uuid
             
         except Exception as e:
             print(f"創建新語者時發生錯誤: {e}")
             raise
     
+    def _get_next_speaker_id(self) -> int:
+        """
+        獲取下一個可用的speaker_id（從1開始）
+        
+        Returns:
+            int: 下一個speaker_id
+        """
+        try:
+            # 獲取所有Speaker的speaker_id
+            speaker_collection = self.client.collections.get("Speaker")
+            results = speaker_collection.query.fetch_objects(
+                return_properties=["speaker_id"],
+                limit=1000  # 假設不會超過1000個語者
+            )
+            
+            # 提取所有現有的speaker_id
+            existing_ids = []
+            for obj in results.objects:
+                speaker_id = obj.properties.get("speaker_id")
+                if speaker_id is not None:
+                    existing_ids.append(speaker_id)
+            
+            # 找出下一個可用的ID
+            next_id = max(existing_ids) + 1 if existing_ids else 1
+            return next_id
+            
+        except Exception as e:
+            print(f"獲取下一個speaker_id時發生錯誤: {e}")
+            # 發生錯誤時返回一個默認值
+            return 1
+    
     def handle_new_speaker(self, new_embedding: np.ndarray, audio_source: str = "", create_time: Optional[datetime] = None, updated_time: Optional[datetime] = None) -> Tuple[str, str, str]:
         """
-        處理全新的語者：創建新語者和嵌入向量
+        處理全新的語者：創建新語者和嵌入向量（V2版本）
         
         Args:
             new_embedding: 新的嵌入向量
@@ -563,70 +607,71 @@ class WeaviateRepository:
             updated_time: 自訂更新時間，如果為 None 則使用當前時間
             
         Returns:
-            tuple: (語者ID, 聲紋向量ID, 語者名稱)
+            tuple: (語者UUID, 聲紋向量UUID, 語者名稱)
         """
         try:
             # 創建新的語者，傳入音檔路徑作為 first_audio
-            speaker_id = self.create_new_speaker(first_audio=audio_source)
+            speaker_uuid = self.create_new_speaker(first_audio=audio_source)
             
-            # 獲取語者名稱
+            # 獲取語者名稱（V2使用full_name）
             speaker_collection = self.client.collections.get("Speaker")
             speaker_obj = speaker_collection.query.fetch_object_by_id(
-                uuid=speaker_id,
-                return_properties=["name"]
+                uuid=speaker_uuid,
+                return_properties=["full_name"]
             )
             
             if not speaker_obj:
-                raise ValueError(f"找不到剛剛創建的語者 (ID: {speaker_id})")
+                raise ValueError(f"找不到剛剛創建的語者 (UUID: {speaker_uuid})")
             
-            speaker_name = speaker_obj.properties["name"]
+            speaker_name = speaker_obj.properties["full_name"]
             
             # 創建新的嵌入向量，並與語者建立關聯
             voice_print_collection = self.client.collections.get("VoicePrint")
-            voice_print_id = str(uuid.uuid4())
+            voice_print_uuid = str(uuid.uuid4())
             
             # 格式化時間或使用當前時間
             create_time_str = format_rfc3339(create_time) if create_time else format_rfc3339()
             updated_time_str = format_rfc3339(updated_time) if updated_time else format_rfc3339()
             
-            # 創建聲紋向量
+            # 創建聲紋向量（V2屬性）
             voice_print_collection.data.insert(
                 properties={
-                    "create_time": create_time_str,
-                    "updated_time": updated_time_str,
+                    "created_at": create_time_str,  # V2: created_at
+                    "updated_at": updated_time_str,  # V2: updated_at
                     "update_count": 1,
-                    "speaker_name": speaker_name,
-                    "audio_source": audio_source
+                    "sample_count": None,  # V2: sample_count（預留，可為空值）
+                    "quality_score": None,  # V2: quality_score（預留，可為空值）
+                    "speaker_name": speaker_name
                 },
-                uuid=voice_print_id,
+                uuid=voice_print_uuid,
                 vector=new_embedding.tolist(),
                 references={
-                    "speaker": [speaker_id]
+                    "speaker": [speaker_uuid]
                 }
             )
             
             # 更新語者的聲紋向量列表
             speaker_collection.data.update(
-                uuid=speaker_id,
+                uuid=speaker_uuid,
                 properties={
-                    "voiceprint_ids": [voice_print_id],
-                    "last_active_time": updated_time_str
+                    "voiceprint_ids": [voice_print_uuid],
+                    "last_active_at": updated_time_str
                 }
             )
             
-            print(f"(新語者) 已建立新語者 {speaker_name} 和對應的聲紋向量")
-            return speaker_id, voice_print_id, speaker_name
+            print(f"(新語者) 已建立新語者 {speaker_name} 和對應的聲紋向量 (UUID: {voice_print_uuid})")
+            return speaker_uuid, voice_print_uuid, speaker_name
             
         except Exception as e:
             print(f"處理新語者時發生錯誤: {e}")
             raise
     
-    def get_voice_print_properties(self, voice_print_id: str, properties: List[str]) -> Optional[Dict[str, Any]]:
+    def get_voice_print_properties(self, voice_print_uuid: str, properties: List[str]) -> Optional[Dict[str, Any]]:
         """
-        獲取聲紋向量的屬性
+        獲取聲紋向量的屬性（V2版本）
         
         Args:
-            voice_print_id: 聲紋向量 ID
+            voice_print_uuid: 聲紋向量 UUID
             properties: 需要獲取的屬性列表
             
         Returns:
@@ -635,7 +680,7 @@ class WeaviateRepository:
         try:
             voice_print_collection = self.client.collections.get("VoicePrint")
             result = voice_print_collection.query.fetch_object_by_id(
-                uuid=voice_print_id,
+                uuid=voice_print_uuid,
                 return_properties=properties
             )
             
@@ -648,13 +693,13 @@ class WeaviateRepository:
             print(f"獲取聲紋向量屬性時發生錯誤: {e}")
             return None
     
-    def update_speaker_voice_prints(self, speaker_id: str, voice_print_id: str) -> bool:
+    def update_speaker_voice_prints(self, speaker_uuid: str, voice_print_uuid: str) -> bool:
         """
-        更新語者的聲紋向量列表
+        更新語者的聲紋向量列表（V2版本）
         
         Args:
-            speaker_id: 語者 ID
-            voice_print_id: 要添加的聲紋向量 ID
+            speaker_uuid: 語者 UUID
+            voice_print_uuid: 要添加的聲紋向量 UUID
             
         Returns:
             bool: 是否更新成功
@@ -662,7 +707,7 @@ class WeaviateRepository:
         try:
             speaker_collection = self.client.collections.get("Speaker")
             speaker_obj = speaker_collection.query.fetch_object_by_id(
-                uuid=speaker_id,
+                uuid=speaker_uuid,
                 return_properties=["voiceprint_ids"]
             )
             
@@ -670,14 +715,14 @@ class WeaviateRepository:
                 return False
                 
             voiceprint_ids = speaker_obj.properties.get("voiceprint_ids", [])
-            if voice_print_id not in voiceprint_ids:
-                voiceprint_ids.append(voice_print_id)
+            if voice_print_uuid not in voiceprint_ids:
+                voiceprint_ids.append(voice_print_uuid)
                 
                 speaker_collection.data.update(
-                    uuid=speaker_id,
+                    uuid=speaker_uuid,
                     properties={
                         "voiceprint_ids": voiceprint_ids,
-                        "last_active_time": format_rfc3339()
+                        "last_active_at": format_rfc3339()  # V2: last_active_at
                     }
                 )
             
@@ -747,10 +792,10 @@ class SpeakerIdentifier:
     
     def _handle_update_embedding(self, best_id: str, best_name: str, best_distance: float, new_embedding: np.ndarray) -> Tuple[str, str, float]:
         """
-        處理需要更新嵌入向量的情況
+        處理需要更新嵌入向量的情況（V2版本）
         
         Args:
-            best_id: 最佳匹配ID
+            best_id: 最佳匹配的聲紋向量 UUID
             best_name: 最佳匹配語者名稱
             best_distance: 最佳匹配距離
             new_embedding: 新的嵌入向量
@@ -762,12 +807,13 @@ class SpeakerIdentifier:
             # 獲取當前更新次數
             properties = self.database.get_voice_print_properties(best_id, ["update_count"])
             if properties is None:
-                raise ValueError(f"無法獲取聲紋向量 ID {best_id} 的屬性")
+                raise ValueError(f"無法獲取聲紋向量 UUID {best_id} 的屬性")
             
-            update_count = properties["update_count"]
+            update_count = properties.get("update_count", 0)
+            new_update_count = update_count + 1  # 新更新次數 = 當前次數 + 1
             
-            # 更新嵌入向量
-            self.database.update_embedding(best_id, new_embedding, update_count)
+            # 更新嵌入向量（傳遞新的更新次數）
+            self.database.update_embedding(best_id, new_embedding, new_update_count)
             print(f"該音檔與語者 {best_name} 相符，且已更新嵌入檔案。")
             return best_id, best_name, best_distance
         except Exception as e:
@@ -776,7 +822,7 @@ class SpeakerIdentifier:
     
     def _handle_new_speaker(self, new_embedding: np.ndarray, audio_source: str = "", timestamp: Optional[datetime] = None) -> Tuple[str, str, float]:
         """
-        處理新語者的情況：創建新語者
+        處理新語者的情況：創建新語者（V2版本）
         
         Args:
             new_embedding: 新的嵌入向量
@@ -784,9 +830,11 @@ class SpeakerIdentifier:
             timestamp: 音訊的時間戳記，用於設定聲紋的創建時間和更新時間
             
         Returns:
-            Tuple[str, str, float]: (語者ID, 語者名稱, 相似度)
+            Tuple[str, str, float]: (語者UUID, 語者名稱, 相似度)
         """
-        speaker_id, voice_print_id, speaker_name = self.database.handle_new_speaker(new_embedding, audio_source, timestamp, timestamp)
+        speaker_id, voice_print_id, speaker_name = self.database.handle_new_speaker(
+            new_embedding, audio_source, create_time=timestamp, updated_time=timestamp
+        )
         return speaker_id, speaker_name, -1  # -1 表示全新的語者
     
     def _handle_add_new_voiceprint_to_speaker(self, best_id: str, best_name: str, best_distance: float, new_embedding: np.ndarray, audio_source: str = "", timestamp: Optional[datetime] = None) -> Tuple[str, str, float]:
@@ -887,12 +935,14 @@ class SpeakerIdentifier:
             voice_print_collection = self.database.client.collections.get("VoicePrint")
             voice_print_id = str(uuid.uuid4())
             
-            # 創建新的聲紋向量
+            # 創建新的聲紋向量（V2版本）
             voice_print_collection.data.insert(
                 properties={
-                    "create_time": create_time_str,
-                    "updated_time": create_time_str,
-                    "update_count": 1,
+                    "created_at": create_time_str,    # V2: created_at
+                    "updated_at": create_time_str,    # V2: updated_at  
+                    "update_count": 1,                # update_count用途不變
+                    "sample_count": None,             # V2: sample_count（預留，可為空值）
+                    "quality_score": None,            # V2: quality_score（預留，可為空值）
                     "speaker_name": speaker_name,
                     "audio_source": audio_source
                 },
@@ -903,7 +953,7 @@ class SpeakerIdentifier:
                 }
             )
             
-            # 更新語者的聲紋向量列表
+            # 更新語者的聲紋向量列表（V2版本使用UUID參數名稱）
             self.database.update_speaker_voice_prints(speaker_id, voice_print_id)
             
             return voice_print_id
@@ -1109,18 +1159,18 @@ class SpeakerIdentifier:
                 print(f"音檔 {audio_file} 不存在，取消處理。")
                 return False
             
-            # 檢查語者是否存在
+            # 檢查語者是否存在（V2版本使用full_name）
             speaker_collection = self.database.client.collections.get("Speaker")
             speaker_obj = speaker_collection.query.fetch_object_by_id(
                 uuid=speaker_id,
-                return_properties=["name"]
+                return_properties=["full_name"]
             )
             
             if not speaker_obj:
                 print(f"語者 ID {speaker_id} 不存在，取消處理。")
                 return False
                 
-            speaker_name = speaker_obj.properties["name"]
+            speaker_name = speaker_obj.properties["full_name"]  # V2: 使用 full_name
             
             # 提取嵌入向量
             new_embedding = self.audio_processor.extract_embedding(audio_file)

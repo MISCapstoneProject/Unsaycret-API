@@ -119,10 +119,11 @@ class SpeakerManager:
 
     def update_speaker_name(self, speaker_uuid: str, new_name: str) -> bool:
         """
-        更改語者名稱，並同步更新所有該語者底下聲紋的 speaker_name。
+        更改語者名稱（V2版本），並同步更新所有該語者底下聲紋的 speaker_name。
         """
         try:
-            return self._db.update_speaker_name(speaker_uuid, new_name)
+            # V2: 默認更新 full_name
+            return self._db.update_speaker_name(speaker_uuid, new_full_name=new_name)
         except Exception as exc:
             logger.error(f"更改語者名稱時發生錯誤: {exc}")
             return False

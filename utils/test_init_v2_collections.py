@@ -24,7 +24,7 @@ from tqdm import tqdm
 from dataclasses import dataclass
 
 from utils.logger import get_logger
-from utils.init_v2_collections import (
+from modules.database.init_v2_collections import (
     WeaviateV2CollectionManager, 
     SpeakerData, 
     SessionData, 

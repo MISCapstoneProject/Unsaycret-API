@@ -306,7 +306,6 @@ class WeaviateV2CollectionManager:
             voiceprint_collection = self.client.collections.create(
                 name=collection_name,
                 properties=[
-                    wc.Property(name="voiceprint_id", data_type=wc.DataType.TEXT),
                     wc.Property(name="created_at", data_type=wc.DataType.DATE),
                     wc.Property(name="updated_at", data_type=wc.DataType.DATE),
                     wc.Property(name="update_count", data_type=wc.DataType.INT),

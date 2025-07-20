@@ -61,7 +61,7 @@ class SpeakerHandler:
                 )
             
             # 3. 驗證當前名稱是否匹配（安全檢查）
-            current_speaker_name = obj.properties.get('name', '')
+            current_speaker_name = obj.properties.get('full_name', '')  # V2: 使用 full_name
             if current_name.strip() != current_speaker_name:
                 raise HTTPException(
                     status_code=400, 
@@ -151,8 +151,8 @@ class SpeakerHandler:
                 )
             
             # 4. 驗證語者名稱是否匹配（安全檢查）
-            source_name = source_speaker.properties.get('name', '')
-            target_name = target_speaker.properties.get('name', '')
+            source_name = source_speaker.properties.get('full_name', '')  # V2: 使用 full_name
+            target_name = target_speaker.properties.get('full_name', '')  # V2: 使用 full_name
             
             if source_speaker_name.strip() != source_name:
                 raise HTTPException(
@@ -203,13 +203,13 @@ class SpeakerHandler:
     
     def get_speaker_info(self, speaker_id: str) -> Dict[str, Any]:
         """
-        獲取語者資訊
+        獲取語者資訊 - 回傳 V2 資料庫完整結構
         
         Args:
             speaker_id: 語者ID
             
         Returns:
-            Dict[str, Any]: 語者資訊
+            Dict[str, Any]: V2 資料庫完整語者資訊
             
         Raises:
             HTTPException: 當語者不存在時
@@ -224,13 +224,18 @@ class SpeakerHandler:
             
             props = obj.properties
 
+            # 回傳 V2 資料庫的所有屬性，保持原始值（包括 None）
             return {
-                "speaker_id": obj.uuid,
-                "speaker_name": props.get('name', ''),
-                "created_time": props.get('create_time', ''),
-                "last_active_time": props.get('last_active_time', ''),
-                "first_audio_id": props.get('first_audio_id'),
-                "voiceprint_count": len(props.get('voiceprint_ids', []))
+                "speaker_id": str(obj.uuid),  # UUID 轉字串
+                "full_name": props.get('full_name'),  # 可能是 None
+                "nickname": props.get('nickname'),  # 可能是 None
+                "gender": props.get('gender'),  # 可能是 None
+                "created_at": props.get('created_at'),  # 可能是 None
+                "last_active_at": props.get('last_active_at'),  # 可能是 None
+                "meet_count": props.get('meet_count'),  # 可能是 None
+                "meet_days": props.get('meet_days'),  # 可能是 None
+                "voiceprint_ids": [str(vid) for vid in props.get('voiceprint_ids', [])],  # UUID 陣列轉字串陣列
+                "first_audio": props.get('first_audio')  # 可能是 None
             }
         except HTTPException:
             raise
@@ -243,48 +248,38 @@ class SpeakerHandler:
 
     def list_all_speakers(self) -> List[Dict[str, Any]]:
         """
-        列出所有語者的業務邏輯
+        列出所有語者的業務邏輯 - 回傳 V2 資料庫完整結構
         
         Returns:
-            List[Dict[str, Any]]: 語者列表，包含完整資訊（含 first_audio_id）
+            List[Dict[str, Any]]: V2 資料庫完整語者列表
             
         Raises:
             HTTPException: 當操作失敗時拋出相應的 HTTP 異常
         """
         try:
-            # 1. 從 SpeakerManager 獲取所有語者（現在已包含 voiceprint_ids）
-            speakers = self.speaker_manager.list_all_speakers()
+            # 1. 從資料庫服務獲取所有語者（V2版本）
+            speakers = self.database.list_all_speakers()
             
-            # 2. 轉換為 API 回應格式
+            # 2. 轉換為 V2 API 回應格式（保留原始值，包括 None）
             api_speakers = []
             for speaker in speakers:
-                voiceprint_ids = speaker.get("voiceprint_ids", [])
-                
-                # 轉換 datetime 物件為字串
-                created_at = speaker.get("create_time")
-                if created_at and hasattr(created_at, 'isoformat'):
-                    created_at = created_at.isoformat()
-                elif created_at == "未知":
-                    created_at = None
-                
-                updated_at = speaker.get("last_active_time") 
-                if updated_at and hasattr(updated_at, 'isoformat'):
-                    updated_at = updated_at.isoformat()
-                elif updated_at == "未知":
-                    updated_at = None
-                
                 # 轉換 UUID 物件為字串
                 speaker_id = str(speaker["uuid"])
-                voiceprint_ids_str = [str(vp_id) for vp_id in voiceprint_ids]
+                voiceprint_ids = speaker.get("voiceprint_ids", [])
+                voiceprint_ids_str = [str(vp_id) for vp_id in voiceprint_ids] if voiceprint_ids else []
                 
+                # V2 資料庫完整屬性，保持原始值
                 api_speaker = {
                     "speaker_id": speaker_id,
-                    "name": speaker["name"],
-                    "created_at": created_at,
-                    "updated_at": updated_at,
-                    "voiceprint_ids": voiceprint_ids_str,
-                    # 包含 first_audio_id
-                    "first_audio_id": str(speaker.get("first_audio_id"))
+                    "full_name": speaker.get("full_name"),  # 可能是 None
+                    "nickname": speaker.get("nickname"),  # 可能是 None  
+                    "gender": speaker.get("gender"),  # 可能是 None
+                    "created_at": speaker.get("created_at"),  # 可能是 None
+                    "last_active_at": speaker.get("last_active_at"),  # 可能是 None
+                    "meet_count": speaker.get("meet_count"),  # 可能是 None
+                    "meet_days": speaker.get("meet_days"),  # 可能是 None
+                    "voiceprint_ids": voiceprint_ids_str,  # UUID 陣列轉字串陣列
+                    "first_audio": speaker.get("first_audio")  # 可能是 None
                 }
                 
                 api_speakers.append(api_speaker)
@@ -326,7 +321,7 @@ class SpeakerHandler:
                 )
             
             # 3. 獲取語者資訊用於回傳
-            speaker_name = obj.properties.get('name', '未命名')
+            speaker_name = obj.properties.get('full_name', '未命名')  # V2: 使用 full_name
             voiceprint_count = len(obj.properties.get('voiceprint_ids', []))
             
             # 4. 執行刪除操作
@@ -427,7 +422,7 @@ class SpeakerHandler:
             candidates = []
             for voice_id, speaker_name, distance, update_count in all_distances:
                 candidates.append({
-                    "voiceprint_id": str(voice_id),
+                    "voiceprint_uuid": str(voice_id),  # 更新欄位名稱
                     "speaker_name": speaker_name,
                     "distance": float(distance),
                     "update_count": update_count,
@@ -438,7 +433,7 @@ class SpeakerHandler:
             best_match = None
             if best_id and best_name:
                 best_match = {
-                    "voiceprint_id": str(best_id),
+                    "voiceprint_uuid": str(best_id),  # 更新欄位名稱
                     "speaker_name": best_name,
                     "distance": float(best_distance),
                     "is_match": is_known_speaker

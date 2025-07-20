@@ -40,7 +40,7 @@ class SpeakerTransferRequest(BaseModel):
 
 class VoiceCandidate(BaseModel):
     """語音驗證候選者模型"""
-    voiceprint_id: str
+    voiceprint_uuid: str  # 使用 UUID 作為識別符
     speaker_name: str
     distance: float
     update_count: int
@@ -48,7 +48,7 @@ class VoiceCandidate(BaseModel):
 
 class VoiceMatch(BaseModel):
     """語音匹配結果模型"""
-    voiceprint_id: str
+    voiceprint_uuid: str  # 使用 UUID 作為識別符
     speaker_name: str
     distance: float
     is_match: bool
@@ -64,12 +64,17 @@ class VoiceVerificationResponse(BaseModel):
     total_candidates: int
 
 class SpeakerInfo(BaseModel):
+    """V2 資料庫完整語者資訊模型"""
     speaker_id: str
-    name: str
-    first_audio_id: Optional[str] = None
+    full_name: Optional[str] = None
+    nickname: Optional[str] = None
+    gender: Optional[str] = None
     created_at: Optional[str] = None
-    updated_at: Optional[str] = None
+    last_active_at: Optional[str] = None
+    meet_count: Optional[int] = None
+    meet_days: Optional[int] = None
     voiceprint_ids: Optional[List[str]] = None
+    first_audio: Optional[str] = None
 
 class ApiResponse(BaseModel):
     """統一API回應模型"""
@@ -135,10 +140,11 @@ async def transfer_voiceprints(request: SpeakerTransferRequest):
     )
     return ApiResponse(**result)
 
-@app.get("/speaker/{speaker_id}")
+@app.get("/speaker/{speaker_id}", response_model=SpeakerInfo)
 async def get_speaker_info(speaker_id: str):
     """
     獲取語者資訊的輔助API（用於前端驗證）
+    回傳 V2 資料庫完整結構
     """
     return speaker_handler.get_speaker_info(speaker_id)
 
