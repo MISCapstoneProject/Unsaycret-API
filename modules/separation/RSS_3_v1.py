@@ -5,6 +5,16 @@ import numpy as np
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
 
+# 從 utils 模組載入配置
+from utils.constants import (
+    AUDIO_CHUNK_SIZE, AUDIO_PYAUDIO_FORMAT_STR, AUDIO_CHANNELS, 
+    AUDIO_RECORDING_RATE, AUDIO_TARGET_RATE, AUDIO_WINDOW_SIZE, 
+    AUDIO_OVERLAP, AUDIO_MIN_ENERGY_THRESHOLD, NOISE_REDUCE_STRENGTH, 
+    AUDIO_MAX_BUFFER_MINUTES, SNR_THRESHOLD, WIENER_FILTER_STRENGTH,
+    HIGH_FREQ_CUTOFF, DYNAMIC_RANGE_COMPRESSION, CONVTASNET_MODEL_NAME,
+    NUM_SPEAKERS_SEPARATION
+)
+
 # 設定日誌 - 改為 INFO 級別
 logging.basicConfig(
     level=logging.INFO,
@@ -29,30 +39,8 @@ import time
 from scipy import signal
 from scipy.ndimage import uniform_filter1d
 
-# 基本錄音參數
-CHUNK = 1024
-FORMAT = pyaudio.paFloat32
-CHANNELS = 1
-RATE = 44100
-TARGET_RATE = 16000
-WINDOW_SIZE = 6
-OVERLAP = 0.5
+# 設定音訊裝置參數
 DEVICE_INDEX = None
-
-# 音訊處理參數
-MIN_ENERGY_THRESHOLD = 0.001
-NOISE_REDUCE_STRENGTH = 0.05  # 降低降噪強度以保持音質
-MAX_BUFFER_MINUTES = 5
-SNR_THRESHOLD = 8  # 降低 SNR 閾值
-
-# 音訊品質改善參數
-WIENER_FILTER_STRENGTH = 0.01  # 更溫和的維納濾波
-HIGH_FREQ_CUTOFF = 7500  # 提高高頻截止點
-DYNAMIC_RANGE_COMPRESSION = 0.7  # 動態範圍壓縮
-
-# ConvTasNet 模型參數
-MODEL_NAME = "JorisCos/ConvTasNet_Libri3Mix_sepnoisy_16k"
-NUM_SPEAKERS = 3
 
 
 class AudioSeparator:
@@ -62,10 +50,10 @@ class AudioSeparator:
         self.snr_threshold = snr_threshold
         
         logger.info(f"使用設備: {self.device}")
-        logger.info(f"模型: {MODEL_NAME}")
+        logger.info(f"模型: {CONVTASNET_MODEL_NAME}")
         
         # 設計更溫和的低通濾波器
-        nyquist = TARGET_RATE // 2
+        nyquist = AUDIO_TARGET_RATE // 2
         cutoff = min(HIGH_FREQ_CUTOFF, nyquist - 100)
         self.lowpass_filter = signal.butter(2, cutoff / nyquist, btype='low', output='sos')  # 降低濾波器階數
         
@@ -80,8 +68,8 @@ class AudioSeparator:
         
         try:
             self.resampler = torchaudio.transforms.Resample(
-                orig_freq=RATE,
-                new_freq=TARGET_RATE
+                orig_freq=AUDIO_RECORDING_RATE,
+                new_freq=AUDIO_TARGET_RATE
             ).to(self.device)
         except Exception as e:
             logger.error(f"重新取樣器初始化失敗: {e}")
@@ -96,14 +84,14 @@ class AudioSeparator:
             'errors': 0
         }
         
-        self.max_buffer_size = int(RATE * MAX_BUFFER_MINUTES * 60 / CHUNK)
+        self.max_buffer_size = int(AUDIO_RECORDING_RATE * AUDIO_MAX_BUFFER_MINUTES * 60 / AUDIO_CHUNK_SIZE)
         logger.info("AudioSeparator 初始化完成")
 
     def _load_model(self):
         """載入 ConvTasNet 模型"""
         if USE_ASTEROID:
             try:
-                model = ConvTasNet.from_pretrained(MODEL_NAME)
+                model = ConvTasNet.from_pretrained(CONVTASNET_MODEL_NAME)
                 model = model.to(self.device)
                 model.eval()
                 return model
@@ -112,7 +100,7 @@ class AudioSeparator:
         
         try:
             model = AutoModel.from_pretrained(
-                MODEL_NAME,
+                CONVTASNET_MODEL_NAME,
                 trust_remote_code=True
             )
             model = model.to(self.device)
@@ -163,12 +151,12 @@ class AudioSeparator:
     def wiener_filter(self, audio_signal):
         """維納濾波器 - 更溫和的處理"""
         try:
-            f, t, stft = signal.stft(audio_signal, fs=TARGET_RATE, nperseg=512, noverlap=256)
+            f, t, stft = signal.stft(audio_signal, fs=AUDIO_TARGET_RATE, nperseg=512, noverlap=256)
             
             # 使用更溫和的雜訊估計
-            quiet_samples = min(int(TARGET_RATE * 0.05), len(audio_signal) // 8)
+            quiet_samples = min(int(AUDIO_TARGET_RATE * 0.05), len(audio_signal) // 8)
             noise_sample = audio_signal[:quiet_samples]
-            _, _, noise_stft = signal.stft(noise_sample, fs=TARGET_RATE, nperseg=512, noverlap=256)
+            _, _, noise_stft = signal.stft(noise_sample, fs=AUDIO_TARGET_RATE, nperseg=512, noverlap=256)
             noise_power = np.mean(np.abs(noise_stft) ** 2, axis=1, keepdims=True)
             
             signal_power = np.abs(stft) ** 2
@@ -178,7 +166,7 @@ class AudioSeparator:
             wiener_gain = np.clip(wiener_gain, 0.1, 1.0)
             
             filtered_stft = stft * wiener_gain
-            _, filtered_audio = signal.istft(filtered_stft, fs=TARGET_RATE)
+            _, filtered_audio = signal.istft(filtered_stft, fs=AUDIO_TARGET_RATE)
             
             return filtered_audio[:len(audio_signal)]
         except:
@@ -232,13 +220,13 @@ class AudioSeparator:
     def spectral_gating(self, audio):
         """改良的頻譜閘控降噪"""
         try:
-            noise_sample_length = max(int(TARGET_RATE * 0.05), 1)
+            noise_sample_length = max(int(AUDIO_TARGET_RATE * 0.05), 1)
             noise_sample = audio[:noise_sample_length]
             
             return nr.reduce_noise(
                 y=audio,
                 y_noise=noise_sample,
-                sr=TARGET_RATE,
+                sr=AUDIO_TARGET_RATE,
                 prop_decrease=NOISE_REDUCE_STRENGTH,
                 stationary=False,  # 非穩態雜訊處理
                 n_jobs=1
@@ -253,11 +241,11 @@ class AudioSeparator:
         
         # 處理形狀
         if len(separated_signals.shape) == 3:
-            if separated_signals.shape[1] == NUM_SPEAKERS:
+            if separated_signals.shape[1] == NUM_SPEAKERS_SEPARATION:
                 enhanced_signals = torch.zeros_like(separated_signals)
                 speaker_dim = 1
                 time_dim = 2
-            elif separated_signals.shape[2] == NUM_SPEAKERS:
+            elif separated_signals.shape[2] == NUM_SPEAKERS_SEPARATION:
                 separated_signals = separated_signals.transpose(1, 2)
                 enhanced_signals = torch.zeros_like(separated_signals)
                 speaker_dim = 1
@@ -267,7 +255,7 @@ class AudioSeparator:
                 speaker_dim = 2
                 time_dim = 1
         else:
-            if separated_signals.shape[0] == NUM_SPEAKERS:
+            if separated_signals.shape[0] == NUM_SPEAKERS_SEPARATION:
                 separated_signals = separated_signals.unsqueeze(0)
                 enhanced_signals = torch.zeros_like(separated_signals)
                 speaker_dim = 1
@@ -322,20 +310,20 @@ class AudioSeparator:
         """處理音訊格式"""
         try:
             # 轉換為 float32
-            if FORMAT == pyaudio.paInt16:
+            if AUDIO_PYAUDIO_FORMAT_STR == "paInt16":
                 audio_float = audio_data.astype(np.float32) / 32768.0
             else:
                 audio_float = audio_data.astype(np.float32)
             
             # 能量檢測：過低則略過
             energy = np.mean(np.abs(audio_float))
-            if energy < MIN_ENERGY_THRESHOLD:
-                logger.debug(f"音訊能量 ({energy:.6f}) 低於閾值 ({MIN_ENERGY_THRESHOLD})")
+            if energy < AUDIO_MIN_ENERGY_THRESHOLD:
+                logger.debug(f"音訊能量 ({energy:.6f}) 低於閾值 ({AUDIO_MIN_ENERGY_THRESHOLD})")
                 return None
             
             # 重塑為正確形狀
             if len(audio_float.shape) == 1:
-                audio_float = audio_float.reshape(-1, CHANNELS)
+                audio_float = audio_float.reshape(-1, AUDIO_CHANNELS)
 
             # 調整形狀以符合模型輸入：[channels, time]
             audio_tensor = torch.from_numpy(audio_float).T.float()
@@ -390,20 +378,20 @@ class AudioSeparator:
                 logger.info(f"使用音訊設備: {device_info['name']}")
             
             stream = p.open(
-                format=FORMAT,
-                channels=CHANNELS,
-                rate=RATE,
+                format=pyaudio.paFloat32,  # 使用實際的 pyaudio 常數
+                channels=AUDIO_CHANNELS,
+                rate=AUDIO_RECORDING_RATE,
                 input=True,
-                frames_per_buffer=CHUNK,
+                frames_per_buffer=AUDIO_CHUNK_SIZE,
                 input_device_index=DEVICE_INDEX
             )
             
             logger.info("開始錄音")
             
             # 計算緩衝區大小與重疊數據
-            samples_per_window = int(WINDOW_SIZE * RATE)
-            window_frames = int(samples_per_window / CHUNK)
-            overlap_frames = int((OVERLAP * RATE) / CHUNK)
+            samples_per_window = int(AUDIO_WINDOW_SIZE * AUDIO_RECORDING_RATE)
+            window_frames = int(samples_per_window / AUDIO_CHUNK_SIZE)
+            overlap_frames = int((AUDIO_OVERLAP * AUDIO_RECORDING_RATE) / AUDIO_CHUNK_SIZE)
             slide_frames = window_frames - overlap_frames
             
             buffer = []
@@ -413,8 +401,8 @@ class AudioSeparator:
             
             while self.is_recording:
                 try:
-                    data = stream.read(CHUNK, exception_on_overflow=False)
-                    frame = np.frombuffer(data, dtype=np.float32 if FORMAT == pyaudio.paFloat32 else np.int16)
+                    data = stream.read(AUDIO_CHUNK_SIZE, exception_on_overflow=False)
+                    frame = np.frombuffer(data, dtype=np.float32 if AUDIO_PYAUDIO_FORMAT_STR == "paFloat32" else np.int16)
                     
                     buffer.append(frame)
                     
@@ -511,7 +499,7 @@ class AudioSeparator:
             
         try:
             mixed_audio = np.concatenate(mixed_audio_buffer)
-            mixed_audio = mixed_audio.reshape(-1, CHANNELS)
+            mixed_audio = mixed_audio.reshape(-1, AUDIO_CHANNELS)
             
             timestamp = datetime.now().strftime('%Y%m%d-%H_%M_%S')
             mixed_output_file = os.path.join(
@@ -523,7 +511,7 @@ class AudioSeparator:
             torchaudio.save(
                 mixed_output_file,
                 mixed_tensor,
-                RATE
+                AUDIO_RECORDING_RATE
             )
             logger.info(f"已儲存原始混合音訊：{mixed_output_file}")
             
@@ -571,7 +559,7 @@ class AudioSeparator:
                 
                 # 處理輸出格式
                 if len(enhanced_separated.shape) == 3:
-                    if enhanced_separated.shape[1] == NUM_SPEAKERS:
+                    if enhanced_separated.shape[1] == NUM_SPEAKERS_SEPARATION:
                         num_speakers = enhanced_separated.shape[1]
                         speaker_dim = 1
                     else:
@@ -582,7 +570,7 @@ class AudioSeparator:
                     speaker_dim = 0
                 
                 saved_count = 0
-                for i in range(min(num_speakers, NUM_SPEAKERS)):
+                for i in range(min(num_speakers, NUM_SPEAKERS_SEPARATION)):
                     try:
                         if speaker_dim == 1:
                             speaker_audio = enhanced_separated[0, i, :].cpu()
@@ -615,7 +603,7 @@ class AudioSeparator:
                             torchaudio.save(
                                 output_file,
                                 final_tensor,
-                                TARGET_RATE
+                                AUDIO_TARGET_RATE
                             )
                             saved_count += 1
                     except Exception as e:

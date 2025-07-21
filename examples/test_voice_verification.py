@@ -7,11 +7,13 @@
 import requests
 import json
 from pathlib import Path
+from utils.env_config import API_HOST, API_PORT
+from utils.constants import API_DEFAULT_VERIFICATION_THRESHOLD, API_DEFAULT_MAX_RESULTS
 
-# API基礎URL
-BASE_URL = "http://localhost:8000"
+# API基礎URL（使用環境變數配置）
+BASE_URL = f"http://{API_HOST}:{API_PORT}"
 
-def test_voice_verification(audio_file_path: str, threshold: float = 0.4, max_results: int = 3):
+def test_voice_verification(audio_file_path: str, threshold: float = API_DEFAULT_VERIFICATION_THRESHOLD, max_results: int = API_DEFAULT_MAX_RESULTS):
     """
     測試語音驗證API
     

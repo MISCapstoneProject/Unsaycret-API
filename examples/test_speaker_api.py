@@ -3,9 +3,10 @@
 """
 import requests
 import json
+from utils.env_config import API_HOST, API_PORT
 
-# API基礎URL（請根據您的實際部署調整）
-BASE_URL = "http://localhost:8000"
+# API基礎URL（使用環境變數配置）
+BASE_URL = f"http://{API_HOST}:{API_PORT}"
 
 def test_get_speaker_info(speaker_id: str):
     """測試獲取說話者資訊"""

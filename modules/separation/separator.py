@@ -127,6 +127,20 @@ except ImportError:
 # 導入日誌模組
 from utils.logger import get_logger
 
+# 導入配置 (環境變數)
+from utils.env_config import (
+    AUDIO_RATE, MODELS_BASE_DIR
+)
+
+# 導入常數 (應用程式參數)  
+from utils.constants import (
+    THRESHOLD_LOW, THRESHOLD_UPDATE, THRESHOLD_NEW,
+    DEFAULT_SEPARATION_MODEL, SPEECHBRAIN_SEPARATOR_MODEL,
+    AUDIO_SAMPLE_RATE, AUDIO_CHUNK_SIZE, AUDIO_CHANNELS, 
+    AUDIO_WINDOW_SIZE, AUDIO_OVERLAP, AUDIO_MIN_ENERGY_THRESHOLD, 
+    AUDIO_MAX_BUFFER_MINUTES, API_MAX_WORKERS, AUDIO_TARGET_RATE
+)
+
 # 導入 main_identify_v5 模組
 from modules.identification import VID_identify_v5 as speaker_id
 
@@ -140,26 +154,30 @@ MODEL_CONFIGS = {
     SeparationModel.CONVTASNET_3SPEAKER: {
         "model_name": "JorisCos/ConvTasNet_Libri3Mix_sepnoisy_16k",
         "num_speakers": 3,
-        "sample_rate": 16000,
+        "sample_rate": AUDIO_SAMPLE_RATE,
         "use_speechbrain": False
     },
     SeparationModel.SEPFORMER_2SPEAKER: {
-        "model_name": "speechbrain/sepformer-whamr16k",
+        "model_name": SPEECHBRAIN_SEPARATOR_MODEL,
         "num_speakers": 2,
-        "sample_rate": 16000,
+        "sample_rate": AUDIO_SAMPLE_RATE,
         "use_speechbrain": True
     }
 }
 
-# 基本錄音參數
-CHUNK = 1024
+# 基本錄音參數（從配置讀取）
+CHUNK = AUDIO_CHUNK_SIZE
 FORMAT = pyaudio.paFloat32
-CHANNELS = 1
-RATE = 44100
-TARGET_RATE = 16000
-WINDOW_SIZE = 6
-OVERLAP = 0.5
+CHANNELS = AUDIO_CHANNELS
+RATE = AUDIO_RATE
+TARGET_RATE = AUDIO_TARGET_RATE
+WINDOW_SIZE = AUDIO_WINDOW_SIZE
+OVERLAP = AUDIO_OVERLAP
 DEVICE_INDEX = None
+
+# 處理參數（從配置讀取）
+MIN_ENERGY_THRESHOLD = AUDIO_MIN_ENERGY_THRESHOLD
+MAX_BUFFER_MINUTES = AUDIO_MAX_BUFFER_MINUTES
 
 # 音訊處理參數
 MIN_ENERGY_THRESHOLD = 0.001
@@ -172,8 +190,16 @@ WIENER_FILTER_STRENGTH = 0.01  # 更溫和的維納濾波
 HIGH_FREQ_CUTOFF = 7500  # 提高高頻截止點
 DYNAMIC_RANGE_COMPRESSION = 0.7  # 動態範圍壓縮
 
-# ConvTasNet 模型參數 (修改為動態配置)
-DEFAULT_MODEL = SeparationModel.SEPFORMER_2SPEAKER
+# ConvTasNet 模型參數 (使用常數配置)
+DEFAULT_MODEL = DEFAULT_SEPARATION_MODEL
+# 修正 DEFAULT_MODEL 的賦值
+if DEFAULT_SEPARATION_MODEL == "sepformer_2speaker":
+    DEFAULT_MODEL = SeparationModel.SEPFORMER_2SPEAKER
+elif DEFAULT_SEPARATION_MODEL == "convtasnet_3speaker":
+    DEFAULT_MODEL = SeparationModel.CONVTASNET_3SPEAKER
+else:
+    DEFAULT_MODEL = SeparationModel.SEPFORMER_2SPEAKER  # 預設值
+
 MODEL_NAME = MODEL_CONFIGS[DEFAULT_MODEL]["model_name"]
 NUM_SPEAKERS = MODEL_CONFIGS[DEFAULT_MODEL]["num_speakers"]
 
@@ -269,7 +295,7 @@ class AudioSeparator:
             logger.error(f"重新取樣器初始化失敗: {e}")
             raise
         
-        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.executor = ThreadPoolExecutor(max_workers=API_MAX_WORKERS)
         self.futures = []
         self.is_recording = False
         self.output_files = []  # 儲存分離後的音檔路徑
@@ -293,16 +319,64 @@ class AudioSeparator:
             # 使用 SpeechBrain SepFormer 模型
             try:
                 logger.info(f"載入 SpeechBrain 模型: {model_name}")
+                
+                # 檢查本地模型目錄是否包含無效的符號連結
+                local_model_path = os.path.abspath(f"models/{self.model_type.value}")
+                if os.path.exists(local_model_path):
+                    logger.info(f"檢查本地模型路徑: {local_model_path}")
+                    
+                    # 檢查是否有無效的符號連結 (Windows JUNCTION 指向 Linux 路徑)
+                    hyperparams_file = os.path.join(local_model_path, "hyperparams.yaml")
+                    if os.path.exists(hyperparams_file):
+                        try:
+                            # 測試檔案讀取權限
+                            with open(hyperparams_file, 'r', encoding='utf-8') as f:
+                                content = f.read(100)  # 讀取前100個字符來測試
+                            logger.info("本地模型檔案可正常讀取")
+                        except (PermissionError, OSError, UnicodeDecodeError) as e:
+                            logger.warning(f"本地模型檔案無法讀取: {e}")
+                            logger.info("檢測到無效的符號連結，需要重新下載模型...")
+                            
+                            # 刪除包含無效符號連結的目錄
+                            try:
+                                import shutil
+                                shutil.rmtree(local_model_path, ignore_errors=True)
+                                logger.info(f"已刪除無效的模型目錄: {local_model_path}")
+                            except Exception as rm_error:
+                                logger.warning(f"刪除模型目錄時出現問題: {rm_error}")
+                
+                # 嘗試載入模型 (如果本地檔案無效，SpeechBrain 會自動重新下載)
                 model = separator.from_hparams(
                     source=model_name,
-                    savedir=f"models/{self.model_type.value}",
+                    savedir=os.path.abspath(f"models/{self.model_type.value}"),
                     run_opts={"device": self.device}
                 )
                 logger.info("SpeechBrain 模型載入成功")
                 return model
+                
             except Exception as e:
                 logger.error(f"SpeechBrain 模型載入失敗: {e}")
-                raise
+                
+                # 最後嘗試：強制重新下載
+                try:
+                    logger.info("嘗試強制重新下載模型...")
+                    import shutil
+                    local_model_path = os.path.abspath(f"models/{self.model_type.value}")
+                    if os.path.exists(local_model_path):
+                        shutil.rmtree(local_model_path, ignore_errors=True)
+                        logger.info("已清除本地模型快取")
+                    
+                    model = separator.from_hparams(
+                        source=model_name,
+                        savedir=os.path.abspath(f"models/{self.model_type.value}"),
+                        run_opts={"device": self.device}
+                    )
+                    logger.info("強制重新下載後模型載入成功")
+                    return model
+                    
+                except Exception as final_error:
+                    logger.error(f"所有嘗試都失敗了: {final_error}")
+                    raise Exception(f"模型載入完全失敗。請檢查網路連接和模型可用性。原始錯誤: {e}")
         else:
             # 使用 ConvTasNet 模型（原有邏輯）
             if USE_ASTEROID:
@@ -346,13 +420,13 @@ class AudioSeparator:
                 if self.model_config["use_speechbrain"]:
                     # SpeechBrain SepFormer 模型測試
                     # SepFormer 期望輸入格式為 [batch, samples]
-                    test_audio = torch.randn(1, 16000).to(self.device)
+                    test_audio = torch.randn(1, AUDIO_SAMPLE_RATE).to(self.device)
                     logger.debug(f"SpeechBrain 測試音訊形狀: {test_audio.shape}")
                     output = self.model.separate_batch(test_audio)
                 else:
                     # ConvTasNet 模型測試
                     # ConvTasNet 期望輸入格式為 [batch, channels, samples]
-                    test_audio = torch.randn(1, 1, 16000).to(self.device)
+                    test_audio = torch.randn(1, 1, AUDIO_SAMPLE_RATE).to(self.device)
                     logger.debug(f"ConvTasNet 測試音訊形狀: {test_audio.shape}")
                     output = self.model(test_audio)
                     

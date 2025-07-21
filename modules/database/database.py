@@ -140,6 +140,9 @@ from utils.logger import get_logger
 # 創建本模組的日誌器
 logger = get_logger(__name__)
 
+# 導入配置
+from utils.env_config import WEAVIATE_HOST, WEAVIATE_PORT, WEAVIATE_CONNECTION_TIMEOUT
+
 # ---------------------------------------------------------------------------
 # 常數與輔助函數
 # ---------------------------------------------------------------------------
@@ -201,8 +204,11 @@ class DatabaseService:
             return
             
         try:
-            self.client = weaviate.connect_to_local()
-            logger.info("成功連接到 Weaviate 資料庫")
+            self.client = weaviate.connect_to_local(
+                host=WEAVIATE_HOST,
+                port=WEAVIATE_PORT,
+            )
+            logger.info(f"成功連接到 Weaviate 資料庫 ({WEAVIATE_HOST}:{WEAVIATE_PORT})")
             
             # 檢查必要的集合是否存在（V2版本）
             if not self.client.collections.exists(self.SPEAKER_CLASS) or \
@@ -254,14 +260,30 @@ class DatabaseService:
             speakers = []
             for obj in results.objects:
                 voiceprint_ids = obj.properties.get("voiceprint_ids", [])
+                
+                # 處理時間欄位，確保轉換為字串格式
+                created_at = obj.properties.get("created_at")
+                last_active_at = obj.properties.get("last_active_at")
+                
+                # 如果是 datetime 對象，轉換為 ISO 格式字串
+                if hasattr(created_at, 'isoformat'):
+                    created_at = created_at.isoformat()
+                elif created_at is None:
+                    created_at = "未知"
+                    
+                if hasattr(last_active_at, 'isoformat'):
+                    last_active_at = last_active_at.isoformat()
+                elif last_active_at is None:
+                    last_active_at = "未知"
+                
                 speakers.append({
                     "uuid": str(obj.uuid),
                     "speaker_id": obj.properties.get("speaker_id", -1),  # 改為-1表示未設定
                     "full_name": obj.properties.get("full_name", "未命名"),
                     "nickname": obj.properties.get("nickname") or "",  # None會變成空字串
                     "gender": obj.properties.get("gender") or "",  # None會變成空字串
-                    "created_at": obj.properties.get("created_at", "未知"),
-                    "last_active_at": obj.properties.get("last_active_at", "未知"),
+                    "created_at": created_at,
+                    "last_active_at": last_active_at,
                     "meet_count": obj.properties.get("meet_count"),  # 保持None或原值，不設預設值
                     "meet_days": obj.properties.get("meet_days"),  # 保持None或原值，不設預設值
                     "first_audio": obj.properties.get("first_audio") or "",  # None會變成空字串
@@ -1067,10 +1089,25 @@ class DatabaseService:
                     )
                     
                     if vp_obj:
+                        # 處理時間欄位，確保轉換為字串格式
+                        created_at = vp_obj.properties.get("created_at")
+                        updated_at = vp_obj.properties.get("updated_at")
+                        
+                        # 如果是 datetime 對象，轉換為 ISO 格式字串
+                        if hasattr(created_at, 'isoformat'):
+                            created_at = created_at.isoformat()
+                        elif created_at is None:
+                            created_at = None  # 保持 None
+                            
+                        if hasattr(updated_at, 'isoformat'):
+                            updated_at = updated_at.isoformat()
+                        elif updated_at is None:
+                            updated_at = None  # 保持 None
+                        
                         vp_data = {
                             "uuid": vp_obj.uuid,
-                            "created_at": vp_obj.properties.get("created_at"),
-                            "updated_at": vp_obj.properties.get("updated_at"),
+                            "created_at": created_at,
+                            "updated_at": updated_at,
                             "update_count": vp_obj.properties.get("update_count", -1),
                             "sample_count": vp_obj.properties.get("sample_count"),
                             "quality_score": vp_obj.properties.get("quality_score"),

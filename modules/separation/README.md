@@ -1,8 +1,9 @@
-Real‑time Speech Separation & Speaker Identification System
+# Separation (語音分離) 模組
 
-版本：v2.1.6 
-最後更新：2025‑06‑18
-作者:Gino
+**版本**: v0.4.0
+**作者**: Gino  
+**最後更新者**: CYouuu  
+**最後更新**: 2025-07-21
 
 本程式是一支「即時語音多工處理」腳本，能夠在錄音進行中：
 

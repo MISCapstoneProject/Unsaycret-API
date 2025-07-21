@@ -1,6 +1,10 @@
-# utils
+# Utils (工具) 模組
 
-共用工具，例如集中式 `get_logger` 函式，以及資料同步腳本。
+**版本**: v0.4.0
+**最後更新**: 2025-07-21
+
+共用工具，包含環境配置、日誌系統、常數定義等。
+提供集中式 `get_logger` 函式與配置管理工具。
 基本使用：
 ```python
 from utils import get_logger

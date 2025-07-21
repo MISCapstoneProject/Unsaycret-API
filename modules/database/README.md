@@ -1,129 +1,373 @@
-# Database Module (Weaviate)
+# Database Module (Weaviate V2)
 
-**版本**：v1.0.1  
-**作者**：Gino
-**最後更新**：2025-05-19  
+**版本**：v0.4.0  
+**作者**：CYouuu  
+**最後更新者**：CYouuu  
+**最後更新**：2025-07-21
 
-## 安裝前置需求
-pip install -r requirements.txt
-如果有GPU
-pip install -r requirements-gpu.txt
+⚠️ **重要變更** ⚠️  
+本版本已升級為 Weaviate V2 資料庫結構，與 V1 版本不相容！
 
+## 🚀 V2 版本重大更新
 
-### 目錄結構
+### Speaker 集合新增欄位
+- `speaker_id` (INT): 從 1 開始遞增的序號 ID
+- `full_name`: 主要名稱
+- `nickname`: 暱稱 (可為空值)
+- `gender`: 性別 (可為空值)
+- `meet_count`: 見面次數 (可為空值)
+- `meet_days`: 見面天數 (可為空值)
+
+### VoicePrint 集合優化
+- 移除冗餘的 `voiceprint_id`，直接使用 Weaviate UUID
+- 新增 `sample_count`: 樣本數量 (預留欄位)
+- 新增 `quality_score`: 品質分數 (可為None)
+
+### 時間欄位重命名
+- `create_time` → `created_at`
+- `updated_time` → `updated_at`
+
+## 📁 模組結構
+
+```
 modules/database/
-├── VID_database.py        # DatabaseService 類別實作
-└── README.md              # 模組說明（本檔）
+├── database.py            # DatabaseService V2 類別實作
+├── init_v2_collections.py # V2 集合初始化工具
+└── README.md              # 本文檔
+```
 
-### 核心類別
-DatabaseService
+## 🛠 安裝與配置
 
-單例模式：確保整個程式只有一個 DatabaseService 實例，內部管理 Weaviate client 連線。
-連線檢查：初始化時會呼叫 weaviate.connect_to_local()，並檢查必須的兩個 collection（Speaker、VoicePrint）是否存在。
+### 前置需求
+```bash
+# 安裝基本相依套件
+pip install -r requirements-base.txt
+
+# GPU 支援 (可選)
+pip install -r requirements-gpu.txt
+```
+
+### 環境配置
+```bash
+# 複製配置範例
+cp .env.example .env
+
+# 編輯 .env 檔案
+WEAVIATE_HOST=localhost
+WEAVIATE_PORT=8080
+WEAVIATE_SCHEME=http
+```
+
+### 啟動 Weaviate
+```bash
+docker-compose up -d
+```
+
+## 🏗 V2 資料庫結構
+
+### Speaker 集合
+```python
+{
+    "speaker_id": int,           # 序號ID (從1開始遞增)
+    "full_name": str,           # 主要名稱
+    "nickname": Optional[str],   # 暱稱 (可為None)
+    "gender": Optional[str],     # 性別 (可為None)
+    "created_at": datetime,      # 建立時間 (RFC3339格式)
+    "last_active_at": datetime,  # 最後活動時間
+    "meet_count": Optional[int], # 見面次數 (可為None)
+    "meet_days": Optional[int],  # 見面天數 (可為None)
+    "voiceprint_ids": List[str], # 關聯聲紋UUID列表
+    "first_audio": str          # 首個音檔路徑
+}
+```
+
+### VoicePrint 集合
+```python
+{
+    "created_at": datetime,      # 建立時間 (RFC3339格式)
+    "updated_at": datetime,      # 更新時間
+    "update_count": int,         # 更新次數
+    "sample_count": Optional[int], # 樣本數量 (預留欄位)
+    "quality_score": Optional[float], # 品質分數 (可為None)
+    "speaker_name": str,         # 語者名稱 (相容性)
+    "speaker": Reference         # 關聯到Speaker集合
+}
+```
+
+### Session 集合
+```python
+{
+    "session_id": str,           # 會議/對話ID
+    "session_type": str,         # 會議類型
+    "title": str,               # 會議標題 (支援語意搜尋)
+    "start_time": datetime,      # 開始時間
+    "end_time": datetime,        # 結束時間
+    "summary": str,              # 會議摘要 (支援語意搜尋)
+    "participants": Reference[]  # 參與語者列表 (關聯到Speaker)
+}
+```
+
+### SpeechLog 集合
+```python
+{
+    "content": str,              # 語音轉錄文字 (支援語意搜尋)
+    "timestamp": datetime,       # 發言時間戳
+    "confidence": float,         # ASR 信心值
+    "duration": float,           # 語音長度(秒)
+    "language": str,             # 語言類型
+    "speaker": Reference,        # 發言語者 (關聯到Speaker)
+    "session": Reference         # 所屬會議 (關聯到Session)
+}
+```
+
+## 💾 DatabaseService V2 核心類別
+
+### 設計模式
+- **單例模式**: 確保全域只有一個 DatabaseService 實例
+- **連線管理**: 自動管理 Weaviate client 連線與重試機制
+- **集合檢查**: 初始化時檢查必要的 V2 集合是否存在
 
 ### 主要方法
 
-Speaker 管理
+#### 語者管理 (Speaker Operations)
+```python
+# 列出所有語者
+speakers: List[Dict] = db.list_all_speakers()
 
-list_all_speakers() → List[Dict]
-列出所有語者及統計資訊。
+# 透過 UUID 查詢語者
+speaker: Optional[Dict] = db.get_speaker(speaker_uuid)
 
-get_speaker(speaker_id) → Dict or None
-依 UUID 取回單一語者物件。
+# 透過序號 ID 查詢語者 (V2 新功能)
+speaker: Optional[Dict] = db.get_speaker_by_id(speaker_id: int)
 
-create_speaker(name: str) → str
-建立一個新的 Speaker，回傳 UUID。
+# 創建新語者
+speaker_uuid: str = db.create_speaker(
+    full_name="王小明",
+    nickname="小明", 
+    gender="男性"
+)
 
-update_speaker_name(speaker_id, new_name) → bool
-同步更新 Speaker 本身 & 底下所有其 voiceprint 的 speaker_name 屬性。
+# 更新語者名稱
+success: bool = db.update_speaker_name(
+    speaker_uuid, 
+    new_full_name="王大明",
+    new_nickname="大明"
+)
 
-update_speaker_last_active(speaker_id, timestamp) → bool
-更新最後活動時間欄位。
+# 更新最後活動時間
+db.update_speaker_last_active(speaker_uuid, timestamp)
 
-delete_speaker(speaker_id) → bool
-刪除 Speaker 並一併刪除其所有聲紋向量。
+# 更新統計資訊
+db.update_speaker_stats(speaker_uuid, meet_count=5, meet_days=3)
 
-VoicePrint 管理
+# 刪除語者
+success: bool = db.delete_speaker(speaker_uuid)
+```
 
-create_voiceprint(speaker_id, embedding, …) → str
-建立新的聲紋向量並回傳其 UUID。
+#### 聲紋管理 (VoicePrint Operations)
+```python
+# 建立聲紋
+voiceprint_uuid: str = db.create_voiceprint(
+    speaker_uuid, 
+    embedding_vector, 
+    audio_source="path/to/audio.wav"
+)
 
-get_voiceprint(id, include_vector=False) → Dict or None
-取回單支向量（可選擇是否要回傳向量值）。
+# 查詢聲紋
+voiceprint: Optional[Dict] = db.get_voiceprint(voiceprint_uuid, include_vector=True)
 
-update_voiceprint(id, new_embedding, update_count) → int
-以「加權移動平均」更新向量，並回傳新的更新次數。
+# 更新聲紋
+success: bool = db.update_voiceprint(voiceprint_uuid, new_embedding, update_count)
 
-delete_voiceprint(id) → bool
-刪除向量並從所屬 Speaker 的列表中移除。
+# 刪除聲紋  
+success: bool = db.delete_voiceprint(voiceprint_uuid)
 
-get_speaker_voiceprints(speaker_id, include_vectors=False) → List[Dict]
-取回某語者所有聲紋資訊。
+# 獲取語者的所有聲紋
+voiceprints: List[Dict] = db.get_speaker_voiceprints(speaker_uuid, include_vectors=False)
+```
 
-向量搜尋
+#### 會議管理 (Session Operations)
+```python
+# 建立會議
+session_uuid: str = db.create_session(
+    session_id="meeting_001",
+    session_type="會議",
+    title="專案討論",
+    start_time=datetime.now(),
+    participant_uuids=["speaker_uuid1", "speaker_uuid2"]
+)
 
-find_similar_voiceprints(embedding, limit=3) → (best_id, best_name, best_dist, all_list)
-對比輸入向量與資料庫中所有向量，依距離排序並回傳最相近結果。
+# 查詢會議
+session: Optional[Dict] = db.get_session(session_uuid)
 
-工具方法
+# 結束會議
+success: bool = db.end_session(session_uuid, end_time=datetime.now(), summary="會議總結")
+```
 
-check_database_connection() → bool
-快速驗證 Weaviate client 連線是否正常。
+#### 語音記錄管理 (SpeechLog Operations)
+```python
+# 建立語音記錄
+speechlog_uuid: str = db.create_speechlog(
+    content="這是一段語音轉錄內容",
+    timestamp=datetime.now(),
+    confidence=0.95,
+    duration=5.2,
+    speaker_uuid="speaker_uuid",
+    session_uuid="session_uuid"
+)
 
-check_collection_exists(name) → bool
-檢查指定的 collection（class）是否存在。
+# 查詢語音記錄
+speechlog: Optional[Dict] = db.get_speechlog(speechlog_uuid)
 
-database_cleanup() → bool / Dict
-執行多步檢查＆修復（如移除「孤兒」聲紋、修正錯誤 reference）。
+# 語意搜尋語音內容
+results: List[Dict] = db.search_speech_content("關鍵字搜尋", limit=10)
+```
 
-### 使用範例
+#### 向量搜索 (Vector Search)
+```python
+# 搜索相似聲紋
+results: List[Dict] = db.find_similar_voiceprints(embedding_vector, limit=5)
 
-from modules.database.VID_database import DatabaseService
+# 結果格式
+# {
+#     "uuid": "聲紋UUID",
+#     "distance": 0.234,          # 餘弦距離
+#     "speaker_uuid": "語者UUID",
+#     "speaker_name": "語者名稱",
+#     "properties": {...}         # 聲紋屬性
+# }
+```
 
-# 初始化（單例）
+#### 關聯管理
+```python
+# 添加聲紋到語者
+db.add_voiceprint_to_speaker(speaker_uuid, voiceprint_uuid)
+
+# 轉移聲紋
+transferred_count: int = db.transfer_voiceprints(
+    source_uuid, 
+    dest_uuid, 
+    voiceprint_uuids
+)
+
+# 獲取聲紋關聯的語者
+speaker_uuid: Optional[str] = db.get_speaker_uuid_from_voiceprint(voiceprint_uuid)
+```
+
+## 🔧 V2 初始化與遷移
+
+### 初始化 V2 集合
+```bash
+python -m modules.database.init_v2_collections
+```
+
+### 從 V1 遷移資料
+```bash
+# 1. 備份現有資料
+python weaviate_study/tool_backup.py
+
+# 2. 初始化 V2 集合
+python -m modules.database.init_v2_collections
+
+# 3. 匯入現有聲紋資料
+python weaviate_study/npy_to_weaviate.py
+```
+
+## 🧪 使用範例
+
+### 基本使用
+```python
+from modules.database.database import DatabaseService
+
+# 取得單例實例
 db = DatabaseService()
 
-# 1. 創建並查詢 Speaker
-sid = db.create_speaker("Alice")
-all_sp = db.list_all_speakers()
+# 檢查資料庫連接
+if not db.check_database_connection():
+    print("資料庫連接失敗")
+    exit(1)
 
-# 2. 為 Alice 加入一筆聲紋
+# 創建新語者
+speaker_uuid = db.create_speaker(
+    full_name="測試語者",
+    nickname="測試",
+    gender="未知"
+)
+
+# 列出所有語者
+speakers = db.list_all_speakers()
+for speaker in speakers:
+    print(f"ID: {speaker['speaker_id']}, 名稱: {speaker['full_name']}")
+```
+
+### 聲紋比對
+```python
 import numpy as np
-vec = np.random.rand(512)
-vp_id = db.create_voiceprint(sid, vec, audio_source="test.wav")
 
-# 3. 搜尋最相似
-best_id, best_name, dist, all_scores = db.find_similar_voiceprints(vec, limit=5)
+# 假設有語音特徵向量
+embedding = np.random.rand(192).tolist()
 
+# 建立聲紋
+voiceprint_uuid = db.create_voiceprint(
+    speaker_uuid,
+    embedding,
+    audio_source="test.wav"
+)
 
+# 搜尋相似聲紋
+similar_results = db.find_similar_voiceprints(embedding, limit=3)
+for result in similar_results:
+    print(f"相似度: {result['distance']:.3f}, 語者: {result['speaker_name']}")
+```
 
+## 🔍 疑難排解
 
+### 常見問題
+1. **連接失敗**: 確認 Weaviate 服務運行且配置正確
+2. **集合不存在**: 執行 `init_v2_collections.py` 初始化
+3. **向量維度錯誤**: 確保嵌入向量維度與模型一致 (192維)
 
-###### 重點功能速查 (Quick Reference)
+### 除錯
+```python
+# 啟用詳細日誌
+import logging
+logging.basicConfig(level=logging.DEBUG)
 
-以下為最常用的場景與對應函式
+# 檢查集合狀態
+db.check_collection_exists("Speaker")
+db.check_collection_exists("VoicePrint")
+```
 
-| 場景說明                       | 函式名稱
+## 📊 效能優化
 
-| **列出所有語者**                | `list_all_speakers()`
-| **查詢單一語者詳細資訊**         | `get_speaker(speaker_id: str)`
-| **新增新語者**                  | `create_speaker(speaker_name: str)`
-| **更新語者名稱**                | `update_speaker_name(speaker_id: str, new_name: str)` 
-| **刪除語者及其所有聲紋**         | `delete_speaker(speaker_id: str)` 
-| **新增聲紋向量**                | `create_voiceprint(speaker_id: str, embedding: np.ndarray, …)` 
-| **查詢聲紋向量**                | `get_voiceprint(voiceprint_id: str, include_vector: bool=False)`
-| **更新聲紋向量（加權移動平均）**  | `update_voiceprint(voiceprint_id: str, new_embedding: np.ndarray)` 
-| **刪除聲紋向量**                | `delete_voiceprint(voiceprint_id: str)` 
-| **列出某語者所有聲紋**           | `get_speaker_voiceprints(speaker_id: str, include_vectors: bool=False)` 
-| **搜尋最相似聲紋**              | `find_similar_voiceprints(embedding: np.ndarray, limit: int=3)` 
-| **檢查資料庫連線**              | `check_database_connection()` 
-| **資料庫清理 & 修復**           | `database_cleanup()` 
+- 使用批次操作提高大量資料處理效率
+- 向量搜尋限制結果數量避免記憶體溢出
+- 定期清理無用的聲紋資料釋放儲存空間
 
-> **示例**：  
-> 如果你想查詢目前所有語者，就直接：
-> ```python
-> from modules.database.VID_database import DatabaseService
-> db = DatabaseService()
-> speakers = db.list_all_speakers()
-> ```
+## 🔗 相關文檔
+
+- [Weaviate 官方文檔](https://weaviate.io/developers/weaviate)
+- [CONFIG_README.md](../../CONFIG_README.md) - 配置說明
+- [weaviate_study/README.md](../../weaviate_study/README.md) - V2 工具說明
+
+## 📋 V2 集合驗證
+
+系統啟動時會自動驗證以下 4 個 V2 集合是否存在：
+
+| 集合名稱 | 用途說明 |
+|---------|---------|
+| `Speaker` | 語者基本資料，支援雙ID系統 |
+| `VoicePrint` | 聲紋向量，支援餘弦相似度搜尋 |
+| `Session` | 會議/對話紀錄，支援語意搜尋 |
+| `SpeechLog` | 語音轉錄記錄，支援內容搜尋 |
+
+如需手動驗證集合狀態：
+```python
+from modules.database.init_v2_collections import WeaviateV2CollectionManager
+
+manager = WeaviateV2CollectionManager()
+manager.connect()
+results = manager.verify_v2_collections()
+print(results)  # {'Speaker': True, 'VoicePrint': True, 'Session': True, 'SpeechLog': True}
+```
 

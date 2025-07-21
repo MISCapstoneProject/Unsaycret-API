@@ -15,6 +15,7 @@ import torchaudio
 import pyaudio  # type: ignore
 
 from utils.logger import get_logger
+from utils.constants import DEFAULT_WHISPER_MODEL
 from modules.separation.separator import AudioSeparator
 from modules.identification.VID_identify_v5 import SpeakerIdentifier
 from modules.asr.whisper_asr import WhisperASR
@@ -31,7 +32,7 @@ logger.info(f"🚀 使用設備: {'cuda' if use_gpu else 'cpu'}")
 
 sep = AudioSeparator()
 spk = SpeakerIdentifier()
-asr = WhisperASR(model_name="medium", gpu=use_gpu)
+asr = WhisperASR(model_name=DEFAULT_WHISPER_MODEL, gpu=use_gpu)
 
 def _timed_call(func, *args):
     t0 = time.perf_counter()

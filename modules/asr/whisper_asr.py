@@ -2,6 +2,7 @@ from pathlib import Path
 import json
 import time
 from utils.logger import get_logger
+from utils.constants import DEFAULT_WHISPER_MODEL, DEFAULT_WHISPER_BEAM_SIZE
 import torch
 import torchaudio
 
@@ -19,16 +20,20 @@ class WhisperASR:
         text, confidence, words = asr.transcribe("path/to/audio.wav")
     """
 
-    def __init__(self, model_name: str = "medium", gpu: bool = False, beam: int = 5, lang: str = "auto"):
+    def __init__(self, model_name: str = None, gpu: bool = False, beam: int = None, lang: str = "auto"):
         self.gpu = gpu
-        self.beam = beam
+        self.beam = beam if beam is not None else DEFAULT_WHISPER_BEAM_SIZE
         self.lang = lang
+        
+        # 使用環境變數的預設模型名稱
+        model_name = model_name if model_name is not None else DEFAULT_WHISPER_MODEL
         self.model = load_model(model_name=model_name, gpu=self.gpu)
+        
         self.last_infer_time = 0.0
         self.last_total_time = 0.0
         
         device_str = "cuda" if self.gpu else "cpu"
-        logger.info(f"🧠 Whisper running on device: {device_str}")
+        logger.info(f"🧠 Whisper running on device: {device_str} (model: {model_name})")
 
     def transcribe(self, wav_path: str) -> tuple[str, float, list[dict]]:
         """

@@ -16,8 +16,13 @@ from pipelines.orchestrator import (
     run_pipeline_STREAM,
     run_pipeline_DIR,
 )
-from services.handlers.speaker_handler import SpeakerHandler
+from api.handlers.speaker_handler import SpeakerHandler
 import tempfile, shutil, os, zipfile
+from utils.constants import (
+    API_DEFAULT_VERIFICATION_THRESHOLD, API_DEFAULT_MAX_RESULTS,
+    WEBSOCKET_CHUNK_SECS, WEBSOCKET_TIMEOUT, WEBSOCKET_MAX_WORKERS,
+    API_MAX_WORKERS
+)
 
 app = FastAPI(title="Unsaycret API")
 
@@ -65,7 +70,8 @@ class VoiceVerificationResponse(BaseModel):
 
 class SpeakerInfo(BaseModel):
     """V2 資料庫完整語者資訊模型"""
-    speaker_id: str
+    uuid: str  # Weaviate UUID
+    speaker_id: int  # 序號ID (從1開始)
     full_name: Optional[str] = None
     nickname: Optional[str] = None
     gender: Optional[str] = None
@@ -166,16 +172,16 @@ async def delete_speaker(speaker_id: str):
 @app.post("/speaker/verify", response_model=VoiceVerificationResponse)
 async def verify_speaker_voice(
     file: UploadFile = File(...),
-    max_results: int = Form(3),
-    threshold: float = Form(0.4)
+    max_results: int = Form(API_DEFAULT_MAX_RESULTS),
+    threshold: float = Form(API_DEFAULT_VERIFICATION_THRESHOLD)
 ):
     """
     語音驗證API端點 - 純讀取操作，判斷音檔中的語者身份
     
     Args:
         file: 要驗證的音檔
-        max_results: 返回最相似的結果數量 (預設 3)
-        threshold: 比對閾值，距離小於此值才認為是匹配到語者 (預設 0.4)
+        max_results: 返回最相似的結果數量 (預設 {API_DEFAULT_MAX_RESULTS})
+        threshold: 比對閾值，距離小於此值才認為是匹配到語者 (預設 {API_DEFAULT_VERIFICATION_THRESHOLD})
         
     Returns:
         VoiceVerificationResponse: 包含驗證結果的回應
@@ -254,8 +260,8 @@ async def ws_stream(ws: WebSocket):
     # ---------------- 背景 thread ---------------- #
     def backend():
         run_pipeline_STREAM(
-            chunk_secs=6,
-            max_workers=2,
+            chunk_secs=WEBSOCKET_CHUNK_SECS,
+            max_workers=API_MAX_WORKERS,
             record_secs=None,
             in_bytes_queue=raw_q,   # ← 改成讀前端送來的 bytes
             queue_out=result_q,     # ★ 把結果塞進 result_q
@@ -279,7 +285,7 @@ async def ws_stream(ws: WebSocket):
 
             # 2) 再 non-blocking 收前端的音訊
             try:
-                data = await asyncio.wait_for(ws.receive(), timeout=0.05)
+                data = await asyncio.wait_for(ws.receive(), timeout=WEBSOCKET_TIMEOUT)
             except asyncio.TimeoutError:
                 continue
 

@@ -52,22 +52,25 @@ warnings.filterwarnings("ignore", category=DeprecationWarning, module="weaviate"
 # 創建本模組的日誌器
 logger = get_logger(__name__)
 
+# 導入配置
+from utils.env_config import WEAVIATE_HOST, WEAVIATE_PORT, WEAVIATE_MAX_RETRIES
+
 
 class WeaviateV2CollectionManager:
     """Weaviate V2 集合管理器"""
     
-    def __init__(self, host: str = "localhost", port: int = 8080, max_retries: int = 3):
+    def __init__(self, host: str = None, port: int = None, max_retries: int = None):
         """
         初始化 Weaviate V2 集合管理器
         
         Args:
-            host: Weaviate 服務器主機地址
-            port: Weaviate 服務器端口  
-            max_retries: 最大重試次數
+            host: Weaviate 服務器主機地址 (預設從環境變數讀取)
+            port: Weaviate 服務器端口 (預設從環境變數讀取)
+            max_retries: 最大重試次數 (預設從環境變數讀取)
         """
-        self.host = host
-        self.port = port
-        self.max_retries = max_retries
+        self.host = host if host is not None else WEAVIATE_HOST
+        self.port = port if port is not None else WEAVIATE_PORT
+        self.max_retries = max_retries if max_retries is not None else WEAVIATE_MAX_RETRIES
         self.client: Optional[weaviate.WeaviateClient] = None
     
     def __enter__(self):
@@ -391,7 +394,7 @@ class WeaviateV2CollectionManager:
         return results
 
 
-def ensure_weaviate_v2_collections(host: str = "localhost", port: int = 8080) -> bool:
+def ensure_weaviate_collections(host: str = "localhost", port: int = 8080) -> bool:
     """
     確認 Weaviate V2 collections 存在，若不存在則建立（具備冪等性）
     
@@ -483,7 +486,7 @@ def main() -> None:
     
     args = parser.parse_args()
     
-    success = ensure_weaviate_v2_collections(
+    success = ensure_weaviate_collections(
         host=args.host,
         port=args.port
     )

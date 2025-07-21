@@ -185,6 +185,8 @@ logging.getLogger("speechbrain").setLevel(logging.ERROR)
 
 # 導入日誌模組
 from utils.logger import get_logger
+from utils.env_config import WEAVIATE_HOST, WEAVIATE_PORT, get_model_save_dir
+from utils.constants import THRESHOLD_LOW, THRESHOLD_UPDATE, THRESHOLD_NEW, SPEECHBRAIN_SPEAKER_MODEL, AUDIO_TARGET_RATE
 
 # 創建模組專屬日誌器
 logger = get_logger(__name__)
@@ -192,16 +194,9 @@ logger = get_logger(__name__)
 # 載入 SpeechBrain 語音辨識模型
 from speechbrain.inference import SpeakerRecognition
 
-# 全域參數設定
-THRESHOLD_LOW = 0.26     # 過於相似，不更新
-THRESHOLD_UPDATE = 0.34  # 下:更新聲紋向量，上:新增一筆聲紋
-THRESHOLD_NEW = 0.4    # 判定為新語者
+# 全域參數設定（從環境配置載入）
 DEFAULT_SPEAKER_NAME = "未命名語者"  # 預設的語者名稱
 DEFAULT_FULL_NAME_PREFIX = "n"  # V2版本：預設full_name前綴
-
-# Weaviate 連接參數（如果需要可以修改）
-WEAVIATE_HOST = "localhost"
-WEAVIATE_PORT = "8080"
 
 
 class AudioProcessor:
@@ -210,18 +205,63 @@ class AudioProcessor:
     def __init__(self) -> None:
         """初始化 SpeechBrain 模型"""
         try:
+            import os
+            import shutil
+            
+            # 檢查本地模型目錄是否包含無效的符號連結
+            local_model_path = get_model_save_dir("speechbrain_recognition")
+            if os.path.exists(local_model_path):
+                logger.info(f"檢查本地語者識別模型路徑: {local_model_path}")
+                
+                # 檢查是否有無效的符號連結 (Windows JUNCTION 指向 Linux 路徑)
+                hyperparams_file = os.path.join(local_model_path, "hyperparams.yaml")
+                if os.path.exists(hyperparams_file):
+                    try:
+                        # 測試檔案讀取權限
+                        with open(hyperparams_file, 'r', encoding='utf-8') as f:
+                            content = f.read(100)  # 讀取前100個字符來測試
+                        logger.info("本地語者識別模型檔案可正常讀取")
+                    except (PermissionError, OSError, UnicodeDecodeError) as e:
+                        logger.warning(f"本地語者識別模型檔案無法讀取: {e}")
+                        logger.info("檢測到無效的符號連結，需要重新下載模型...")
+                        
+                        # 刪除包含無效符號連結的目錄
+                        try:
+                            shutil.rmtree(local_model_path, ignore_errors=True)
+                            logger.info(f"已刪除無效的語者識別模型目錄: {local_model_path}")
+                        except Exception as rm_error:
+                            logger.warning(f"刪除語者識別模型目錄時出現問題: {rm_error}")
+            
             self.model = SpeakerRecognition.from_hparams(
-                source="speechbrain/spkrec-ecapa-voxceleb",
-                savedir="models/speechbrain_recognition"
+                source=SPEECHBRAIN_SPEAKER_MODEL,
+                savedir=get_model_save_dir("speechbrain_recognition")
             )
-            print("SpeechBrain 模型加載成功！")
+            logger.info("SpeechBrain 語者識別模型加載成功！")
         except ImportError as e:
-            print(f"SpeechBrain 未正確安裝: {e}")
-            print("請運行: pip install speechbrain")
+            logger.error(f"SpeechBrain 未正確安裝: {e}")
+            logger.error("請運行: pip install speechbrain")
             raise
         except Exception as e:
-            print(f"載入 SpeechBrain 模型時發生錯誤: {e}")
-            raise
+            logger.error(f"載入 SpeechBrain 模型時發生錯誤: {e}")
+            
+            # 如果載入失敗，嘗試強制重新下載
+            try:
+                logger.info("嘗試強制重新下載語者識別模型...")
+                import os
+                import shutil
+                local_model_path = get_model_save_dir("speechbrain_recognition")
+                if os.path.exists(local_model_path):
+                    shutil.rmtree(local_model_path, ignore_errors=True)
+                    logger.info("已清除本地語者識別模型快取")
+                
+                self.model = SpeakerRecognition.from_hparams(
+                    source=SPEECHBRAIN_SPEAKER_MODEL,
+                    savedir=get_model_save_dir("speechbrain_recognition")
+                )
+                logger.info("強制重新下載後語者識別模型載入成功")
+            except Exception as final_error:
+                logger.error(f"所有嘗試都失敗了: {final_error}")
+                raise Exception(f"語者識別模型載入完全失敗。請檢查網路連接和模型可用性。原始錯誤: {e}")
     
     def resample_audio(self, signal: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
         """
@@ -288,7 +328,7 @@ class AudioProcessor:
                 signal = signal.mean(axis=1)
 
             # 根據取樣率處理
-            target_sr = 16000
+            target_sr = AUDIO_TARGET_RATE
             if sr == target_sr:
                 signal_16k = signal
             elif sr != target_sr:
@@ -519,7 +559,7 @@ class WeaviateRepository:
         
         Args:
             speaker_name: 語者名稱，默認為「未命名語者」
-            first_audio: 第一次生成該語者時使用的音檔路徑（如 "20250709_185516\segment_001\speaker1.wav"）
+            first_audio: 第一次生成該語者時使用的音檔路徑（如 "20250709_185516\\segment_001\\speaker1.wav"）
             
         Returns:
             str: 新建立的語者 UUID

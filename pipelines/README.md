@@ -1,4 +1,7 @@
-# pipelines
+# Pipelines (處理流程) 模組
+
+**版本**: v0.4.0
+**最後更新**: 2025-07-21
 
 整合語者分離、辨識與 ASR 的處理流程。
 提供兩個函式：`run_pipeline_file` 處理單一音檔，`run_pipeline_dir` 批次處理資料夾。

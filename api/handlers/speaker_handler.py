@@ -204,9 +204,10 @@ class SpeakerHandler:
     def get_speaker_info(self, speaker_id: str) -> Dict[str, Any]:
         """
         獲取語者資訊 - 回傳 V2 資料庫完整結構
+        支援UUID和序號ID兩種查詢方式
         
         Args:
-            speaker_id: 語者ID
+            speaker_id: 語者ID，可以是UUID或序號ID
             
         Returns:
             Dict[str, Any]: V2 資料庫完整語者資訊
@@ -215,7 +216,17 @@ class SpeakerHandler:
             HTTPException: 當語者不存在時
         """
         try:
-            obj = self.speaker_manager.get_speaker(speaker_id)
+            obj = None
+            
+            # 嘗試判斷是 UUID 還是序號ID
+            if speaker_id.isdigit():
+                # 如果是純數字，當作序號ID處理
+                numeric_id = int(speaker_id)
+                obj = self.database.get_speaker_by_id(numeric_id)
+            else:
+                # 否則當作UUID處理
+                obj = self.speaker_manager.get_speaker(speaker_id)
+                
             if not obj:
                 raise HTTPException(
                     status_code=404, 
@@ -224,14 +235,30 @@ class SpeakerHandler:
             
             props = obj.properties
 
+            # 處理時間欄位，確保轉換為字串格式
+            created_at = props.get('created_at')
+            last_active_at = props.get('last_active_at')
+            
+            # 如果是 datetime 對象，轉換為 ISO 格式字串
+            if hasattr(created_at, 'isoformat'):
+                created_at = created_at.isoformat()
+            elif created_at is None:
+                created_at = None  # 保持 None
+                
+            if hasattr(last_active_at, 'isoformat'):
+                last_active_at = last_active_at.isoformat()
+            elif last_active_at is None:
+                last_active_at = None  # 保持 None
+
             # 回傳 V2 資料庫的所有屬性，保持原始值（包括 None）
             return {
-                "speaker_id": str(obj.uuid),  # UUID 轉字串
+                "uuid": str(obj.uuid),  # Weaviate UUID
+                "speaker_id": props.get('speaker_id', -1),  # 序號ID
                 "full_name": props.get('full_name'),  # 可能是 None
                 "nickname": props.get('nickname'),  # 可能是 None
                 "gender": props.get('gender'),  # 可能是 None
-                "created_at": props.get('created_at'),  # 可能是 None
-                "last_active_at": props.get('last_active_at'),  # 可能是 None
+                "created_at": created_at,  # 轉換後的時間字串或None
+                "last_active_at": last_active_at,  # 轉換後的時間字串或None
                 "meet_count": props.get('meet_count'),  # 可能是 None
                 "meet_days": props.get('meet_days'),  # 可能是 None
                 "voiceprint_ids": [str(vid) for vid in props.get('voiceprint_ids', [])],  # UUID 陣列轉字串陣列
@@ -268,14 +295,30 @@ class SpeakerHandler:
                 voiceprint_ids = speaker.get("voiceprint_ids", [])
                 voiceprint_ids_str = [str(vp_id) for vp_id in voiceprint_ids] if voiceprint_ids else []
                 
+                # 處理時間欄位，確保轉換為字串格式
+                created_at = speaker.get('created_at')
+                last_active_at = speaker.get('last_active_at')
+                
+                # 如果是 datetime 對象，轉換為 ISO 格式字串
+                if hasattr(created_at, 'isoformat'):
+                    created_at = created_at.isoformat()
+                elif created_at is None:
+                    created_at = None  # 保持 None
+                    
+                if hasattr(last_active_at, 'isoformat'):
+                    last_active_at = last_active_at.isoformat()
+                elif last_active_at is None:
+                    last_active_at = None  # 保持 None
+                
                 # V2 資料庫完整屬性，保持原始值
                 api_speaker = {
-                    "speaker_id": speaker_id,
+                    "uuid": speaker_id,  # Weaviate UUID 
+                    "speaker_id": speaker.get("speaker_id", -1),  # 序號ID
                     "full_name": speaker.get("full_name"),  # 可能是 None
                     "nickname": speaker.get("nickname"),  # 可能是 None  
                     "gender": speaker.get("gender"),  # 可能是 None
-                    "created_at": speaker.get("created_at"),  # 可能是 None
-                    "last_active_at": speaker.get("last_active_at"),  # 可能是 None
+                    "created_at": created_at,  # 轉換後的時間字串或None
+                    "last_active_at": last_active_at,  # 轉換後的時間字串或None
                     "meet_count": speaker.get("meet_count"),  # 可能是 None
                     "meet_days": speaker.get("meet_days"),  # 可能是 None
                     "voiceprint_ids": voiceprint_ids_str,  # UUID 陣列轉字串陣列

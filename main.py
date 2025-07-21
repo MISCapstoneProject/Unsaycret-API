@@ -5,9 +5,10 @@
 import uvicorn
 import sys
 import os
-from services.api import app
-from utils.init_collections import ensure_weaviate_collections
+from api.api import app
+from modules.database.init_v2_collections import ensure_weaviate_collections
 from utils.logger import get_logger
+from utils.env_config import API_HOST, API_PORT, API_LOG_LEVEL, WEAVIATE_HOST, WEAVIATE_PORT
 
 logger = get_logger(__name__)
 
@@ -20,7 +21,7 @@ def initialize_system() -> bool:
     """
     try:
         # 初始化 Weaviate 集合
-        logger.info("正在初始化 Weaviate 資料庫...")
+        logger.info(f"正在初始化 Weaviate 資料庫 ({WEAVIATE_HOST}:{WEAVIATE_PORT})...")
         if not ensure_weaviate_collections():
             logger.error("Weaviate 資料庫初始化失敗")
             return False
@@ -57,7 +58,7 @@ if __name__ == "__main__":
     
     uvicorn.run(
         app, 
-        host="0.0.0.0", 
-        port=8000,
-        log_level="info"
+        host=API_HOST, 
+        port=API_PORT,
+        log_level=API_LOG_LEVEL
     )
