@@ -1,12 +1,11 @@
 # Unsaycret-API
 
-**作者**: CYouuu  
-**最後更新者**: CYouuu  
-**版本**: v0.4.0 
-**最後更新**: 2025-07-21
+**版本**: v0.4.0  <br>
+**最後更新**: 2025-07-22
 
 ## 專案簡介
-Unsaycret-API 是一套模組化的語音處理系統，整合語音分離、說者辨識、語音辨識、API 服務，並支援 Weaviate V2 向量資料庫串接。專案採用分層配置管理，將環境變數與演算法常數分離，提升可維護性和部署靈活性。
+Unsaycret-API 是一套模組化的語音處理系統，整合語音分離、說者辨識、語音辨識、API 服務，並支援 Weaviate V2 向量資料庫串接。
+專案執行後會啟動 API 伺服器，以呼叫 API 的方式使用所有功能。
 
 > **⚠️ V2 資料庫版本**: 本版本已升級至 Weaviate V2 資料庫結構，不相容於 V1 版本
 
@@ -14,14 +13,14 @@ Unsaycret-API 是一套模組化的語音處理系統，整合語音分離、說
 
 - 🎙 **語者分離**：採用 SpeechBrain Sepformer (2人) / ConvTasNet (3人)，支援多人語音分離
 - 🧠 **語音辨識（ASR）**：Faster-Whisper，支援 GPU/CPU 動態切換，逐詞時間戳與信心值
-- 🗣 **說話人辨識**：ECAPA-TDNN 語者聲紋比對，支援聲紋自動更新與雙 ID 系統（UUID + 序號ID）
+- 🗣 **說話人辨識**：ECAPA-TDNN 語者聲紋比對，支援聲紋自動更新
 - 🛜 **API 服務**：FastAPI 提供完整的 RESTful 與 WebSocket 介面
 - 🧠 **Weaviate V2 整合**：語音向量與辨識結果存入 Weaviate V2，支援高效語者搜尋與比對
 - ⚙️ **分層配置**：環境變數(.env) 與應用常數(constants.py) 分離管理
 
 ## 🏗 系統架構
 
-### 配置系統 (v2.0)
+### 配置系統
 ```
 ├── .env                     # 環境相關配置 (不納入版控)
 ├── .env.example             # 配置範例檔案
@@ -36,7 +35,7 @@ Unsaycret-API 是一套模組化的語音處理系統，整合語音分離、說
 Unsaycret-API/
 ├── api/                     # FastAPI 應用程式層 (重構自 services/)
 │   ├── api.py              # HTTP API 入口與路由定義
-│   ├── handlers/           # 業務邏輯處理器
+│   ├── handlers/           # 語者管理業務邏輯處理器
 │   │   └── speaker_handler.py
 │   └── README.md
 ├── modules/                 # 核心業務模組
@@ -53,7 +52,7 @@ Unsaycret-API/
 │   ├── env_config.py           # 環境配置載入
 │   ├── constants.py            # 應用程式常數
 │   └── logger.py               # 統一日誌系統
-└── weaviate_study/         # Weaviate V2 整合工具
+└── weaviate_study/         # Weaviate V2 開發工具
     ├── npy_to_weaviate.py      # V2 向量匯入工具
     └── README.md
 ```
@@ -65,7 +64,8 @@ Unsaycret-API/
 **複製並配置環境變數：**
 ```bash
 cp .env.example .env
-# 編輯 .env 檔案，針對本地自行調整以下設定：
+
+# 自行編輯 .env 檔案，針對本地調整以下設定：
 # - WEAVIATE_HOST=localhost
 # - WEAVIATE_PORT=8080  
 # - API_HOST=0.0.0.0
@@ -126,7 +126,7 @@ python main.py
 
 ## 🗄️ Weaviate V2 資料庫結構
 
-本系統使用 4 個主要集合：
+本系統資料庫使用 4 個主要集合：
 
 ### Speaker
 語者基本資訊，包含姓名、性別、活動記錄等
@@ -158,7 +158,7 @@ MODELS_BASE_DIR=./models
 ```
 
 ### 應用程式常數 (constants.py)
-演算法核心參數，經過實驗調校：
+演算法固定核心參數，經過實驗調校：
 ```python
 # 語者識別閾值
 THRESHOLD_LOW = 0.26      # 過於相似，不更新向量
@@ -180,24 +180,12 @@ SPEECHBRAIN_SPEAKER_MODEL = "speechbrain/spkrec-ecapa-voxceleb"
 - **utils/**  
   其他輔助腳本（如日誌、同步工具）。
 
-### 測試與驗證
+### 測試資料
+- 可使用 `weaviate_study/npy_to_weaviate.py` 匯入現有 5 筆聲紋資料
 ```bash
-# 測試 API 模型和資料庫整合
-python examples/test_api_models.py
-
-# 測試語者 API 功能  
-python examples/test_speaker_api.py
-
-# 測試語音驗證功能
-python examples/test_voice_verification.py
+# 匯入預設測試聲紋資料到資料庫
+python -m weaviate_study/npy_to_weaviate.py
 ```
-
-### V1 升級到 V2 指南
-如果您從 V1 版本升級：
-1. 備份現有資料
-2. 停止舊版 API 服務
-3. 執行 V2 集合初始化
-4. 使用 `weaviate_study/npy_to_weaviate.py` 匯入現有聲紋資料
 
 ## �️ 工具腳本
 
@@ -209,13 +197,14 @@ python weaviate_study/npy_to_weaviate.py
 # 重置並重新建立 V2 集合
 python weaviate_study/create_reset_collections.py  
 
-# 搜尋測試
+# 查看資料庫目前資料
 python weaviate_study/tool_search.py
+# 也可使用 localhost:8081 進入 Weaviate UI 控制台
 ```
 
 ## 系統需求
 
-- **Python 版本**：Python 3.9+ (建議使用 Python 3.12)
+- **Python 版本**：Python 3.10+ (建議使用 Python 3.12)
 - **作業系統**：Windows 10/11, Linux, macOS
 - **硬體需求**：
   - 最低：8GB RAM，4核心 CPU
@@ -230,12 +219,19 @@ python weaviate_study/tool_search.py
 3. **模型下載失敗**：檢查網路連接，系統會自動重試下載
 4. **GPU 記憶體不足**：設定 `FORCE_CPU=true` 強制使用 CPU
 
-### 除錯模式
+### 設備控制
 ```bash  
-# 設定除錯等級
-export LOG_LEVEL=DEBUG
-python main.py
+# 強制使用 CPU（忽略 GPU）
+FORCE_CPU=true
+
+# 指定 CUDA 設備索引（多GPU環境，預設為 0）  
+CUDA_DEVICE_INDEX=0
 ```
+
+**注意**：
+- `FORCE_CPU=true` 會強制所有模組使用 CPU，適用於GPU記憶體不足的情況
+- `CUDA_DEVICE_INDEX` 用於多GPU系統中指定要使用的GPU（從0開始編號）
+- 系統會自動檢查指定的GPU是否存在，不存在時會回退到 GPU 0
 
 ## 📚 相關文檔
 
@@ -251,6 +247,7 @@ python main.py
 
 - **語者分離**: EvanLo62
 - **語者識別**: CYouuu  
+- **語音轉文字**: gino287
 - **API & 整合**: 專案團隊
 - **資料庫設計**: CYouuu
 

@@ -20,7 +20,7 @@ Voice_ID
  5. 語者管理：獨立模組化的語者與聲紋管理功能
 
 ** 重要說明 **：目前使用的語者分離模型是 ConvTasNet 3人預訓練模型，
-因此本系統使用時可以分離最多三個說話者的混合語音。
+因此本系統使用時可以分離最多三個語者的混合語音。
  
 系統模組架構：
 -----------
@@ -32,7 +32,7 @@ Voice_ID
 -----------
  - 語者分離模型: ConvTasNet (16kHz 三聲道分離)
  - 語者識別模型: SpeechBrain ECAPA-TDNN 模型 (192維特徵向量)
- - 向量資料庫: Weaviate，用於儲存和檢索說話者嵌入向量
+ - 向量資料庫: Weaviate，用於儲存和檢索語者嵌入向量
  - 即時處理: 多執行緒並行處理，邊錄音邊識別
  - 音訊增強: 頻譜閘控降噪、維納濾波、動態範圍壓縮，提高分離品質
 
@@ -129,7 +129,7 @@ from utils.logger import get_logger
 
 # 導入配置 (環境變數)
 from utils.env_config import (
-    AUDIO_RATE, MODELS_BASE_DIR
+    AUDIO_RATE, MODELS_BASE_DIR, FORCE_CPU, CUDA_DEVICE_INDEX
 )
 
 # 導入常數 (應用程式參數)  
@@ -243,10 +243,10 @@ def create_separator(model_name: str = None, **kwargs):
     return AudioSeparator(model_type=model_type, **kwargs)
 
 # 全域參數設定，使用 v5 版本的閾值
-EMBEDDING_DIR = "embeddingFiles"  # 所有說話者嵌入資料的根目錄
+EMBEDDING_DIR = "embeddingFiles"  # 所有語者嵌入資料的根目錄
 THRESHOLD_LOW = speaker_id.THRESHOLD_LOW     # 過於相似，不更新
 THRESHOLD_UPDATE = speaker_id.THRESHOLD_UPDATE # 更新嵌入向量
-THRESHOLD_NEW = speaker_id.THRESHOLD_NEW    # 判定為新說話者
+THRESHOLD_NEW = speaker_id.THRESHOLD_NEW    # 判定為新語者
 
 # 輸出目錄
 OUTPUT_DIR = "R3SI/Audio-storage"  # 儲存分離後音訊的目錄
@@ -260,7 +260,27 @@ logger = get_logger(__name__)
 
 class AudioSeparator:
     def __init__(self, model_type: SeparationModel = DEFAULT_MODEL, enable_noise_reduction=True, snr_threshold=SNR_THRESHOLD):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # 設備選擇邏輯：優先考慮 FORCE_CPU 設定
+        if FORCE_CPU:
+            self.device = "cpu"
+            logger.info("🔧 FORCE_CPU=true，強制使用 CPU 運算")
+        else:
+            if torch.cuda.is_available():
+                # 檢查指定的 CUDA 設備是否存在
+                if CUDA_DEVICE_INDEX < torch.cuda.device_count():
+                    self.device = f"cuda:{CUDA_DEVICE_INDEX}"
+                    # 確保設定正確的設備
+                    torch.cuda.set_device(CUDA_DEVICE_INDEX)
+                    if CUDA_DEVICE_INDEX != 0:
+                        logger.info(f"🎯 使用指定的 CUDA 設備: {CUDA_DEVICE_INDEX}")
+                else:
+                    logger.warning(f"⚠️  指定的 CUDA 設備索引 {CUDA_DEVICE_INDEX} 不存在，改用 cuda:0")
+                    self.device = "cuda:0"
+                    torch.cuda.set_device(0)
+            else:
+                self.device = "cpu"
+                logger.info("🖥️  未偵測到 GPU 設備，使用 CPU 運算")
+                
         self.model_type = model_type
         self.model_config = MODEL_CONFIGS[model_type]
         self.num_speakers = self.model_config["num_speakers"]
@@ -269,8 +289,8 @@ class AudioSeparator:
         
         logger.info(f"使用設備: {self.device}")
         logger.info(f"模型類型: {model_type.value}")
-        logger.info(f"模型: {self.model_config['model_name']}")
-        logger.info(f"支援語者數: {self.num_speakers}")
+        logger.info(f"載入模型: {self.model_config['model_name']}")
+        logger.info(f"支援語者數量: {self.num_speakers}")
         
         # 設計更溫和的低通濾波器
         nyquist = TARGET_RATE // 2
@@ -278,7 +298,7 @@ class AudioSeparator:
         self.lowpass_filter = signal.butter(2, cutoff / nyquist, btype='low', output='sos')
         
         try:
-            logger.info("載入模型中...")
+            logger.info("正在載入模型...")
             self.model = self._load_model()
             logger.info("模型載入完成")
             self._test_model()
@@ -332,10 +352,10 @@ class AudioSeparator:
                             # 測試檔案讀取權限
                             with open(hyperparams_file, 'r', encoding='utf-8') as f:
                                 content = f.read(100)  # 讀取前100個字符來測試
-                            logger.info("本地模型檔案可正常讀取")
+                            logger.info("本地模型檔案讀取正常")
                         except (PermissionError, OSError, UnicodeDecodeError) as e:
                             logger.warning(f"本地模型檔案無法讀取: {e}")
-                            logger.info("檢測到無效的符號連結，需要重新下載模型...")
+                            logger.info("偵測到無效的符號連結，準備重新下載模型...")
                             
                             # 刪除包含無效符號連結的目錄
                             try:
@@ -343,7 +363,7 @@ class AudioSeparator:
                                 shutil.rmtree(local_model_path, ignore_errors=True)
                                 logger.info(f"已刪除無效的模型目錄: {local_model_path}")
                             except Exception as rm_error:
-                                logger.warning(f"刪除模型目錄時出現問題: {rm_error}")
+                                logger.warning(f"刪除模型目錄時發生錯誤: {rm_error}")
                 
                 # 嘗試載入模型 (如果本地檔案無效，SpeechBrain 會自動重新下載)
                 model = separator.from_hparams(
@@ -371,12 +391,12 @@ class AudioSeparator:
                         savedir=os.path.abspath(f"models/{self.model_type.value}"),
                         run_opts={"device": self.device}
                     )
-                    logger.info("強制重新下載後模型載入成功")
+                    logger.info("強制重新下載後，模型載入成功")
                     return model
                     
                 except Exception as final_error:
-                    logger.error(f"所有嘗試都失敗了: {final_error}")
-                    raise Exception(f"模型載入完全失敗。請檢查網路連接和模型可用性。原始錯誤: {e}")
+                    logger.error(f"所有載入嘗試均失敗: {final_error}")
+                    raise Exception(f"模型載入完全失敗。請檢查網路連線和模型可用性。原始錯誤: {e}")
         else:
             # 使用 ConvTasNet 模型（原有邏輯）
             if USE_ASTEROID:
@@ -386,7 +406,7 @@ class AudioSeparator:
                     model.eval()
                     return model
                 except Exception as e:
-                    logger.warning(f"Asteroid 載入失敗，嘗試其他方法...")
+                    logger.warning(f"Asteroid 載入失敗，嘗試其他載入方式...")
             
             try:
                 model = AutoModel.from_pretrained(
@@ -397,7 +417,7 @@ class AudioSeparator:
                 model.eval()
                 return model
             except Exception as e:
-                logger.info("嘗試 torch.hub 載入...")
+                logger.info("嘗試使用 torch.hub 載入...")
                 return self._manual_load_model()
 
     def _manual_load_model(self):
@@ -410,7 +430,7 @@ class AudioSeparator:
             model.eval()
             return model
         except Exception as e:
-            logger.error(f"所有載入方法都失敗: {e}")
+            logger.error(f"所有載入方式均失敗: {e}")
             raise
 
     def _test_model(self):
@@ -984,7 +1004,7 @@ class AudioSeparator:
 
                             saved_count += 1
                     except Exception as e:
-                        logger.warning(f"儲存說話者 {i+1} 失敗: {e}")
+                        logger.warning(f"儲存語者 {i+1} 失敗: {e}")
                 
                 if saved_count > 0:
                     logger.info(f"片段 {segment_index} 完成，儲存 {saved_count} 個檔案")
@@ -1072,7 +1092,7 @@ class AudioSeparator:
                         
                         # 檢查音訊品質
                         rms = torch.sqrt(torch.mean(speaker_audio ** 2))
-                        if rms > 0.01:  # 只保存有意義的音訊
+                        if rms > 0.01:  # 只儲存有意義的音訊
                             # 溫和的正規化
                             max_val = torch.max(torch.abs(speaker_audio))
                             if max_val > 0:
@@ -1083,7 +1103,7 @@ class AudioSeparator:
                             final_audio = speaker_audio.numpy()
                             final_tensor = speaker_audio.unsqueeze(0)
                             
-                            # 儲存音訊流資料供直接辨識
+                            # 儲存音訊串流資料供直接辨識使用
                             audio_streams.append({
                                 'audio_data': final_audio,
                                 'sample_rate': TARGET_RATE,
@@ -1109,10 +1129,10 @@ class AudioSeparator:
                             saved_count += 1
                             
                     except Exception as e:
-                        logger.warning(f"處理說話者 {i+1} 失敗: {e}")
+                        logger.warning(f"處理語者 {i+1} 時失敗: {e}")
                 
                 if saved_count > 0:
-                    logger.info(f"片段 {segment_index} 分離完成，共 {saved_count} 個語者")
+                    logger.info(f"片段 {segment_index} 分離完成，共處理 {saved_count} 個語者")
             
             # 步驟2: 即時進行語者識別
             logger.info(
@@ -1164,7 +1184,7 @@ class AudioSeparator:
 # ================== 語者識別部分 ======================
 
 class SpeakerIdentifier:
-    """說話者識別類，負責呼叫 v5 版本的語者識別功能，使用單例模式"""
+    """語者識別類，負責呼叫 v5 版本的語者識別功能，使用單例模式"""
     
     _instance = None
     
@@ -1176,7 +1196,7 @@ class SpeakerIdentifier:
         return cls._instance
     
     def __init__(self) -> None:
-        """初始化說話者識別器，使用 v5 版本的 SpeakerIdentifier"""
+        """初始化語者識別器，使用 v5 版本的 SpeakerIdentifier"""
         # 若已初始化，則跳過
         if hasattr(self, '_initialized') and self._initialized:
             return
@@ -1196,14 +1216,14 @@ class SpeakerIdentifier:
     
     def process_audio_streams(self, audio_streams: list, timestamp: datetime) -> dict:
         """
-        處理多個音訊流並進行說話者識別
+        處理多個音訊流並進行語者識別
         
         Args:
             audio_streams: 音訊流資料列表，每個元素包含 'audio_data', 'sample_rate', 'name'
             timestamp: 音訊流的時間戳記物件
             
         Returns:
-            dict: 音訊流名稱 -> (說話者名稱, 相似度, 識別結果描述)
+            dict: 音訊流名稱 -> (語者名稱, 相似度, 識別結果描述)
         """
         results = {}
         
@@ -1228,17 +1248,17 @@ class SpeakerIdentifier:
                     
                     # 根據距離判斷識別結果
                     if distance == -1:
-                        # 距離為 -1 表示新建立的說話者
-                        result_desc = f"新說話者 {speaker_name} \t(已建立新聲紋:{distance:.4f})"
+                        # 距離為 -1 表示新建立的語者
+                        result_desc = f"新語者 {speaker_name} \t(已建立新聲紋:{distance:.4f})"
                     elif distance < THRESHOLD_LOW:
-                        result_desc = f"說話者 {speaker_name} \t(聲音非常相似:{distance:.4f})"
+                        result_desc = f"語者 {speaker_name} \t(聲音非常相似:{distance:.4f})"
                     elif distance < THRESHOLD_UPDATE:
-                        result_desc = f"說話者 {speaker_name} \t(已更新聲紋:{distance:.4f})"
+                        result_desc = f"語者 {speaker_name} \t(已更新聲紋:{distance:.4f})"
                     elif distance < THRESHOLD_NEW:
-                        result_desc = f"說話者 {speaker_name} \t(新增新的聲紋:{distance:.4f})"
+                        result_desc = f"語者 {speaker_name} \t(新增新的聲紋:{distance:.4f})"
                     else:
-                        # 此處不應該執行到，因為距離大於 THRESHOLD_NEW 時應該創建新說話者
-                        result_desc = f"說話者 {speaker_name} \t(判斷不明確):{distance:.4f}"
+                        # 此處不應該執行到，因為距離大於 THRESHOLD_NEW 時應該創建新語者
+                        result_desc = f"語者 {speaker_name} \t(判斷不明確):{distance:.4f}"
                     
                     results[name] = (speaker_name, distance, result_desc)
                     # logger.info(f"結果: {result_desc}")

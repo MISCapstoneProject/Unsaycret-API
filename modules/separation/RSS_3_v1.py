@@ -14,6 +14,7 @@ from utils.constants import (
     HIGH_FREQ_CUTOFF, DYNAMIC_RANGE_COMPRESSION, CONVTASNET_MODEL_NAME,
     NUM_SPEAKERS_SEPARATION
 )
+from utils.env_config import FORCE_CPU, CUDA_DEVICE_INDEX
 
 # 設定日誌 - 改為 INFO 級別
 logging.basicConfig(
@@ -45,7 +46,27 @@ DEVICE_INDEX = None
 
 class AudioSeparator:
     def __init__(self, enable_noise_reduction=True, snr_threshold=SNR_THRESHOLD):
-        self.device = "cuda" if torch.cuda.is_available() else "cpu"
+        # 設備選擇邏輯：優先考慮 FORCE_CPU 設定
+        if FORCE_CPU:
+            self.device = "cpu"
+            logger.info("🔧 FORCE_CPU=true，強制使用 CPU")
+        else:
+            if torch.cuda.is_available():
+                # 檢查指定的CUDA設備是否存在
+                if CUDA_DEVICE_INDEX < torch.cuda.device_count():
+                    self.device = f"cuda:{CUDA_DEVICE_INDEX}"
+                    # 確保設定正確的設備
+                    torch.cuda.set_device(CUDA_DEVICE_INDEX)
+                    if CUDA_DEVICE_INDEX != 0:
+                        logger.info(f"🎯 使用 CUDA 設備索引: {CUDA_DEVICE_INDEX}")
+                else:
+                    logger.warning(f"⚠️  CUDA 設備索引 {CUDA_DEVICE_INDEX} 不存在，使用 cuda:0")
+                    self.device = "cuda:0"
+                    torch.cuda.set_device(0)
+            else:
+                self.device = "cpu"
+                logger.info("🖥️  未偵測到 GPU，使用 CPU")
+        
         self.enable_noise_reduction = enable_noise_reduction
         self.snr_threshold = snr_threshold
         

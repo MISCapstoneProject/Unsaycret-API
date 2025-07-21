@@ -16,6 +16,7 @@ import pyaudio  # type: ignore
 
 from utils.logger import get_logger
 from utils.constants import DEFAULT_WHISPER_MODEL
+from utils.env_config import FORCE_CPU, CUDA_DEVICE_INDEX
 from modules.separation.separator import AudioSeparator
 from modules.identification.VID_identify_v5 import SpeakerIdentifier
 from modules.asr.whisper_asr import WhisperASR
@@ -26,9 +27,27 @@ logger.info("🖥 GPU available: %s", torch.cuda.is_available())
 if torch.cuda.is_available():
     logger.info("   Device: %s", torch.cuda.get_device_name(0))
 
-# ---------- 1. 自動偵測 GPU ----------
-use_gpu = torch.cuda.is_available()
-logger.info(f"🚀 使用設備: {'cuda' if use_gpu else 'cpu'}")
+# ---------- 1. GPU/CPU 設備選擇 ----------
+current_cuda_device = CUDA_DEVICE_INDEX  # 建立本地變數避免修改全域變數
+
+if FORCE_CPU:
+    use_gpu = False
+    logger.info("🔧 FORCE_CPU=true，強制使用 CPU")
+else:
+    use_gpu = torch.cuda.is_available()
+    if use_gpu:
+        # 檢查指定的設備是否存在
+        if current_cuda_device < torch.cuda.device_count():
+            torch.cuda.set_device(current_cuda_device)
+            logger.info(f"🎯 設定 CUDA 設備索引: {current_cuda_device}")
+            logger.info(f"   使用設備: {torch.cuda.get_device_name(current_cuda_device)}")
+        else:
+            logger.warning(f"⚠️  CUDA 設備索引 {current_cuda_device} 不存在，使用預設設備 0")
+            current_cuda_device = 0
+            torch.cuda.set_device(current_cuda_device)  # 確實設定設備 0
+            logger.info(f"   已設定為設備 0: {torch.cuda.get_device_name(0)}")
+
+logger.info(f"🚀 使用設備: {'cuda:' + str(current_cuda_device) if use_gpu else 'cpu'}")
 
 sep = AudioSeparator()
 spk = SpeakerIdentifier()
