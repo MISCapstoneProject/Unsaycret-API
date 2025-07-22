@@ -18,6 +18,7 @@ from utils.logger import get_logger
 from modules.separation.separator import AudioSeparator
 from modules.identification.VID_identify_v5 import SpeakerIdentifier
 from modules.asr.whisper_asr import WhisperASR
+from modules.asr.text_utils import compute_cer,compute_wer
 
 logger = get_logger(__name__)
 
@@ -31,7 +32,7 @@ logger.info(f"🚀 使用設備: {'cuda' if use_gpu else 'cpu'}")
 
 sep = AudioSeparator()
 spk = SpeakerIdentifier()
-asr = WhisperASR(model_name="medium", gpu=use_gpu)
+asr = WhisperASR(model_name="large-v2", gpu=use_gpu,beam = 5, lang = "zh")
 
 def _timed_call(func, *args):
     t0 = time.perf_counter()
@@ -178,59 +179,92 @@ def run_pipeline_file(raw_wav: str, max_workers: int = 3):
 
     return bundle, pretty_bundle, stats
 
+def load_truth_map(path: str) -> dict[str, str]:
+    """從一個 .txt 檔（每行 filename<TAB>transcript）讀出 mapping"""
+    m = {}
+    with open(path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or "\t" not in line:
+                continue
+            fname, txt = line.split("\t", 1)
+            m[fname] = txt.strip()
+    return m
 
-def run_pipeline_dir(dir_path: str, max_workers: int = 3) -> str:
+def run_pipeline_dir(dir_path: str,truth_map_path: str = "truth_map.txt", max_workers: int = 3) -> str:
     """一次處理資料夾內所有音檔，並將「檔案層級統計」+「段落層級詳情」寫入同一份 TSV。
 
     只呼叫 `run_pipeline_file()` 一次就同時拿到 `stats` 與 `segments`，避免重複運算。
     回傳值為生成之 `summary.tsv` 的路徑（字串）。
     """
 
+    # 1) 先載入 ground truth
+    truth_map = load_truth_map(truth_map_path) if truth_map_path else {}
+    
     # === 準備輸出目錄 ===
+    # 2) 準備輸出資料夾
     timestamp = dt.now().strftime("%Y%m%d_%H%M%S")
     out_dir = pathlib.Path("work_output") / f"batch_{timestamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
-    summary_path = out_dir / "summary.tsv"
+    summary_path    = out_dir / "summary.tsv"
     asr_report_path = out_dir / "asr_report.tsv"
 
     # === 收集所有支援格式之音檔（含子目錄） ===
-    audio_files = [f for f in pathlib.Path(dir_path).rglob("*") if f.suffix.lower() in {".wav", ".mp3", ".flac", ".ogg"}]
+    audio_files = [
+        f for f in pathlib.Path(dir_path).rglob("*")
+        if f.suffix.lower() in {".wav", ".mp3", ".flac", ".ogg"}
+    ]
     if not audio_files:
         logger.warning("⚠️  目錄內未找到支援格式音檔")
         return str(summary_path)
 
     # === 一次處理並暫存結果 ===
-    file_results = []  # [(檔案索引, Path, stats, segments)]
+    file_results = []
     for idx, audio in enumerate(sorted(audio_files), start=1):
         logger.info(f"===== 處理檔案 {audio.name} ({idx}/{len(audio_files)}) =====")
         segments, pretty, stats = run_pipeline_file(str(audio), max_workers)
+
+        # override stats['wer'], stats['cer'] using central map
+        gt = truth_map.get(audio.name)
+        if gt:
+            recog_text = " ".join(s.get("text","") for s in segments if s.get("text"))
+            stats["wer"] = compute_wer(gt, recog_text)
+            stats["cer"] = compute_cer(gt, recog_text)
+        else:
+            stats["wer"] = None
+            stats["cer"] = None
+
         file_results.append((idx, audio, stats, segments))
 
     # === 寫入 TSV ===
-    with open(summary_path, "w", encoding="utf-8") as f_sum, open(asr_report_path, "w", encoding="utf-8") as f_asr:
-        # -- 檔案層級統計 --
+    with open(summary_path,    "w", encoding="utf-8") as f_sum, \
+         open(asr_report_path, "w", encoding="utf-8") as f_asr:
+
+        # 檔案層級統計
         f_sum.write("編號\t檔名\t音檔長度(s)\t總耗時(s)\t分離耗時(s)\tSpeakerID耗時(s)\tASR耗時(s)\n")
         f_asr.write("編號\t檔名\tASR耗時(s)\t總耗時(s)\t平均confidence\tWER\tCER\n")
+
         for idx, audio, stats, _ in file_results:
+            wer_str = f"{stats['wer']:.4f}" if stats['wer'] is not None else "NA"
+            cer_str = f"{stats['cer']:.4f}" if stats['cer'] is not None else "NA"
             f_sum.write(
                 f"{idx}\t{audio.name}\t{stats['length']:.2f}\t{stats['total']:.2f}\t"
                 f"{stats['separate']:.2f}\t{stats['speaker']:.2f}\t{stats['asr']:.2f}\n"
             )
-            wer_str = f"{stats['wer']:.4f}" if stats['wer'] is not None else "NA"
-            cer_str = f"{stats['cer']:.4f}" if stats['cer'] is not None else "NA"
             f_asr.write(
                 f"{idx}\t{audio.name}\t{stats['asr']:.2f}\t{stats['total']:.2f}\t"
                 f"{stats['avg_conf']:.4f}\t{wer_str}\t{cer_str}\n"
             )
-        # 空行分段
+
+        # 段落層級詳情
         f_sum.write("\n檔案\t開始(s)\t結束(s)\t說話者\tdistance\tconfidence\t文字\n")
-        # -- 段落層級詳情 --
         for _, audio, _, segments in file_results:
             for seg in segments:
-                text = str(seg.get("text", "")).replace("\t", " ")
+                text = seg.get("text","").replace("\t"," ")
                 f_sum.write(
                     f"{audio.name}\t{seg['start']:.3f}\t{seg['end']:.3f}\t"
-                    f"{seg['speaker']}\t{seg['distance']:.4f}\t{seg['confidence']:.4f}\t{text}\n"
+                    f"{seg['speaker']}\t{seg.get('distance',0.0):.4f}\t"
+                    f"{seg['confidence']:.4f}\t{text}\n"
                 )
 
     logger.info(f"✅ Directory pipeline 完成 → {summary_path}")
