@@ -25,12 +25,12 @@ SPEECHBRAIN_SEPARATOR_MODEL = "speechbrain/sepformer-whamr16k"
 
 # Whisper 模型對照表
 WHISPER_MODEL_MAP = {
-    "tiny": "guillaumekln/faster-whisper-tiny",
-    "base": "guillaumekln/faster-whisper-base",
-    "small": "guillaumekln/faster-whisper-small",
-    "medium": "guillaumekln/faster-whisper-medium",
+    "tiny":     "guillaumekln/faster-whisper-tiny",
+    "base":     "guillaumekln/faster-whisper-base",
+    "small":    "guillaumekln/faster-whisper-small",
+    "medium":   "guillaumekln/faster-whisper-medium",
     "large-v2": "guillaumekln/faster-whisper-large-v2",
-    "large-v3": "guillaumekln/faster-whisper-large-v3",
+    "large-v3": "Systran/faster-whisper-large-v3",   # ← 改這行/新增這行
 }
 
 # WebSocket 處理參數
