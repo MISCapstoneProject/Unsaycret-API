@@ -372,8 +372,8 @@ class WeaviateRepository:
                 
                 # 嘗試自動初始化V2集合
                 try:
-                    from modules.database.init_v2_collections import ensure_weaviate_v2_collections
-                    if ensure_weaviate_v2_collections():
+                    from modules.database.init_v2_collections import ensure_weaviate_collections
+                    if ensure_weaviate_collections():
                         print("✅ 已自動初始化V2集合！")
                     else:
                         print("❌ 自動初始化V2集合失敗！")

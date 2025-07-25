@@ -13,13 +13,8 @@ Weaviate Collections V2 初始化模組
 
 🎯 向量化策略：
 - DEFAULT_VECTORIZER_MODULE: 'none' (預設不向量化)
-- Session: 啟用 text2vec_transformers
-  - title: vectorize_property_name=True (語義搜尋)
-  - summary: vectorize_property_name=True (語義搜尋)
-  - session_id, session_type: vectorize_property_name=False (不需要向量化)
-- SpeechLog: 啟用 text2vec_transformers
-  - content: vectorize_property_name=True (語義搜尋)
-  - language: vectorize_property_name=False (不需要向量化)
+- Session: 不啟用向量化（text2vec_transformers 已移除）
+- SpeechLog: 不啟用向量化（text2vec_transformers 已移除）
 - Speaker, VoicePrint: 使用 none (關聯查詢即可)
 
 📦 使用方法：
@@ -208,10 +203,10 @@ class WeaviateV2CollectionManager:
                 properties=[
                     wc.Property(name="session_id", data_type=wc.DataType.TEXT),
                     wc.Property(name="session_type", data_type=wc.DataType.TEXT),
-                    wc.Property(name="title", data_type=wc.DataType.TEXT),  # 語意搜尋
+                    wc.Property(name="title", data_type=wc.DataType.TEXT),  
                     wc.Property(name="start_time", data_type=wc.DataType.DATE),
                     wc.Property(name="end_time", data_type=wc.DataType.DATE),
-                    wc.Property(name="summary", data_type=wc.DataType.TEXT),    # 語意搜尋
+                    wc.Property(name="summary", data_type=wc.DataType.TEXT),  
                 ],
                 references=[
                     wc.ReferenceProperty(
@@ -219,13 +214,7 @@ class WeaviateV2CollectionManager:
                         target_collection="Speaker"
                     )
                 ],
-                vectorizer_config=[
-                    wc.Configure.NamedVectors.text2vec_transformers(      
-                        name="text_emb",                                   #   任意命名
-                        source_properties=["title", "summary"],
-                        vectorize_collection_name=False,
-                    )
-                ]
+                vectorizer_config=wc.Configure.Vectorizer.none()
             )
             logger.info(f"成功建立 {collection_name} 集合")
             return True
@@ -233,7 +222,7 @@ class WeaviateV2CollectionManager:
         except Exception as e:
             logger.error(f"建立 {collection_name} 集合時發生錯誤: {str(e)}")
             return False
-    
+
     def create_speechlog(self) -> bool:
         """
         建立 SpeechLog 集合（一句話記錄）
@@ -256,7 +245,7 @@ class WeaviateV2CollectionManager:
             speechlog_collection = self.client.collections.create(
                 name=collection_name,
                 properties=[
-                    wc.Property(name="content", data_type=wc.DataType.TEXT),    # 語義搜尋
+                    wc.Property(name="content", data_type=wc.DataType.TEXT),    
                     wc.Property(name="timestamp", data_type=wc.DataType.DATE),
                     wc.Property(name="confidence", data_type=wc.DataType.NUMBER),
                     wc.Property(name="duration", data_type=wc.DataType.NUMBER),
@@ -272,13 +261,7 @@ class WeaviateV2CollectionManager:
                         target_collection="Session"
                     )
                 ],
-                vectorizer_config=[
-                    wc.Configure.NamedVectors.text2vec_transformers(     
-                        name="text_emb",
-                        source_properties=["content"],
-                        vectorize_collection_name=False,
-                    )
-                ]
+                vectorizer_config=wc.Configure.Vectorizer.none()
             )
             logger.info(f"成功建立 {collection_name} 集合")
             return True
