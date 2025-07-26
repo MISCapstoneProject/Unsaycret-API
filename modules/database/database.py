@@ -523,20 +523,15 @@ class DatabaseService:
             logger.error(f"更新語者最後活動時間時發生錯誤: {exc}")
             return False
     
-    def update_speaker_stats(
-        self, 
-        speaker_uuid: str, 
-        meet_count: Optional[int] = None,
-        meet_days: Optional[int] = None
-    ) -> bool:
+    def update_speaker(self, speaker_uuid: str, update_fields: Dict[str, Any]) -> bool:
         """
-        更新語者的統計資訊（V2版本新增）。
-        
+        通用更新語者資料的方法。
+        如果更新了 full_name，會同步更新所有關聯聲紋的 speaker_name。
+
         Args:
             speaker_uuid: 語者 UUID
-            meet_count: 會議次數，若為None則不更新
-            meet_days: 會議天數，若為None則不更新
-            
+            update_fields: 包含要更新的欄位與值的字典
+
         Returns:
             bool: 是否更新成功
         """
@@ -544,28 +539,44 @@ class DatabaseService:
             if not valid_uuid(speaker_uuid):
                 logger.error(f"無效的語者 UUID 格式: {speaker_uuid}")
                 return False
-            
-            # 準備要更新的屬性
-            update_properties = {}
-            if meet_count is not None:
-                update_properties["meet_count"] = meet_count
-            if meet_days is not None:
-                update_properties["meet_days"] = meet_days
-                
-            if not update_properties:
-                logger.warning("沒有提供任何要更新的統計資訊")
-                return False
-            
+
+            if not update_fields:
+                logger.warning("沒有提供任何要更新的欄位")
+                return True  # 沒有東西要更新，不算錯誤
+
             sp_col = self.client.collections.get(self.SPEAKER_CLASS)
-            sp_col.data.update(
-                uuid=speaker_uuid, 
-                properties=update_properties
-            )
-            
-            logger.info(f"已更新語者 {speaker_uuid} 的統計資訊")
+
+            # 1. 更新 Speaker 物件本身
+            sp_col.data.update(uuid=speaker_uuid, properties=update_fields)
+            logger.info(f"已更新語者 {speaker_uuid} 的屬性: {list(update_fields.keys())}")
+
+            # 2. 如果 full_name 被更新，需要同步更新所有 VoicePrint 的 speaker_name
+            if "full_name" in update_fields:
+                # 拿回這個 Speaker 物件，讀出 voiceprint_ids 和更新後的 full_name
+                sp_obj = sp_col.query.fetch_object_by_id(uuid=speaker_uuid)
+                if not sp_obj:
+                    logger.error(f"找不到語者 (UUID: {speaker_uuid})，無法同步更新聲紋")
+                    return False
+
+                vp_ids = sp_obj.properties.get("voiceprint_ids", [])
+                updated_full_name = sp_obj.properties.get("full_name", "未命名")
+
+                # 逐一更新每支 VoicePrint 的 speaker_name
+                if vp_ids:
+                    vp_col = self.client.collections.get(self.VOICEPRINT_CLASS)
+                    for vp_id in vp_ids:
+                        try:
+                            vp_col.data.update(
+                                uuid=vp_id,
+                                properties={"speaker_name": updated_full_name}
+                            )
+                        except Exception as vp_exc:
+                            logger.error(f"同步更新聲紋 {vp_id} 的 speaker_name 時失敗: {vp_exc}")
+                    logger.info(f"已同步更新 {len(vp_ids)} 個關聯聲紋的 speaker_name 為 '{updated_full_name}'")
+
             return True
         except Exception as exc:
-            logger.error(f"更新語者統計資訊時發生錯誤: {exc}")
+            logger.error(f"更新語者 {speaker_uuid} 時發生錯誤: {exc}")
             return False
     
     def delete_speaker(self, speaker_uuid: str) -> bool:

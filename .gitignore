@@ -19,7 +19,6 @@ ct2_models/
 work_output/
 stream_output/
 pretrained_models/
-embeddingFiles/
 models
 R3SI
 pipeline_stages.csv

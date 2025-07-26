@@ -1,13 +1,11 @@
 # Unsaycret-API
 
-**版本**: v0.4.0  <br>
-**最後更新**: 2025-07-22
+**版本**: v0.4.1  <br>
+**最後更新**: 2025-07-27
 
 ## 專案簡介
-Unsaycret-API 是一套模組化的語音處理系統，整合語音分離、說者辨識、語音辨識、API 服務，並支援 Weaviate V2 向量資料庫串接。
+Unsaycret-API 是一套模組化的語音處理系統，整合語音分離、說者辨識、語音辨識、API 服務，並支援 Weaviate 向量資料庫串接。
 專案執行後會啟動 API 伺服器，以呼叫 API 的方式使用所有功能。
-
-> **⚠️ V2 資料庫版本**: 本版本已升級至 Weaviate V2 資料庫結構，不相容於 V1 版本
 
 ## 🚀 主要功能
 
@@ -33,29 +31,33 @@ Unsaycret-API 是一套模組化的語音處理系統，整合語音分離、說
 ### 核心模組架構
 ```
 Unsaycret-API/
-├── api/                     # FastAPI 應用程式層 (重構自 services/)
-│   ├── api.py              # HTTP API 入口與路由定義
-│   ├── handlers/           # 語者管理業務邏輯處理器
-│   │   └── speaker_handler.py
+├── api/                     # FastAPI 應用程式層
+│   ├── api.py               # HTTP API 入口與路由定義
 │   └── README.md
+├── services/                # 資料存取門面
+│   └── data_facade.py       # DataFacade: 統一對外資料操作介面
 ├── modules/                 # 核心業務模組
-│   ├── asr/                # 語音辨識 (Faster-Whisper)
-│   ├── database/           # Weaviate V2 資料庫操作
-│   │   ├── database.py         # DatabaseService V2 實作
-│   │   └── init_v2_collections.py  # V2 集合初始化
-│   ├── identification/     # 語者識別 (ECAPA-TDNN)
-│   ├── management/         # 語者管理
-│   └── separation/         # 語者分離 (Sepformer/ConvTasNet)
-├── pipelines/              # 處理流程編排
-│   └── orchestrator.py         # 分離+辨識+ASR 整合流程
-├── utils/                  # 系統工具
-│   ├── env_config.py           # 環境配置載入
-│   ├── constants.py            # 應用程式常數
-│   └── logger.py               # 統一日誌系統
-└── weaviate_study/         # Weaviate V2 開發工具
-    ├── npy_to_weaviate.py      # V2 向量匯入工具
+│   ├── asr/                 # 語音辨識 (Faster-Whisper)
+│   ├── database/            # Weaviate V2 資料庫操作
+│   │   ├── database.py
+│   │   └── init_v2_collections.py
+│   ├── identification/      # 語者識別 (ECAPA-TDNN)
+│   ├── management/          # 語者管理
+│   └── separation/          # 語者分離 (Sepformer/ConvTasNet)
+├── pipelines/               # 處理流程編排
+│   └── orchestrator.py      # 分離+辨識+ASR 整合流程
+├── utils/                   # 系統工具
+│   ├── env_config.py
+│   ├── constants.py
+│   └── logger.py            # 統一日誌管理
+└── weaviate_study/          # Weaviate V2 開發工具
+    ├── npy_to_weaviate.py   # 匯入現有測試聲紋向量資料
     └── README.md
 ```
+
+> **說明**：
+> - `services/data_facade.py` 為資料存取門面，API 層所有資料查詢、異動、驗證等操作皆透過 DataFacade 對外暴露，實現業務邏輯與資料層分離。
+> - `modules/` 內為各功能子模組，專注於演算法與資料處理。
 
 ## 🚀 快速開始
 

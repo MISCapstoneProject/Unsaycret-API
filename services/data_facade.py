@@ -1,6 +1,7 @@
-# services/handlers/speaker_handler.py
+# services/data_facade.py
 """
-語者管理業務邏輯處理器
+DataService － 資料存取統一入口（Facade）
+封裝 SpeakerRepo、VoiceprintRepo… 提供 API 層存取。
 
 此模組包含所有與語者管理相關的業務邏輯，
 將 HTTP 層與業務邏輯分離，提高程式碼的可維護性和可測試性。
@@ -14,8 +15,8 @@ from utils.logger import get_logger
 
 logger = get_logger(__name__)
 
-class SpeakerHandler:
-    """語者管理業務邏輯處理器"""
+class DataFacade:
+    """資料庫管理的邏輯處理器"""
     
     def __init__(self) -> None:
         """初始化語者處理器"""
@@ -506,3 +507,40 @@ class SpeakerHandler:
                 status_code=500, 
                 detail=f"伺服器內部錯誤：{str(e)}"
             )
+    
+    def update_speaker(self, speaker_id: str, update_fields: dict) -> dict:
+        """
+        通用語者資料更新（僅允許部分欄位可更新）
+        Args:
+            speaker_id: 語者唯一識別碼（UUID 或序號ID）
+            update_fields: 欲更新的欄位 dict
+        Returns:
+            dict: 操作結果
+        Raises:
+            HTTPException: 當操作失敗時
+        """
+        try:
+            # 1. 驗證輸入
+            if not speaker_id or not update_fields:
+                raise HTTPException(status_code=400, detail="語者ID與更新欄位不可為空")
+            # 2. 檢查語者是否存在
+            obj = self.speaker_manager.get_speaker(speaker_id)
+            if not obj:
+                raise HTTPException(status_code=404, detail=f"找不到ID為 {speaker_id} 的語者")
+            # 3. 執行更新
+            success = self.speaker_manager.update_speaker(speaker_id, update_fields)
+            if success:
+                logger.info(f"成功更新語者 {speaker_id} 欄位: {list(update_fields.keys())}")
+                return {
+                    "success": True,
+                    "message": f"成功更新語者 {speaker_id} 欄位: {list(update_fields.keys())}",
+                    "data": {"speaker_id": speaker_id, "updated_fields": update_fields}
+                }
+            else:
+                logger.error(f"語者更新失敗：speaker_id={speaker_id}")
+                raise HTTPException(status_code=500, detail="語者更新失敗，請檢查日誌以獲取詳細資訊")
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"語者更新發生未預期錯誤：{str(e)}")
+            raise HTTPException(status_code=500, detail=f"伺服器內部錯誤：{str(e)}")

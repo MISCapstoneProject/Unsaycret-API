@@ -6,7 +6,7 @@
 import sys
 sys.path.append('.')
 
-from api.handlers.speaker_handler import SpeakerHandler
+from services.data_facade import SpeakerHandler
 from modules.database.database import DatabaseService
 
 def test_api_models():

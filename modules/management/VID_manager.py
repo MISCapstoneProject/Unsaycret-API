@@ -128,6 +128,21 @@ class SpeakerManager:
             logger.error(f"更改語者名稱時發生錯誤: {exc}")
             return False
 
+    def update_speaker(self, speaker_uuid: str, update_fields: dict) -> bool:
+        """
+        通用語者資料多欄位更新（V2，支援 PATCH）
+        Args:
+            speaker_uuid: 語者 UUID
+            update_fields: 欲更新的欄位 dict
+        Returns:
+            bool: 是否成功
+        """
+        try:
+            return self._db.update_speaker(speaker_uuid, update_fields)
+        except Exception as exc:
+            logger.error(f"更新語者欄位時發生錯誤: {exc}")
+            return False
+
     def delete_speaker(self, speaker_uuid: str) -> bool:
         """刪除語者。"""
         try:

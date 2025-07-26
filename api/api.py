@@ -16,7 +16,7 @@ from pipelines.orchestrator import (
     run_pipeline_STREAM,
     run_pipeline_DIR,
 )
-from api.handlers.speaker_handler import SpeakerHandler
+from services.data_facade import DataFacade
 import tempfile, shutil, os, zipfile
 from utils.constants import (
     API_DEFAULT_VERIFICATION_THRESHOLD, API_DEFAULT_MAX_RESULTS,
@@ -26,8 +26,8 @@ from utils.constants import (
 
 app = FastAPI(title="Unsaycret API")
 
-# 初始化處理器
-speaker_handler = SpeakerHandler()
+# 初始化資料存取接口
+data_facade = DataFacade()
 
 # Pydantic 模型定義
 class SpeakerRenameRequest(BaseModel):
@@ -82,11 +82,139 @@ class SpeakerInfo(BaseModel):
     voiceprint_ids: Optional[List[str]] = None
     first_audio: Optional[str] = None
 
+class SpeakerUpdateRequest(BaseModel):
+    """語者資料更新請求模型（僅允許部分欄位可選）"""
+    full_name: Optional[str] = None
+    nickname: Optional[str] = None
+    gender: Optional[str] = None
+    created_at: Optional[str] = None
+    last_active_at: Optional[str] = None
+    meet_count: Optional[int] = None
+    meet_days: Optional[int] = None
+
 class ApiResponse(BaseModel):
     """統一API回應模型"""
     success: bool
     message: str
     data: Optional[dict] = None
+
+# ----------------------------------------------------------------------------
+# Session CRUD 模型與路由
+# ----------------------------------------------------------------------------
+class SessionCreateRequest(BaseModel):
+    session_type: Optional[str] = None
+    title: Optional[str] = None
+    start_time: Optional[str] = None  # ISO 格式字串，預設為當下時間
+    end_time: Optional[str] = None    # ISO 格式字串
+    summary: Optional[str] = None
+    participants: Optional[List[str]] = None  # 語者 UUID 列表
+
+class SessionUpdateRequest(BaseModel):
+    session_type: Optional[str] = None
+    title: Optional[str] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    summary: Optional[str] = None
+    participants: Optional[List[str]] = None
+
+class SessionInfo(BaseModel):
+    uuid: str
+    session_id: str
+    session_type: Optional[str] = None
+    title: Optional[str] = None
+    start_time: Optional[str] = None
+    end_time: Optional[str] = None
+    summary: Optional[str] = None
+    participants: Optional[List[str]] = []
+
+@app.post("/sessions", response_model=ApiResponse)
+async def create_session(request: SessionCreateRequest) -> ApiResponse:
+    """新增 Session 記錄"""
+    result = data_facade.create_session(request)
+    return ApiResponse(**result)
+
+@app.get("/sessions", response_model=List[SessionInfo])
+async def list_sessions() -> List[SessionInfo]:
+    """列出所有 Session"""
+    return data_facade.list_sessions()
+
+@app.get("/sessions/{session_id}", response_model=SessionInfo)
+async def get_session_info(session_id: str) -> SessionInfo:
+    """取得單一 Session 資訊"""
+    return data_facade.get_session_info(session_id)
+
+@app.patch("/sessions/{session_id}", response_model=ApiResponse)
+async def update_session(session_id: str, request: SessionUpdateRequest) -> ApiResponse:
+    """部分更新 Session"""
+    update_data = request.model_dump(exclude_unset=True)
+    result = data_facade.update_session(session_id, update_data)
+    return ApiResponse(**result)
+
+@app.delete("/sessions/{session_id}", response_model=ApiResponse)
+async def delete_session(session_id: str) -> ApiResponse:
+    """刪除 Session"""
+    result = data_facade.delete_session(session_id)
+    return ApiResponse(**result)
+
+# ----------------------------------------------------------------------------
+# SpeechLog CRUD 模型與路由
+# ----------------------------------------------------------------------------
+class SpeechLogCreateRequest(BaseModel):
+    content: Optional[str] = None
+    timestamp: Optional[str] = None  # ISO 格式字串，預設為當下時間
+    confidence: Optional[float] = None
+    duration: Optional[float] = None
+    language: Optional[str] = None
+    speaker: Optional[str] = None  # 語者 UUID
+    session: Optional[str] = None  # Session UUID
+
+class SpeechLogUpdateRequest(BaseModel):
+    content: Optional[str] = None
+    timestamp: Optional[str] = None
+    confidence: Optional[float] = None
+    duration: Optional[float] = None
+    language: Optional[str] = None
+    speaker: Optional[str] = None
+    session: Optional[str] = None
+
+class SpeechLogInfo(BaseModel):
+    uuid: str
+    content: Optional[str] = None
+    timestamp: Optional[str] = None
+    confidence: Optional[float] = None
+    duration: Optional[float] = None
+    language: Optional[str] = None
+    speaker: Optional[str] = None
+    session: Optional[str] = None
+
+@app.post("/speechlogs", response_model=ApiResponse)
+async def create_speechlog(request: SpeechLogCreateRequest) -> ApiResponse:
+    """新增 SpeechLog 記錄"""
+    result = data_facade.create_speechlog(request)
+    return ApiResponse(**result)
+
+@app.get("/speechlogs", response_model=List[SpeechLogInfo])
+async def list_speechlogs() -> List[SpeechLogInfo]:
+    """列出所有 SpeechLog"""
+    return data_facade.list_speechlogs()
+
+@app.get("/speechlogs/{speechlog_id}", response_model=SpeechLogInfo)
+async def get_speechlog_info(speechlog_id: str) -> SpeechLogInfo:
+    """取得單一 SpeechLog 資訊"""
+    return data_facade.get_speechlog_info(speechlog_id)
+
+@app.patch("/speechlogs/{speechlog_id}", response_model=ApiResponse)
+async def update_speechlog(speechlog_id: str, request: SpeechLogUpdateRequest) -> ApiResponse:
+    """部分更新 SpeechLog"""
+    update_data = request.model_dump(exclude_unset=True)
+    result = data_facade.update_speechlog(speechlog_id, update_data)
+    return ApiResponse(**result)
+
+@app.delete("/speechlogs/{speechlog_id}", response_model=ApiResponse)
+async def delete_speechlog(speechlog_id: str) -> ApiResponse:
+    """刪除 SpeechLog"""
+    result = data_facade.delete_speechlog(speechlog_id)
+    return ApiResponse(**result)
 
 @app.post("/transcribe")
 async def transcribe(file: UploadFile = File(...)):
@@ -109,23 +237,31 @@ async def transcribe(file: UploadFile = File(...)):
     }
     
 
-@app.post("/speaker/rename", response_model=ApiResponse)
-async def rename_speaker(request: SpeakerRenameRequest):
+@app.patch("/speaker/{speaker_id}", response_model=ApiResponse)
+async def update_speaker(speaker_id: str, request: SpeakerUpdateRequest) -> ApiResponse:
     """
-    更改語者名稱的API端點
-    
+    更新語者資料的 API 端點
+
     Args:
-        request: 包含speaker_id、current_name和new_name的請求
-        
+        speaker_id: 語者唯一識別碼
+        request: 欲更新欄位的請求（可以只傳入部分欄位）
+
     Returns:
         ApiResponse: 包含操作結果的回應
     """
-    result = speaker_handler.rename_speaker(
-        speaker_id=request.speaker_id,
-        current_name=request.current_name,
-        new_name=request.new_name
-    )
-    return ApiResponse(**result)
+    forbidden_fields = {"voiceprint_ids", "first_audio"}
+    update_data = request.model_dump(exclude_unset=True)
+    update_fields = {k: v for k, v in update_data.items() if k not in forbidden_fields and v is not None}
+    if not update_fields:
+        return ApiResponse(success=False, message="未提供可更新的欄位", data=None)
+    try:
+        result = data_facade.update_speaker(
+            speaker_id=speaker_id,
+            update_fields=update_fields
+        )
+        return ApiResponse(**result)
+    except Exception as e:
+        return ApiResponse(success=False, message=f"更新失敗: {str(e)}", data=None)
 
 @app.post("/speaker/transfer", response_model=ApiResponse)
 async def transfer_voiceprints(request: SpeakerTransferRequest):
@@ -138,7 +274,7 @@ async def transfer_voiceprints(request: SpeakerTransferRequest):
     Returns:
         ApiResponse: 包含操作結果的回應
     """
-    result = speaker_handler.transfer_voiceprints(
+    result = data_facade.transfer_voiceprints(
         source_speaker_id=request.source_speaker_id,
         source_speaker_name=request.source_speaker_name,
         target_speaker_id=request.target_speaker_id,
@@ -152,21 +288,21 @@ async def get_speaker_info(speaker_id: str):
     獲取語者資訊的輔助API（用於前端驗證）
     回傳 V2 資料庫完整結構
     """
-    return speaker_handler.get_speaker_info(speaker_id)
+    return data_facade.get_speaker_info(speaker_id)
 
 @app.get("/speakers", response_model=List[SpeakerInfo])
 async def list_speakers():
     """
     列出所有語者與完整資訊
     """
-    return speaker_handler.list_all_speakers()
+    return data_facade.list_all_speakers()
 
 @app.delete("/speaker/{speaker_id}", response_model=ApiResponse)
 async def delete_speaker(speaker_id: str):
     """
     刪除語者及其底下的所有 voiceprints
     """
-    result = speaker_handler.delete_speaker(speaker_id)
+    result = data_facade.delete_speaker(speaker_id)
     return ApiResponse(**result)
 
 @app.post("/speaker/verify", response_model=VoiceVerificationResponse)
@@ -213,7 +349,7 @@ async def verify_speaker_voice(
     
     try:
         # 4. 執行語音驗證
-        result = speaker_handler.verify_speaker_voice(
+        result = data_facade.verify_speaker_voice(
             audio_file_path=tmp_path,
             threshold=threshold,
             max_results=max_results

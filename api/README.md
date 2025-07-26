@@ -2,20 +2,19 @@
 
 FastAPI 應用程式層，提供完整的 HTTP REST API 和 WebSocket 介面。
 
-**版本**: v0.4.0  
-**作者**: CYouuu  
+**版本**: v0.4.1  
 **最後更新者**: CYouuu  
-**最後更新**: 2025-07-21
+**最後更新**: 2025-07-27
 
 ## 📁 模組結構
 
 ```
 api/
 ├── api.py              # FastAPI 應用程式主體
-├── handlers/           # 業務邏輯處理器  
-│   └── speaker_handler.py
-└── README.md           # 本文檔
+├── README.md           # 本文檔
 ```
+services/
+├── data_facade.py      # 資料存取門面（統一對外資料操作介面）
 
 ## 🚀 主要功能
 
@@ -41,13 +40,6 @@ python main.py
 ### 直接啟動 uvicorn
 ```bash
 uvicorn api.api:app --host 0.0.0.0 --port 8000 --reload
-```
-
-### 開發模式
-```bash
-# 設定除錯模式
-export API_DEBUG=true
-python main.py
 ```
 
 ## 📡 API 端點總覽
@@ -125,31 +117,31 @@ API_DEFAULT_MAX_RESULTS = 3              # 預設最大結果數
 API_MAX_WORKERS = 2                      # API 最大工作執行緒
 ```
 
-## 🔧 業務邏輯處理器
+## 🔧 資料存取門面（Data Facade）
 
-### SpeakerHandler
-位於 `handlers/speaker_handler.py`，負責：
+### DataFacade
+位於 `services/data_facade.py`，負責：
 
 - **語者資料管理**: CRUD 操作，支援雙 ID 查詢
-- **聲紋處理**: 語音驗證、改名、轉移業務邏輯
+- **聲紋處理**: 語音驗證、改名、轉移等資料層邏輯
 - **錯誤處理**: 統一的異常處理與 HTTP 錯誤回應
 - **資料轉換**: 資料庫物件轉換為 API 回應格式
 
 ### 使用範例
 ```python
-from api.handlers.speaker_handler import SpeakerHandler
+from services.data_facade import DataFacade
 
-handler = SpeakerHandler()
+data_facade = DataFacade()
 
 # 查詢語者 (支援 UUID 或序號ID)
-speaker = handler.get_speaker_info("1")  # 序號ID
-speaker = handler.get_speaker_info("uuid-string")  # UUID
+speaker = data_facade.get_speaker_info("1")  # 序號ID
+speaker = data_facade.get_speaker_info("uuid-string")  # UUID
 
 # 列出所有語者
-speakers = handler.list_all_speakers()
+speakers = data_facade.list_all_speakers()
 
 # 語音驗證
-result = handler.verify_speaker_voice(
+result = data_facade.verify_speaker_voice(
     audio_file_path="/path/to/audio.wav",
     threshold=0.4,
     max_results=3
@@ -160,7 +152,7 @@ result = handler.verify_speaker_voice(
 
 ### 添加新的 API 端點
 1. 在 `api.py` 中定義路由和 Pydantic 模型
-2. 在 `handlers/` 中實作業務邏輯
+2. 在 `services/data_facade.py` 中實作資料存取邏輯
 3. 更新 API 文檔
 
 ### 錯誤處理原則
@@ -179,4 +171,4 @@ python examples/test_voice_verification.py
 
 - [API_DOCUMENTATION.md](../API_DOCUMENTATION.md) - 完整 API 文檔
 - [CONFIG_README.md](../CONFIG_README.md) - 配置說明
-- 各 handlers 模組內部文檔
+- `services/data_facade.py` 內部文檔
