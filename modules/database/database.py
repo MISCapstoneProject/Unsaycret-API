@@ -3,9 +3,9 @@
 語者與聲紋資料庫接口 (Speaker and Voiceprint Database Interface) V2
 ===============================================================================
 
-版本：v2.0.0
+版本：v2.0.1
 作者：CYouuu  
-最後更新：2025-07-21
+最後更新：2025-07-28
 
 ⚠️ 重要變更 ⚠️
 本版本已升級為V2資料庫結構，與V1版本不相容！
@@ -191,6 +191,9 @@ class DatabaseService:
     # Weaviate 集合（類）名稱
     SPEAKER_CLASS = "Speaker"
     VOICEPRINT_CLASS = "VoicePrint"
+    # Session 和 SpeechLog 集合名稱
+    SESSION_CLASS = "Session"
+    SPEECHLOG_CLASS = "SpeechLog"
     
     def __new__(cls) -> 'DatabaseService':
         """實現單例模式，確保全局只有一個資料庫連接實例。"""
@@ -212,8 +215,10 @@ class DatabaseService:
             
             # 檢查必要的集合是否存在（V2版本）
             if not self.client.collections.exists(self.SPEAKER_CLASS) or \
-               not self.client.collections.exists(self.VOICEPRINT_CLASS):
-                logger.warning(f"Weaviate 中缺少必要的V2集合 ({self.SPEAKER_CLASS} / {self.VOICEPRINT_CLASS})!")
+               not self.client.collections.exists(self.VOICEPRINT_CLASS) or \
+               not self.client.collections.exists(self.SESSION_CLASS) or \
+               not self.client.collections.exists(self.SPEECHLOG_CLASS):
+                logger.warning(f"Weaviate 中缺少必要的V2集合 ({self.SPEAKER_CLASS} / {self.VOICEPRINT_CLASS} / {self.SESSION_CLASS} / {self.SPEECHLOG_CLASS})!")
                 logger.warning("請先運行 modules/database/init_v2_collections.py 建立所需的V2集合")
                 # 嘗試自動初始化V2集合
                 try:
@@ -235,6 +240,32 @@ class DatabaseService:
         
         DatabaseService._initialized = True
     
+    def _ensure_connection(self) -> None:
+        """確保資料庫連接正常，如果斷線則重新連接"""
+        try:
+            # 簡單檢查連接是否正常
+            if not hasattr(self, 'client') or not self.client:
+                raise Exception("連接不存在")
+            
+            # 測試連接是否可用
+            self.client.collections.exists("test")
+            
+        except Exception:
+            logger.warning("檢測到資料庫連接異常，嘗試重新連接...")
+            try:
+                if hasattr(self, 'client') and self.client:
+                    self.client.close()
+                
+                self.client = weaviate.connect_to_local(
+                    host=WEAVIATE_HOST,
+                    port=WEAVIATE_PORT,
+                )
+                logger.info("資料庫連接已重新建立")
+                
+            except Exception as e:
+                logger.error(f"重新連接資料庫失敗: {e}")
+                raise
+
     def close(self) -> None:
         """關閉資料庫連接。"""
         if hasattr(self, 'client'):
@@ -310,6 +341,9 @@ class DatabaseService:
             if not valid_uuid(speaker_uuid):
                 logger.error(f"無效的語者 UUID 格式: {speaker_uuid}")
                 return None
+            
+            # 確保連接正常
+            self._ensure_connection()
                 
             return (
                 self.client.collections.get(self.SPEAKER_CLASS)
@@ -1422,6 +1456,756 @@ class DatabaseService:
         except Exception as e:
             logger.error(f"檢查集合 {collection_name} 是否存在時發生錯誤: {e}")
             return False
+
+    # -------------------------------------------------------------------------
+    # Session 相關操作
+    # -------------------------------------------------------------------------
+    
+    def _get_next_session_id(self) -> str:
+        """
+        獲取下一個可用的 session_id（自增字串格式，如 "1", "2", "3"...）
+        
+        Returns:
+            str: 下一個session_id
+        """
+        try:
+            # 獲取所有Session的session_id
+            results = (
+                self.client.collections.get(self.SESSION_CLASS)
+                .query.fetch_objects(
+                    return_properties=["session_id"],
+                    limit=1000  # 假設不會超過1000個Session
+                )
+            )
+            
+            # 提取所有現有的session_id，轉換為數字
+            existing_ids = []
+            for obj in results.objects:
+                session_id = obj.properties.get("session_id")
+                if session_id and session_id.isdigit():
+                    existing_ids.append(int(session_id))
+            
+            # 找出下一個可用的ID
+            next_id = max(existing_ids) + 1 if existing_ids else 1
+            return str(next_id)
+            
+        except Exception as e:
+            logger.error(f"獲取下一個session_id時發生錯誤: {e}")
+            return "1"
+    
+    def create_session(self, request: Any) -> dict:
+        """
+        建立新 Session
+        Args:
+            request: SessionCreateRequest
+        Returns:
+            dict: 操作結果
+        """
+        try:
+            from datetime import datetime, timezone
+            
+            # 生成 UUID 和 session_id
+            session_uuid = str(uuid.uuid4())
+            session_id = self._get_next_session_id()
+            
+            # 預設時間為當下
+            current_time = format_rfc3339()
+            
+            # 準備屬性
+            properties = {
+                "session_id": session_id,
+                "session_type": getattr(request, 'session_type', None) or "",
+                "title": getattr(request, 'title', None) or "",
+                "start_time": getattr(request, 'start_time', None) or current_time,
+                "end_time": getattr(request, 'end_time', None),
+                "summary": getattr(request, 'summary', None) or ""
+            }
+            
+            # 準備參與者引用
+            references = {}
+            participants = getattr(request, 'participants', None) or []
+            if participants:
+                # 驗證所有參與者 UUID 存在
+                valid_participants = []
+                for participant_uuid in participants:
+                    if valid_uuid(participant_uuid) and self.get_speaker(participant_uuid):
+                        valid_participants.append(participant_uuid)
+                    else:
+                        logger.warning(f"參與者 UUID {participant_uuid} 無效或不存在，已跳過")
+                
+                if valid_participants:
+                    references["participants"] = valid_participants
+            
+            # 建立 Session
+            session_collection = self.client.collections.get(self.SESSION_CLASS)
+            session_collection.data.insert(
+                properties=properties,
+                uuid=session_uuid,
+                references=references
+            )
+            
+            logger.info(f"已建立新 Session (UUID: {session_uuid}, ID: {session_id})")
+            return {
+                "success": True,
+                "message": f"成功建立 Session {session_id}",
+                "data": {
+                    "uuid": session_uuid,
+                    "session_id": session_id
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"建立 Session 時發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+    
+    def list_sessions(self) -> list:
+        """
+        列出所有 Session
+        Returns:
+            list: SessionInfo 列表
+        """
+        try:
+            results = (
+                self.client.collections.get(self.SESSION_CLASS)
+                .query.fetch_objects(
+                    return_references=QueryReference(link_on="participants", return_properties=["uuid"])
+                )
+            )
+            
+            sessions = []
+            for obj in results.objects:
+                # 處理參與者引用
+                participants = []
+                if obj.references and obj.references.get("participants"):
+                    participants = [str(ref_obj.uuid) for ref_obj in obj.references["participants"].objects]
+                
+                # 處理時間欄位
+                start_time = obj.properties.get("start_time")
+                end_time = obj.properties.get("end_time")
+                
+                if hasattr(start_time, 'isoformat'):
+                    start_time = start_time.isoformat()
+                if hasattr(end_time, 'isoformat'):
+                    end_time = end_time.isoformat()
+                
+                sessions.append({
+                    "uuid": str(obj.uuid),
+                    "session_id": obj.properties.get("session_id", ""),
+                    "session_type": obj.properties.get("session_type"),
+                    "title": obj.properties.get("title"),
+                    "start_time": start_time,
+                    "end_time": end_time,
+                    "summary": obj.properties.get("summary"),
+                    "participants": participants
+                })
+            
+            # 按 session_id 排序
+            sessions.sort(key=lambda s: int(s["session_id"]) if s["session_id"].isdigit() else 0, reverse=True)
+            return sessions
+            
+        except Exception as e:
+            logger.error(f"列出 Session 時發生錯誤: {e}")
+            return []
+    
+    def get_session_info(self, session_id: str) -> dict:
+        """
+        取得單一 Session 資訊
+        Args:
+            session_id: Session UUID 或 session_id
+        Returns:
+            dict: SessionInfo
+        """
+        try:
+            obj = None
+            
+            # 嘗試判斷是 UUID 還是 session_id
+            if valid_uuid(session_id):
+                # UUID 查詢
+                obj = (
+                    self.client.collections.get(self.SESSION_CLASS)
+                    .query.fetch_object_by_id(
+                        uuid=session_id,
+                        return_references=QueryReference(link_on="participants", return_properties=["uuid"])
+                    )
+                )
+            else:
+                # session_id 查詢
+                results = (
+                    self.client.collections.get(self.SESSION_CLASS)
+                    .query.fetch_objects(
+                        where=Filter.by_property("session_id").equal(session_id),
+                        limit=1,
+                        return_references=QueryReference(link_on="participants", return_properties=["uuid"])
+                    )
+                )
+                obj = results.objects[0] if results.objects else None
+            
+            if not obj:
+                return {}
+            
+            # 處理參與者引用
+            participants = []
+            if obj.references and obj.references.get("participants"):
+                participants = [str(ref_obj.uuid) for ref_obj in obj.references["participants"].objects]
+            
+            # 處理時間欄位
+            start_time = obj.properties.get("start_time")
+            end_time = obj.properties.get("end_time")
+            
+            if hasattr(start_time, 'isoformat'):
+                start_time = start_time.isoformat()
+            if hasattr(end_time, 'isoformat'):
+                end_time = end_time.isoformat()
+            
+            return {
+                "uuid": str(obj.uuid),
+                "session_id": obj.properties.get("session_id", ""),
+                "session_type": obj.properties.get("session_type"),
+                "title": obj.properties.get("title"),
+                "start_time": start_time,
+                "end_time": end_time,
+                "summary": obj.properties.get("summary"),
+                "participants": participants
+            }
+            
+        except Exception as e:
+            logger.error(f"取得 Session 資訊時發生錯誤: {e}")
+            return {}
+    
+    def update_session(self, session_id: str, update_fields: dict) -> dict:
+        """
+        更新 Session
+        Args:
+            session_id: Session UUID 或 session_id
+            update_fields: 欲更新的欄位
+        Returns:
+            dict: 操作結果
+        """
+        try:
+            if not update_fields:
+                return {"success": True, "message": "沒有欄位需要更新", "data": None}
+            
+            # 找到 Session 物件
+            obj = None
+            target_uuid = None
+            
+            if valid_uuid(session_id):
+                target_uuid = session_id
+                obj = self.client.collections.get(self.SESSION_CLASS).query.fetch_object_by_id(uuid=session_id)
+            else:
+                results = (
+                    self.client.collections.get(self.SESSION_CLASS)
+                    .query.fetch_objects(
+                        where=Filter.by_property("session_id").equal(session_id),
+                        limit=1
+                    )
+                )
+                if results.objects:
+                    obj = results.objects[0]
+                    target_uuid = str(obj.uuid)
+            
+            if not obj:
+                return {"success": False, "message": f"找不到 Session {session_id}", "data": None}
+            
+            # 分離屬性和引用
+            properties_to_update = {}
+            references_to_update = {}
+            
+            for key, value in update_fields.items():
+                if key == "participants":
+                    # 處理參與者引用
+                    if value:
+                        valid_participants = []
+                        for participant_uuid in value:
+                            if valid_uuid(participant_uuid) and self.get_speaker(participant_uuid):
+                                valid_participants.append(participant_uuid)
+                        references_to_update["participants"] = valid_participants
+                    else:
+                        references_to_update["participants"] = []
+                else:
+                    properties_to_update[key] = value
+            
+            # 更新屬性
+            if properties_to_update:
+                self.client.collections.get(self.SESSION_CLASS).data.update(
+                    uuid=target_uuid,
+                    properties=properties_to_update
+                )
+            
+            # 更新引用
+            if references_to_update:
+                session_collection = self.client.collections.get(self.SESSION_CLASS)
+                for ref_name, ref_values in references_to_update.items():
+                    session_collection.data.reference_replace(
+                        from_uuid=target_uuid,
+                        from_property=ref_name,
+                        to=ref_values
+                    )
+            
+            logger.info(f"已更新 Session {session_id}")
+            return {
+                "success": True,
+                "message": f"成功更新 Session {session_id}",
+                "data": {"uuid": session_id, "updated_fields": list(update_fields.keys())}
+            }
+            
+        except Exception as e:
+            logger.error(f"更新 Session 時發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+    
+    def delete_session(self, session_id: str) -> dict:
+        """
+        刪除 Session 及其關聯的所有 SpeechLogs
+        Args:
+            session_id: Session UUID 或 session_id
+        Returns:
+            dict: 操作結果
+        """
+        try:
+            # 找到 Session 物件
+            obj = None
+            target_uuid = None
+            
+            if valid_uuid(session_id):
+                target_uuid = session_id
+                obj = self.client.collections.get(self.SESSION_CLASS).query.fetch_object_by_id(uuid=session_id)
+            else:
+                results = (
+                    self.client.collections.get(self.SESSION_CLASS)
+                    .query.fetch_objects(
+                        where=Filter.by_property("session_id").equal(session_id),
+                        limit=1
+                    )
+                )
+                if results.objects:
+                    obj = results.objects[0]
+                    target_uuid = str(obj.uuid)
+            
+            if not obj:
+                return {"success": False, "message": f"找不到 Session {session_id}", "data": None}
+            
+            session_name = obj.properties.get("title", f"Session {obj.properties.get('session_id', '')}")
+            
+            # 先刪除所有關聯的 SpeechLogs
+            speechlogs_deleted = 0
+            try:
+                # 查找所有引用此 Session 的 SpeechLogs
+                speechlog_results = (
+                    self.client.collections.get(self.SPEECHLOG_CLASS)
+                    .query.fetch_objects(
+                        return_references=QueryReference(link_on="session", return_properties=["uuid"])
+                    )
+                )
+                
+                for speechlog_obj in speechlog_results.objects:
+                    # 檢查是否引用了要刪除的 Session
+                    if (speechlog_obj.references and 
+                        speechlog_obj.references.get("session") and 
+                        speechlog_obj.references["session"].objects):
+                        
+                        for ref_session in speechlog_obj.references["session"].objects:
+                            if str(ref_session.uuid) == target_uuid:
+                                # 刪除這個 SpeechLog
+                                self.client.collections.get(self.SPEECHLOG_CLASS).data.delete_by_id(
+                                    uuid=str(speechlog_obj.uuid)
+                                )
+                                speechlogs_deleted += 1
+                                break
+                
+                if speechlogs_deleted > 0:
+                    logger.info(f"已級聯刪除 {speechlogs_deleted} 個關聯的 SpeechLogs")
+                    
+            except Exception as speechlog_error:
+                logger.warning(f"刪除關聯 SpeechLogs 時發生錯誤: {speechlog_error}")
+                # 繼續刪除 Session，即使 SpeechLog 刪除失敗
+            
+            # 刪除 Session
+            self.client.collections.get(self.SESSION_CLASS).data.delete_by_id(uuid=target_uuid)
+            
+            logger.info(f"已刪除 Session {session_id} ({session_name}) 及其 {speechlogs_deleted} 個關聯 SpeechLogs")
+            return {
+                "success": True,
+                "message": f"成功刪除 Session {session_name} 及其 {speechlogs_deleted} 個關聯記錄",
+                "data": {
+                    "uuid": session_id, 
+                    "session_name": session_name,
+                    "deleted_speechlogs": speechlogs_deleted
+                }
+            }
+            
+        except Exception as e:
+            logger.error(f"刪除 Session 時發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+
+    # -------------------------------------------------------------------------
+    # SpeechLog 相關操作
+    # -------------------------------------------------------------------------
+    
+    def create_speechlog(self, request: Any) -> dict:
+        """
+        建立新 SpeechLog
+        Args:
+            request: SpeechLogCreateRequest
+        Returns:
+            dict: 操作結果
+        """
+        try:
+            # 生成 UUID
+            speechlog_uuid = str(uuid.uuid4())
+            
+            # 預設時間為當下
+            current_time = format_rfc3339()
+            
+            # 準備屬性
+            properties = {
+                "content": getattr(request, 'content', None) or "",
+                "timestamp": getattr(request, 'timestamp', None) or current_time,
+                "confidence": getattr(request, 'confidence', None),
+                "duration": getattr(request, 'duration', None),
+                "language": getattr(request, 'language', None) or ""
+            }
+            
+            # 準備引用
+            references = {}
+            
+            # 處理語者引用
+            speaker_uuid = getattr(request, 'speaker', None)
+            if speaker_uuid and valid_uuid(speaker_uuid) and self.get_speaker(speaker_uuid):
+                references["speaker"] = [speaker_uuid]
+            elif speaker_uuid:
+                logger.warning(f"語者 UUID {speaker_uuid} 無效或不存在，已跳過")
+            
+            # 處理 Session 引用
+            session_uuid = getattr(request, 'session', None)
+            if session_uuid and valid_uuid(session_uuid):
+                # 驗證 Session 存在
+                session_obj = self.client.collections.get(self.SESSION_CLASS).query.fetch_object_by_id(uuid=session_uuid)
+                if session_obj:
+                    references["session"] = [session_uuid]
+                else:
+                    logger.warning(f"Session UUID {session_uuid} 不存在，已跳過")
+            elif session_uuid:
+                logger.warning(f"Session UUID {session_uuid} 無效，已跳過")
+            
+            # 建立 SpeechLog
+            speechlog_collection = self.client.collections.get(self.SPEECHLOG_CLASS)
+            speechlog_collection.data.insert(
+                properties=properties,
+                uuid=speechlog_uuid,
+                references=references
+            )
+            
+            logger.info(f"已建立新 SpeechLog (UUID: {speechlog_uuid})")
+            return {
+                "success": True,
+                "message": "成功建立 SpeechLog",
+                "data": {"uuid": speechlog_uuid}
+            }
+            
+        except Exception as e:
+            logger.error(f"建立 SpeechLog 時發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+    
+    def list_speechlogs(self) -> list:
+        """
+        列出所有 SpeechLog
+        Returns:
+            list: SpeechLogInfo 列表
+        """
+        try:
+            results = (
+                self.client.collections.get(self.SPEECHLOG_CLASS)
+                .query.fetch_objects(
+                    return_references=[
+                        QueryReference(link_on="speaker", return_properties=["uuid"]),
+                        QueryReference(link_on="session", return_properties=["uuid"])
+                    ]
+                )
+            )
+            
+            speechlogs = []
+            for obj in results.objects:
+                # 處理引用
+                speaker_uuid = None
+                session_uuid = None
+                
+                if obj.references:
+                    if obj.references.get("speaker") and obj.references["speaker"].objects:
+                        speaker_uuid = str(obj.references["speaker"].objects[0].uuid)
+                    if obj.references.get("session") and obj.references["session"].objects:
+                        session_uuid = str(obj.references["session"].objects[0].uuid)
+                
+                # 處理時間欄位
+                timestamp = obj.properties.get("timestamp")
+                if hasattr(timestamp, 'isoformat'):
+                    timestamp = timestamp.isoformat()
+                
+                speechlogs.append({
+                    "uuid": str(obj.uuid),
+                    "content": obj.properties.get("content"),
+                    "timestamp": timestamp,
+                    "confidence": obj.properties.get("confidence"),
+                    "duration": obj.properties.get("duration"),
+                    "language": obj.properties.get("language"),
+                    "speaker": speaker_uuid,
+                    "session": session_uuid
+                })
+            
+            # 按時間排序（最新在前）
+            speechlogs.sort(key=lambda s: s["timestamp"] or "", reverse=True)
+            return speechlogs
+            
+        except Exception as e:
+            logger.error(f"列出 SpeechLog 時發生錯誤: {e}")
+            return []
+    
+    def get_speechlog_info(self, speechlog_id: str) -> dict:
+        """
+        取得單一 SpeechLog 資訊
+        Args:
+            speechlog_id: SpeechLog UUID
+        Returns:
+            dict: SpeechLogInfo
+        """
+        try:
+            if not valid_uuid(speechlog_id):
+                return {}
+            
+            obj = (
+                self.client.collections.get(self.SPEECHLOG_CLASS)
+                .query.fetch_object_by_id(
+                    uuid=speechlog_id,
+                    return_references=[
+                        QueryReference(link_on="speaker", return_properties=["uuid"]),
+                        QueryReference(link_on="session", return_properties=["uuid"])
+                    ]
+                )
+            )
+            
+            if not obj:
+                return {}
+            
+            # 處理引用
+            speaker_uuid = None
+            session_uuid = None
+            
+            if obj.references:
+                if obj.references.get("speaker") and obj.references["speaker"].objects:
+                    speaker_uuid = str(obj.references["speaker"].objects[0].uuid)
+                if obj.references.get("session") and obj.references["session"].objects:
+                    session_uuid = str(obj.references["session"].objects[0].uuid)
+            
+            # 處理時間欄位
+            timestamp = obj.properties.get("timestamp")
+            if hasattr(timestamp, 'isoformat'):
+                timestamp = timestamp.isoformat()
+            
+            return {
+                "uuid": str(obj.uuid),
+                "content": obj.properties.get("content"),
+                "timestamp": timestamp,
+                "confidence": obj.properties.get("confidence"),
+                "duration": obj.properties.get("duration"),
+                "language": obj.properties.get("language"),
+                "speaker": speaker_uuid,
+                "session": session_uuid
+            }
+            
+        except Exception as e:
+            logger.error(f"取得 SpeechLog 資訊時發生錯誤: {e}")
+            return {}
+    
+    def update_speechlog(self, speechlog_id: str, update_fields: dict) -> dict:
+        """
+        更新 SpeechLog
+        Args:
+            speechlog_id: SpeechLog UUID
+            update_fields: 欲更新的欄位
+        Returns:
+            dict: 操作結果
+        """
+        try:
+            if not valid_uuid(speechlog_id):
+                return {"success": False, "message": "無效的 SpeechLog UUID", "data": None}
+            
+            if not update_fields:
+                return {"success": True, "message": "沒有欄位需要更新", "data": None}
+            
+            # 檢查 SpeechLog 是否存在
+            obj = self.client.collections.get(self.SPEECHLOG_CLASS).query.fetch_object_by_id(uuid=speechlog_id)
+            if not obj:
+                return {"success": False, "message": f"找不到 SpeechLog {speechlog_id}", "data": None}
+            
+            # 分離屬性和引用
+            properties_to_update = {}
+            references_to_update = {}
+            
+            for key, value in update_fields.items():
+                if key == "speaker":
+                    if value and valid_uuid(value) and self.get_speaker(value):
+                        references_to_update["speaker"] = [value]
+                    elif value:
+                        logger.warning(f"語者 UUID {value} 無效或不存在，已跳過")
+                elif key == "session":
+                    if value and valid_uuid(value):
+                        session_obj = self.client.collections.get(self.SESSION_CLASS).query.fetch_object_by_id(uuid=value)
+                        if session_obj:
+                            references_to_update["session"] = [value]
+                        else:
+                            logger.warning(f"Session UUID {value} 不存在，已跳過")
+                    elif value:
+                        logger.warning(f"Session UUID {value} 無效，已跳過")
+                else:
+                    properties_to_update[key] = value
+            
+            # 更新屬性
+            if properties_to_update:
+                self.client.collections.get(self.SPEECHLOG_CLASS).data.update(
+                    uuid=speechlog_id,
+                    properties=properties_to_update
+                )
+            
+            # 更新引用
+            if references_to_update:
+                speechlog_collection = self.client.collections.get(self.SPEECHLOG_CLASS)
+                for ref_name, ref_values in references_to_update.items():
+                    speechlog_collection.data.reference_replace(
+                        from_uuid=speechlog_id,
+                        from_property=ref_name,
+                        to=ref_values
+                    )
+            
+            logger.info(f"已更新 SpeechLog {speechlog_id}")
+            return {
+                "success": True,
+                "message": f"成功更新 SpeechLog {speechlog_id}",
+                "data": {"uuid": speechlog_id, "updated_fields": list(update_fields.keys())}
+            }
+            
+        except Exception as e:
+            logger.error(f"更新 SpeechLog 時發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+    
+    def delete_speechlog(self, speechlog_id: str) -> dict:
+        """
+        刪除 SpeechLog
+        Args:
+            speechlog_id: SpeechLog UUID
+        Returns:
+            dict: 操作結果
+        """
+        try:
+            if not valid_uuid(speechlog_id):
+                return {"success": False, "message": "無效的 SpeechLog UUID", "data": None}
+            
+            # 檢查 SpeechLog 是否存在
+            obj = self.client.collections.get(self.SPEECHLOG_CLASS).query.fetch_object_by_id(uuid=speechlog_id)
+            if not obj:
+                return {"success": False, "message": f"找不到 SpeechLog {speechlog_id}", "data": None}
+            
+            content_preview = obj.properties.get("content", "")[:50] + ("..." if len(obj.properties.get("content", "")) > 50 else "")
+            
+            # 刪除 SpeechLog
+            self.client.collections.get(self.SPEECHLOG_CLASS).data.delete_by_id(uuid=speechlog_id)
+            
+            logger.info(f"已刪除 SpeechLog {speechlog_id}")
+            return {
+                "success": True,
+                "message": "成功刪除 SpeechLog",
+                "data": {"uuid": speechlog_id, "content_preview": content_preview}
+            }
+            
+        except Exception as e:
+            logger.error(f"刪除 SpeechLog 時發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+
+    # ------------------------- 關聯查詢方法 -------------------------
+    def get_sessions_by_speaker(self, speaker_id: str) -> list:
+        """
+        透過 Speaker 取得相關的 Session 列表
+        
+        Args:
+            speaker_id: 語者 UUID
+            
+        Returns:
+            list: SessionInfo 列表
+        """
+        try:
+            # 查詢 participants 陣列包含該 speaker_id 的 Session
+            sessions = self.client.collections.get(self.SESSION_CLASS).query.fetch_objects(
+                where=weaviate.classes.query.Filter.by_property("participants").contains_any([speaker_id])
+            )
+            
+            result = []
+            for obj in sessions.objects:
+                session_info = {
+                    "uuid": str(obj.uuid),
+                    "session_id": obj.properties.get("session_id"),
+                    "session_type": obj.properties.get("session_type"),
+                    "title": obj.properties.get("title"),
+                    "start_time": obj.properties.get("start_time"),
+                    "end_time": obj.properties.get("end_time"),
+                    "summary": obj.properties.get("summary"),
+                    "participants": obj.properties.get("participants", [])
+                }
+                result.append(session_info)
+            
+            logger.info(f"找到 {len(result)} 個 Session 包含 Speaker {speaker_id}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"查詢 Speaker 的 Session 時發生錯誤: {e}")
+            return []
+
+    def get_speechlogs_by_speaker(self, speaker_id: str) -> list:
+        """
+        透過 Speaker 取得相關的 SpeechLog 列表
+        
+        Args:
+            speaker_id: 語者 UUID
+            
+        Returns:
+            list: SpeechLogInfo 列表
+        """
+        try:
+            # 暫時使用獲取所有 SpeechLog 然後篩選的方法
+            # 因為 by_ref 查詢語法在當前 Weaviate 版本中可能有問題
+            all_speechlogs = self.list_speechlogs()
+            
+            # 篩選出屬於指定 Speaker 的 SpeechLog
+            result = [sl for sl in all_speechlogs if sl.get("speaker") == speaker_id]
+            
+            logger.info(f"找到 {len(result)} 個 SpeechLog 屬於 Speaker {speaker_id}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"查詢 Speaker 的 SpeechLog 時發生錯誤: {e}")
+            return []
+
+    def get_speechlogs_by_session(self, session_id: str) -> list:
+        """
+        透過 Session 取得相關的 SpeechLog 列表
+        
+        Args:
+            session_id: Session UUID
+            
+        Returns:
+            list: SpeechLogInfo 列表
+        """
+        try:
+            # 暫時使用獲取所有 SpeechLog 然後篩選的方法
+            # 因為 by_ref 查詢語法在當前 Weaviate 版本中可能有問題
+            all_speechlogs = self.list_speechlogs()
+            
+            # 篩選出屬於指定 Session 的 SpeechLog
+            result = [sl for sl in all_speechlogs if sl.get("session") == session_id]
+            
+            logger.info(f"找到 {len(result)} 個 SpeechLog 屬於 Session {session_id}")
+            return result
+            
+        except Exception as e:
+            logger.error(f"查詢 Session 的 SpeechLog 時發生錯誤: {e}")
+            return []
 
 # 單元測試代碼
 if __name__ == "__main__":

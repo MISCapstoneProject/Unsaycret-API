@@ -3,7 +3,7 @@
 語者與聲紋管理系統 (Speaker and Voiceprint Management System)
 ===============================================================================
 
-版本：v1.1.0 
+版本：v2.0.1
 作者：CYouuu
 最後更新：2025-05-19
 
@@ -91,6 +91,7 @@ class SpeakerManager:
     """
     封裝所有與資料庫互動的語者管理操作。
     使用 VID_database 模組提供的 DatabaseService 作為統一接口。
+    專注於語者（Speaker）相關的業務邏輯。
     """
 
     def __init__(self):
@@ -242,7 +243,188 @@ class SpeakerManager:
             logger.exception("❌ 執行資料庫檢查與修復時發生錯誤")
             print(f"❌ 執行資料庫檢查與修復時發生錯誤：{exc}")
 
+    # ------------------------- Session CRUD 委託方法 -------------------------
+    # 注意：這些方法僅為向後相容性保留，建議直接使用 SessionManager
+    def create_session(self, request: Any) -> dict:
+        """建立新 Session（委託給 SessionManager）"""
+        session_manager = SessionManager()
+        return session_manager.create_session(request)
+    
+    def list_sessions(self) -> list:
+        """列出所有 Session（委託給 SessionManager）"""
+        session_manager = SessionManager()
+        return session_manager.list_sessions()
+    
+    def get_session_info(self, session_id: str) -> dict:
+        """取得 Session 資訊（委託給 SessionManager）"""
+        session_manager = SessionManager()
+        return session_manager.get_session_info(session_id)
+    
+    def update_session(self, session_id: str, update_fields: dict) -> dict:
+        """更新 Session（委託給 SessionManager）"""
+        session_manager = SessionManager()
+        return session_manager.update_session(session_id, update_fields)
+    
+    def delete_session(self, session_id: str) -> dict:
+        """刪除 Session（委託給 SessionManager）"""
+        session_manager = SessionManager()
+        return session_manager.delete_session(session_id)
 
+    # ------------------------- SpeechLog CRUD 委託方法 -------------------------
+    # 注意：這些方法僅為向後相容性保留，建議直接使用 SpeechLogManager
+    def create_speechlog(self, request: Any) -> dict:
+        """建立新 SpeechLog（委託給 SpeechLogManager）"""
+        speechlog_manager = SpeechLogManager()
+        return speechlog_manager.create_speechlog(request)
+    
+    def list_speechlogs(self) -> list:
+        """列出所有 SpeechLog（委託給 SpeechLogManager）"""
+        speechlog_manager = SpeechLogManager()
+        return speechlog_manager.list_speechlogs()
+    
+    def get_speechlog_info(self, speechlog_id: str) -> dict:
+        """取得 SpeechLog 資訊（委託給 SpeechLogManager）"""
+        speechlog_manager = SpeechLogManager()
+        return speechlog_manager.get_speechlog_info(speechlog_id)
+    
+    def update_speechlog(self, speechlog_id: str, update_fields: dict) -> dict:
+        """更新 SpeechLog（委託給 SpeechLogManager）"""
+        speechlog_manager = SpeechLogManager()
+        return speechlog_manager.update_speechlog(speechlog_id, update_fields)
+    
+    def delete_speechlog(self, speechlog_id: str) -> dict:
+        """刪除 SpeechLog（委託給 SpeechLogManager）"""
+        speechlog_manager = SpeechLogManager()
+        return speechlog_manager.delete_speechlog(speechlog_id)
+
+
+# ---------------------------------------------------------------------------
+# Session/SpeechLog Manager Classes
+# ---------------------------------------------------------------------------
+
+class SessionManager:
+    """Session 資料管理類別"""
+    
+    def __init__(self):
+        from modules.database.database import DatabaseService
+        self._db = DatabaseService()
+    
+    def create_session(self, request: Any) -> dict:
+        """建立新 Session"""
+        try:
+            result = self._db.create_session(request)
+            return result
+        except Exception as e:
+            logger.error(f"建立 Session 時發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+    
+    def list_sessions(self) -> list:
+        """列出所有 Session"""
+        try:
+            return self._db.list_sessions()
+        except Exception as e:
+            logger.error(f"列出 Session 時發生錯誤: {e}")
+            return []
+    
+    def get_session_info(self, session_id: str) -> dict:
+        """取得 Session 資訊"""
+        try:
+            return self._db.get_session_info(session_id)
+        except Exception as e:
+            logger.error(f"取得 Session 資訊時發生錯誤: {e}")
+            return {}
+    
+    def update_session(self, session_id: str, update_fields: dict) -> dict:
+        """更新 Session"""
+        try:
+            result = self._db.update_session(session_id, update_fields)
+            return result
+        except Exception as e:
+            logger.error(f"更新 Session 時發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+    
+    def delete_session(self, session_id: str) -> dict:
+        """刪除 Session"""
+        try:
+            result = self._db.delete_session(session_id)
+            return result
+        except Exception as e:
+            logger.error(f"刪除 Session 時發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+
+    def get_sessions_by_speaker(self, speaker_id: str) -> list:
+        """透過 Speaker 取得相關的 Session 列表"""
+        try:
+            return self._db.get_sessions_by_speaker(speaker_id)
+        except Exception as e:
+            logger.error(f"查詢 Speaker 的 Session 時發生錯誤: {e}")
+            return []
+
+class SpeechLogManager:
+    """SpeechLog 資料管理類別"""
+    
+    def __init__(self):
+        from modules.database.database import DatabaseService
+        self._db = DatabaseService()
+    
+    def create_speechlog(self, request: Any) -> dict:
+        """建立新 SpeechLog"""
+        try:
+            result = self._db.create_speechlog(request)
+            return result
+        except Exception as e:
+            logger.error(f"建立 SpeechLog 時發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+    
+    def list_speechlogs(self) -> list:
+        """列出所有 SpeechLog"""
+        try:
+            return self._db.list_speechlogs()
+        except Exception as e:
+            logger.error(f"列出 SpeechLog 時發生錯誤: {e}")
+            return []
+    
+    def get_speechlog_info(self, speechlog_id: str) -> dict:
+        """取得 SpeechLog 資訊"""
+        try:
+            return self._db.get_speechlog_info(speechlog_id)
+        except Exception as e:
+            logger.error(f"取得 SpeechLog 資訊時發生錯誤: {e}")
+            return {}
+    
+    def update_speechlog(self, speechlog_id: str, update_fields: dict) -> dict:
+        """更新 SpeechLog"""
+        try:
+            result = self._db.update_speechlog(speechlog_id, update_fields)
+            return result
+        except Exception as e:
+            logger.error(f"更新 SpeechLog 時發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+    
+    def delete_speechlog(self, speechlog_id: str) -> dict:
+        """刪除 SpeechLog"""
+        try:
+            result = self._db.delete_speechlog(speechlog_id)
+            return result
+        except Exception as e:
+            logger.error(f"刪除 SpeechLog 時發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+
+    def get_speechlogs_by_speaker(self, speaker_id: str) -> list:
+        """透過 Speaker 取得相關的 SpeechLog 列表"""
+        try:
+            return self._db.get_speechlogs_by_speaker(speaker_id)
+        except Exception as e:
+            logger.error(f"查詢 Speaker 的 SpeechLog 時發生錯誤: {e}")
+            return []
+
+    def get_speechlogs_by_session(self, session_id: str) -> list:
+        """透過 Session 取得相關的 SpeechLog 列表"""
+        try:
+            return self._db.get_speechlogs_by_session(session_id)
+        except Exception as e:
+            logger.error(f"查詢 Session 的 SpeechLog 時發生錯誤: {e}")
+            return []
 # ---------------------------------------------------------------------------
 # CLI (Command‑line Interface)
 # ---------------------------------------------------------------------------

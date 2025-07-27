@@ -8,7 +8,7 @@ DataService － 資料存取統一入口（Facade）
 """
 from typing import Dict, Any, Optional, List
 from fastapi import HTTPException
-from modules.management.VID_manager import SpeakerManager
+from modules.management.VID_manager import SpeakerManager, SessionManager, SpeechLogManager
 from modules.identification.VID_identify_v5 import AudioProcessor
 from modules.database.database import DatabaseService
 from utils.logger import get_logger
@@ -19,8 +19,12 @@ class DataFacade:
     """資料庫管理的邏輯處理器"""
     
     def __init__(self) -> None:
-        """初始化語者處理器"""
+        """初始化各種處理器"""
+        # 各個獨立的管理器
         self.speaker_manager = SpeakerManager()
+        self.session_manager = SessionManager()  
+        self.speechlog_manager = SpeechLogManager()
+        
         # 初始化語音處理器和資料庫服務（用於純讀取的語音驗證）
         self.audio_processor = AudioProcessor()
         self.database = DatabaseService()
@@ -544,3 +548,186 @@ class DataFacade:
         except Exception as e:
             logger.error(f"語者更新發生未預期錯誤：{str(e)}")
             raise HTTPException(status_code=500, detail=f"伺服器內部錯誤：{str(e)}")
+
+    # ------------------------- Session CRUD -------------------------
+    def create_session(self, request: Any) -> dict:
+        """
+        新增 Session 紀錄
+        Args:
+            request: SessionCreateRequest
+        Returns:
+            dict: 操作結果
+        """
+        try:
+            return self.session_manager.create_session(request)
+        except Exception as e:
+            logger.error(f"建立 Session 發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+
+    def list_sessions(self) -> list:
+        """
+        列出所有 Session
+        Returns:
+            list: SessionInfo 列表
+        """
+        try:
+            return self.session_manager.list_sessions()
+        except Exception as e:
+            logger.error(f"列出 Session 發生錯誤: {e}")
+            return []
+
+    def get_session_info(self, session_id: str) -> dict:
+        """
+        取得單一 Session 資訊
+        Args:
+            session_id: Session UUID
+        Returns:
+            dict: SessionInfo
+        """
+        try:
+            return self.session_manager.get_session_info(session_id)
+        except Exception as e:
+            logger.error(f"查詢 Session 發生錯誤: {e}")
+            return {}
+
+    def update_session(self, session_id: str, update_fields: dict) -> dict:
+        """
+        部分更新 Session
+        Args:
+            session_id: Session UUID
+            update_fields: 欲更新欄位 dict
+        Returns:
+            dict: 操作結果
+        """
+        try:
+            return self.session_manager.update_session(session_id, update_fields)
+        except Exception as e:
+            logger.error(f"更新 Session 發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+
+    def delete_session(self, session_id: str) -> dict:
+        """
+        刪除 Session
+        Args:
+            session_id: Session UUID
+        Returns:
+            dict: 操作結果
+        """
+        try:
+            return self.session_manager.delete_session(session_id)
+        except Exception as e:
+            logger.error(f"刪除 Session 發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+
+    # ------------------------- SpeechLog CRUD -------------------------
+    def create_speechlog(self, request: Any) -> dict:
+        """
+        新增 SpeechLog 紀錄
+        Args:
+            request: SpeechLogCreateRequest
+        Returns:
+            dict: 操作結果
+        """
+        try:
+            return self.speechlog_manager.create_speechlog(request)
+        except Exception as e:
+            logger.error(f"建立 SpeechLog 發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+
+    def list_speechlogs(self) -> list:
+        """
+        列出所有 SpeechLog
+        Returns:
+            list: SpeechLogInfo 列表
+        """
+        try:
+            return self.speechlog_manager.list_speechlogs()
+        except Exception as e:
+            logger.error(f"列出 SpeechLog 發生錯誤: {e}")
+            return []
+
+    def get_speechlog_info(self, speechlog_id: str) -> dict:
+        """
+        取得單一 SpeechLog 資訊
+        Args:
+            speechlog_id: SpeechLog UUID
+        Returns:
+            dict: SpeechLogInfo
+        """
+        try:
+            return self.speechlog_manager.get_speechlog_info(speechlog_id)
+        except Exception as e:
+            logger.error(f"查詢 SpeechLog 發生錯誤: {e}")
+            return {}
+
+    def update_speechlog(self, speechlog_id: str, update_fields: dict) -> dict:
+        """
+        部分更新 SpeechLog
+        Args:
+            speechlog_id: SpeechLog UUID
+            update_fields: 欲更新欄位 dict
+        Returns:
+            dict: 操作結果
+        """
+        try:
+            return self.speechlog_manager.update_speechlog(speechlog_id, update_fields)
+        except Exception as e:
+            logger.error(f"更新 SpeechLog 發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+
+    def delete_speechlog(self, speechlog_id: str) -> dict:
+        """
+        刪除 SpeechLog
+        Args:
+            speechlog_id: SpeechLog UUID
+        Returns:
+            dict: 操作結果
+        """
+        try:
+            return self.speechlog_manager.delete_speechlog(speechlog_id)
+        except Exception as e:
+            logger.error(f"刪除 SpeechLog 發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
+
+    # ------------------------- 關聯查詢方法 -------------------------
+    def get_speaker_sessions(self, speaker_id: str) -> list:
+        """
+        透過 Speaker 取得相關的 Session 列表
+        Args:
+            speaker_id: 語者 UUID
+        Returns:
+            list: SessionInfo 列表
+        """
+        try:
+            return self.session_manager.get_sessions_by_speaker(speaker_id)
+        except Exception as e:
+            logger.error(f"查詢 Speaker 的 Session 發生錯誤: {e}")
+            return []
+
+    def get_speaker_speechlogs(self, speaker_id: str) -> list:
+        """
+        透過 Speaker 取得相關的 SpeechLog 列表
+        Args:
+            speaker_id: 語者 UUID
+        Returns:
+            list: SpeechLogInfo 列表
+        """
+        try:
+            return self.speechlog_manager.get_speechlogs_by_speaker(speaker_id)
+        except Exception as e:
+            logger.error(f"查詢 Speaker 的 SpeechLog 發生錯誤: {e}")
+            return []
+
+    def get_session_speechlogs(self, session_id: str) -> list:
+        """
+        透過 Session 取得相關的 SpeechLog 列表
+        Args:
+            session_id: Session UUID
+        Returns:
+            list: SpeechLogInfo 列表
+        """
+        try:
+            return self.speechlog_manager.get_speechlogs_by_session(session_id)
+        except Exception as e:
+            logger.error(f"查詢 Session 的 SpeechLog 發生錯誤: {e}")
+            return []

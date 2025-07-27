@@ -23,6 +23,9 @@ models
 R3SI
 pipeline_stages.csv
 
+# 測試檔案
+*test_report.json
+
 # 虛擬環境
 venv
 unsaycret_venv

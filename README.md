@@ -1,7 +1,7 @@
 # Unsaycret-API
 
 **版本**: v0.4.1  <br>
-**最後更新**: 2025-07-27
+**最後更新**: 2025-07-28
 
 ## 專案簡介
 Unsaycret-API 是一套模組化的語音處理系統，整合語音分離、說者辨識、語音辨識、API 服務，並支援 Weaviate 向量資料庫串接。
@@ -113,22 +113,40 @@ python main.py
 
 ## 📡 API 端點
 
-### HTTP REST API
-- `POST /transcribe` - 單檔語音轉錄（分離+辨識+ASR）
-- `POST /transcribe_dir` - 批次轉錄（目錄/ZIP檔）
-- `POST /speaker/rename` - 語者改名
-- `POST /speaker/transfer` - 聲紋轉移  
-- `POST /speaker/verify` - 語音驗證（識別語者身份）
-- `GET /speaker/{id}` - 獲取語者資訊（支援 UUID 和序號 ID）
-- `GET /speakers` - 列出所有語者
-- `DELETE /speaker/{id}` - 刪除語者
+### 🚀 核心功能
+- **語音轉錄**: `POST /transcribe` - 單檔語音轉錄（分離+辨識+ASR）
+- **批次轉錄**: `POST /transcribe_dir` - 批次轉錄（目錄/ZIP檔）
+- **即時處理**: `WS /ws/stream` - 即時語音處理串流
 
-### WebSocket
-- `WS /ws/stream` - 即時語音處理串流
+### 📊 資料管理
+- **語者管理**: 完整的CRUD操作（查詢、更新、刪除）
+- **會議管理**: 建立、查詢會議記錄（支援級聯刪除）
+- **語音記錄**: 管理語音片段和轉錄內容
+- **關聯查詢**: 語者-會議-語音記錄關聯查詢
+
+### 🔧 進階功能
+- **語音驗證**: 識別語者身份
+- **聲紋轉移**: 合併語者聲紋資料
+
+### 📖 完整API文檔
+詳細的API端點說明、請求格式、回應範例請參考：
+- **API文檔**: [API_DOCUMENTATION.md](API_DOCUMENTATION.md)
+- **互動式文檔**: http://localhost:8000/docs
+- **ReDoc文檔**: http://localhost:8000/redoc
+
+### 🧪 API測試
+```bash
+# 基礎功能測試
+python examples/test_all_apis.py
+
+# 綜合測試（推薦）
+python examples/test_comprehensive_apis.py
+```
+測試指南請參考：[examples/API_TEST_GUIDE.md](examples/API_TEST_GUIDE.md)
 
 ## 🗄️ Weaviate V2 資料庫結構
 
-本系統資料庫使用 4 個主要集合：
+本系統使用 4 個主要集合，支援完整的資料關聯與級聯操作：
 
 ### Speaker
 語者基本資訊，包含姓名、性別、活動記錄等
@@ -138,9 +156,12 @@ python main.py
 
 ### Session
 會議/對話場次資料，記錄時間、參與者等資訊
+- 🔗 **級聯刪除**: 刪除會議時自動清理所有關聯的語音記錄
 
 ### SpeechLog
 語音片段記錄，包含文字內容、時間戳與語者關聯
+
+> **資料完整性**: 系統實現了完整的級聯刪除機制，確保不會產生孤立記錄
 
 ## ⚙️ 配置系統 (v2.0)
 
@@ -237,8 +258,9 @@ CUDA_DEVICE_INDEX=0
 
 ## 📚 相關文檔
 
+- [API_DOCUMENTATION.md](API_DOCUMENTATION.md) - 完整 API 文檔與使用說明
+- [examples/API_TEST_GUIDE.md](examples/API_TEST_GUIDE.md) - API 測試指南
 - [CONFIG_README.md](CONFIG_README.md) - 配置系統詳細說明
-- [API_DOCUMENTATION.md](API_DOCUMENTATION.md) - 完整 API 文檔
 - 各模組 README - 詳見對應模組目錄
 
 ## 📄 授權條款
