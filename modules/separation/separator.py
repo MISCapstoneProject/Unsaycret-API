@@ -99,6 +99,11 @@ Weaviate 資料庫設定：
 """
 
 import os
+
+# 修復 SVML 錯誤：在導入 PyTorch 之前設定環境變數
+os.environ["MKL_DISABLE_FAST_MM"] = "1"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 import numpy as np
 import torch
 import torchaudio
@@ -115,6 +120,8 @@ import time
 from scipy import signal
 from scipy.ndimage import uniform_filter1d
 from enum import Enum
+from sklearn.cluster import DBSCAN # type: ignore
+import librosa # type: ignore
 
 # 修改模型載入方式
 try:
@@ -173,7 +180,7 @@ RATE = AUDIO_RATE
 TARGET_RATE = AUDIO_TARGET_RATE
 WINDOW_SIZE = AUDIO_WINDOW_SIZE
 OVERLAP = AUDIO_OVERLAP
-DEVICE_INDEX = None
+DEVICE_INDEX = 2
 
 # 處理參數（從配置讀取）
 MIN_ENERGY_THRESHOLD = AUDIO_MIN_ENERGY_THRESHOLD
@@ -287,6 +294,12 @@ class AudioSeparator:
         self.enable_noise_reduction = enable_noise_reduction
         self.snr_threshold = snr_threshold
         
+        # 語者偵測相關參數 - 進一步降低為更靈敏的設定
+        self.vad_threshold = 0.1  # 進一步降低語音活動檢測閾值（原0.08）
+        self.speaker_energy_threshold = 0.1  # 進一步降低說話者能量閾值（原0.15）
+        self.silence_threshold = 0.002  # 進一步降低靜音檢測閾值（原0.002）
+        self.min_speech_duration = 0.8  # 進一步降低最小語音持續時間（原0.3秒）
+
         logger.info(f"使用設備: {self.device}")
         logger.info(f"模型類型: {model_type.value}")
         logger.info(f"載入模型: {self.model_config['model_name']}")
@@ -900,9 +913,246 @@ class AudioSeparator:
                        f"跳過: {stats['segments_skipped']}, "
                        f"錯誤: {stats['errors']}")
 
+    def detect_speaker_count(self, audio_tensor: torch.Tensor) -> int:
+        """
+        偵測音訊中的說話者數量
+        
+        Args:
+            audio_tensor: 輸入音訊張量 [channels, samples] 或 [batch, channels, samples]
+            
+        Returns:
+            int: 偵測到的說話者數量
+        """
+        try:
+            # 確保音訊格式正確
+            if len(audio_tensor.shape) == 3:
+                audio_data = audio_tensor[0, 0, :].cpu().numpy()
+            elif len(audio_tensor.shape) == 2:
+                audio_data = audio_tensor[0, :].cpu().numpy()
+            else:
+                audio_data = audio_tensor.cpu().numpy()
+            
+            # 0. 基本靜音檢測 - 進一步放寬條件
+            audio_rms = np.sqrt(np.mean(audio_data ** 2))
+            audio_max = np.max(np.abs(audio_data))
+            audio_std = np.std(audio_data)
+            
+            logger.info(f"音訊統計 - RMS: {audio_rms:.6f}, Max: {audio_max:.6f}, STD: {audio_std:.6f}, 靜音閾值: {self.silence_threshold:.6f}")
+            
+            # 更寬鬆的靜音檢測：只要有一個指標超過閾值就認為可能有語音
+            is_silent = (audio_rms < self.silence_threshold and 
+                        audio_max < self.silence_threshold * 4 and 
+                        audio_std < self.silence_threshold * 1.5)
+            
+            if is_silent:
+                logger.info(f"判定為靜音 - 所有指標都低於閾值")
+                return 0
+            
+            logger.info(f"通過靜音檢測，進行語音活動偵測...")
+            
+            # 1. 簡化的語音活動檢測 (VAD)
+            frame_length = int(TARGET_RATE * 0.025)  # 25ms 幀
+            hop_length = int(TARGET_RATE * 0.010)   # 10ms 跳躍
+            
+            # 計算短時能量
+            frames = librosa.util.frame(audio_data, frame_length=frame_length, hop_length=hop_length)
+            energy = np.sum(frames ** 2, axis=0)
+            
+            # 正規化能量
+            if np.max(energy) > 0:
+                energy = energy / np.max(energy)
+            
+            # 簡化的VAD：主要基於能量檢測
+            energy_active = energy > self.vad_threshold
+            
+            # 額外的過零率檢測作為輔助（但不是必需的）
+            try:
+                zero_crossings = []
+                for i in range(min(frames.shape[1], 100)):  # 限制處理數量以提高速度
+                    frame = frames[:, i]
+                    zcr = np.sum(np.diff(np.sign(frame)) != 0) / len(frame)
+                    zero_crossings.append(zcr)
+                zero_crossings = np.array(zero_crossings)
+                
+                # 如果有合理的過零率，結合使用；否則只用能量
+                if len(zero_crossings) > 0:
+                    zcr_active = (zero_crossings > 0.005) & (zero_crossings < 0.8)  # 非常寬鬆的範圍
+                    if np.sum(zcr_active) > len(zcr_active) * 0.05:  # 如果至少5%的幀有合理過零率
+                        combined_active = energy_active[:len(zcr_active)] & zcr_active
+                        if np.sum(combined_active) > np.sum(energy_active) * 0.3:  # 如果結合檢測結果不會過度降低
+                            vad_frames = np.zeros_like(energy_active, dtype=bool)
+                            vad_frames[:len(combined_active)] = combined_active
+                        else:
+                            vad_frames = energy_active
+                    else:
+                        vad_frames = energy_active
+                else:
+                    vad_frames = energy_active
+            except Exception as e:
+                logger.debug(f"過零率檢測失敗，使用純能量檢測: {e}")
+                vad_frames = energy_active
+            
+            logger.info(f"VAD結果 - 總幀數: {len(vad_frames)}, 活動幀數: {np.sum(vad_frames)}, 比例: {np.sum(vad_frames)/len(vad_frames):.3f}")
+            
+            # 2. 更寬鬆的語音區段檢查
+            if np.any(vad_frames):
+                total_speech_ratio = np.sum(vad_frames) / len(vad_frames)
+                
+                # 大幅降低語音活動比例要求
+                if total_speech_ratio < 0.02:  # 只要2%的幀有活動就可能是語音
+                    logger.info(f"語音活動比例太低: {total_speech_ratio:.3f}")
+                    return 0
+                
+                # 檢查連續區段（但要求更寬鬆）
+                diff = np.diff(np.concatenate(([False], vad_frames, [False])).astype(int))
+                starts = np.where(diff == 1)[0]
+                ends = np.where(diff == -1)[0]
+                
+                if len(starts) > 0 and len(ends) > 0:
+                    speech_durations = (ends - starts) * hop_length / TARGET_RATE
+                    max_duration = np.max(speech_durations) if len(speech_durations) > 0 else 0
+                    
+                    logger.info(f"語音區段分析 - 區段數: {len(starts)}, 最長持續時間: {max_duration:.2f}秒, 最小要求: {self.min_speech_duration:.2f}秒")
+                    
+                    # 如果有任何區段超過最小要求，或者總活動比例足夠
+                    if max_duration >= self.min_speech_duration or total_speech_ratio > 0.05:
+                        logger.info("通過語音區段檢查")
+                    else:
+                        logger.info(f"語音區段太短且活動比例不足")
+                        return 0
+                else:
+                    # 如果無法計算區段，檢查總體活動
+                    if total_speech_ratio < 0.03:
+                        logger.info(f"無法計算區段且活動比例不足: {total_speech_ratio:.3f}")
+                        return 0
+            else:
+                logger.info("未檢測到任何語音活動")
+                return 0
+            
+            # 3. 如果通過了所有檢查，嘗試進行說話者數量估計
+            try:
+                # 簡化的MFCC分析
+                mfccs = librosa.feature.mfcc(
+                    y=audio_data, 
+                    sr=TARGET_RATE,
+                    n_mfcc=13,
+                    hop_length=hop_length,
+                    n_fft=frame_length*2
+                )
+                
+                # 確保維度匹配
+                min_frames = min(mfccs.shape[1], len(vad_frames))
+                mfccs = mfccs[:, :min_frames]
+                vad_frames = vad_frames[:min_frames]
+                
+                if np.any(vad_frames):
+                    active_mfccs = mfccs[:, vad_frames]
+                    
+                    if active_mfccs.shape[1] < 5:  # 進一步降低要求
+                        logger.info(f"有效語音幀數很少 ({active_mfccs.shape[1]})，直接判定為單一語者")
+                        return 1
+                    
+                    # 簡化的說話者數量估計
+                    features = active_mfccs.T
+                    audio_duration = len(audio_data) / TARGET_RATE
+                    
+                    # 對於短音訊，直接判定為單一語者
+                    if audio_duration < 3.0 or features.shape[0] < 20:
+                        logger.info(f"短音訊 ({audio_duration:.2f}秒) 或特徵少 ({features.shape[0]})，判定為單一語者")
+                        return 1
+                    
+                    # 嘗試聚類分析（但如果失敗就回傳1）
+                    try:
+                        clustering = DBSCAN(
+                            eps=1.2,  # 更大的聚類半徑
+                            min_samples=max(3, int(features.shape[0] * 0.1))
+                        ).fit(features)
+                        
+                        unique_labels = set(clustering.labels_)
+                        if -1 in unique_labels:
+                            unique_labels.remove(-1)
+                        
+                        detected_speakers = len(unique_labels)
+                        
+                        if detected_speakers == 0:
+                            detected_speakers = 1  # 後備方案
+                        
+                        logger.info(f"聚類分析結果: {detected_speakers} 位說話者")
+                        
+                    except Exception as e:
+                        logger.info(f"聚類分析失敗，預設為單一語者: {e}")
+                        detected_speakers = 1
+                    
+                else:
+                    detected_speakers = 1
+                    
+            except Exception as e:
+                logger.info(f"MFCC分析失敗，預設為單一語者: {e}")
+                detected_speakers = 1
+            
+            # 4. 最終限制和驗證
+            detected_speakers = min(detected_speakers, self.num_speakers)
+            detected_speakers = max(detected_speakers, 1)  # 既然通過了語音檢測，至少是1個說話者
+            
+            logger.info(f"最終偵測結果: {detected_speakers} 位說話者")
+            return detected_speakers
+            
+        except Exception as e:
+            logger.warning(f"語者數量偵測失敗，使用後備方案: {e}")
+            return self._fallback_speaker_detection(audio_data if 'audio_data' in locals() else audio_tensor.cpu().numpy())
+
+    def _fallback_speaker_detection(self, audio_data: np.ndarray) -> int:
+        """
+        後備的語者數量偵測方法，基於簡化的能量分析
+        
+        Args:
+            audio_data: 音訊數據
+            
+        Returns:
+            int: 估計的說話者數量
+        """
+        try:
+            # 非常寬鬆的靜音檢測
+            audio_rms = np.sqrt(np.mean(audio_data ** 2))
+            audio_max = np.max(np.abs(audio_data))
+            
+            logger.info(f"後備檢測 - RMS: {audio_rms:.6f}, Max: {audio_max:.6f}")
+            
+            # 只要有一個指標超過很低的閾值就認為有語音
+            if audio_rms < self.silence_threshold * 0.3 and audio_max < self.silence_threshold:
+                logger.info("後備檢測：判定為靜音")
+                return 0
+            
+            # 如果通過靜音檢測，至少回傳1個說話者
+            logger.info("後備檢測：判定為有語音活動")
+            return 1
+            
+        except Exception as e:
+            logger.warning(f"後備語者偵測也失敗: {e}")
+            # 終極後備方案：只要音訊不是完全靜音就認為有1個說話者
+            try:
+                if np.any(np.abs(audio_data) > 0.0001):  # 極低的閾值
+                    logger.info("終極後備：偵測到非零音訊")
+                    return 1
+                else:
+                    logger.info("終極後備：音訊完全靜音")
+                    return 0
+            except:
+                logger.info("所有檢測都失敗，預設回傳1")
+                return 1  # 最保險的選擇
+
     def separate_and_save(self, audio_tensor, output_dir, segment_index):
         """分離並儲存音訊，並回傳 (path, start, end) 列表。"""
         try:
+            # 新增：在分離前先偵測說話者數量
+            detected_speakers = self.detect_speaker_count(audio_tensor)
+            logger.info(f"片段 {segment_index} - 偵測到 {detected_speakers} 位說話者")
+            
+            # 如果沒有偵測到說話者，跳過處理
+            if detected_speakers == 0:
+                logger.info(f"片段 {segment_index} - 未偵測到說話者，跳過處理")
+                return []
+            
             # 初始化累計時間戳
             current_t0 = getattr(self, "_current_t0", 0.0)
             results = []   # 用來收 (path, start, end)
@@ -960,7 +1210,11 @@ class AudioSeparator:
                 
                 saved_count = 0
                 start_time = current_t0
-                for i in range(min(num_speakers, self.num_speakers)):
+                
+                # 根據偵測到的說話者數量限制輸出
+                effective_speakers = min(detected_speakers, num_speakers, self.num_speakers)
+                
+                for i in range(effective_speakers):
                     try:
                         if speaker_dim == 1:
                             speaker_audio = enhanced_separated[0, i, :].cpu()
@@ -1007,7 +1261,7 @@ class AudioSeparator:
                         logger.warning(f"儲存語者 {i+1} 失敗: {e}")
                 
                 if saved_count > 0:
-                    logger.info(f"片段 {segment_index} 完成，儲存 {saved_count} 個檔案")
+                    logger.info(f"片段 {segment_index} 完成，實際儲存 {saved_count}/{effective_speakers} 個檔案")
                 
             # 更新累計時間到下一段
             current_t0 += seg_duration
@@ -1028,6 +1282,15 @@ class AudioSeparator:
     def separate_and_identify(self, audio_tensor: torch.Tensor, output_dir: str, segment_index: int) -> None:
         """分離音訊並直接進行語音識別，可選擇是否儲存音訊檔案"""
         try:
+            # 新增：在分離前先偵測說話者數量
+            detected_speakers = self.detect_speaker_count(audio_tensor)
+            logger.info(f"片段 {segment_index} - 偵測到 {detected_speakers} 位說話者")
+            
+            # 如果沒有偵測到說話者，跳過處理
+            if detected_speakers == 0:
+                logger.info(f"片段 {segment_index} - 未偵測到說話者，跳過處理")
+                return []
+            
             audio_files = []
             audio_streams = []
             

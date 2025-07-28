@@ -22,6 +22,10 @@ from modules.identification.VID_identify_v5 import SpeakerIdentifier
 from modules.asr.whisper_asr import WhisperASR
 from modules.asr.text_utils import compute_cer, compute_wer
 
+# 修復 SVML 錯誤：在導入 PyTorch 之前設定環境變數
+os.environ["MKL_DISABLE_FAST_MM"] = "1"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
+
 logger = get_logger(__name__)
 
 logger.info("🖥 GPU available: %s", torch.cuda.is_available())
@@ -349,7 +353,7 @@ def run_pipeline_stream(
             if n not in unique or item["confidence"] > unique[n]["confidence"]:
                 unique[n] = item
         speaker_results = list(unique.values())
-
+ 
         seg_dict = {
             "segment": idx,
             "start": round(t0, 2),
