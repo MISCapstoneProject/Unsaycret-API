@@ -131,8 +131,7 @@ def _print(*args, **kwargs) -> None:
         # 將多個參數轉換為單個字符串
         message = " ".join(str(arg) for arg in args)
         logger.info(message)
-        # 保留對終端的直接輸出以保持兼容性
-        original_print(*args, **kwargs)
+        # 移除重複的直接輸出，避免雙重顯示
 
 # 設置輸出開關的函數
 def set_output_enabled(enable: bool) -> None:
@@ -436,10 +435,10 @@ class WeaviateRepository:
                 speaker_name = obj.properties.get("speaker_name")
                 update_count = obj.properties.get("update_count")  # 恢復使用update_count
                 
-                # 使用安全的格式化方法，避免 None 值導致錯誤
-                distance_str = f"{distance:.4f}" if distance is not None else "未知"
-                print(f"比對 - 語者: {speaker_name}, "
-                      f"更新次數: {update_count}, 餘弦距離: {distance_str}")
+                # 移除重複的比對輸出，交由上層處理
+                # distance_str = f"{distance:.4f}" if distance is not None else "未知"
+                # print(f"比對 - 語者: {speaker_name}, "
+                #       f"更新次數: {update_count}, 餘弦距離: {distance_str}")
                 
                 # 保存距離資訊（使用update_count作為第4個參數）
                 distances.append((object_id, speaker_name, distance, update_count))
@@ -1011,7 +1010,8 @@ class SpeakerIdentifier:
             verbose: 是否輸出詳細信息，預設為 True
         """
         if verbose:
-            print(message)
+            # 直接使用 logger 避免與 _print 函數重複輸出
+            logger.info(message)
 
     # 格式化輸出比對結果
     def format_comparison_result(self, speaker_name: str, update_count: int, distance: float, verbose: bool = True) -> None:
@@ -1026,7 +1026,8 @@ class SpeakerIdentifier:
         """
         if verbose:
             distance_str = f"{distance:.4f}" if distance is not None else "未知"
-            print(f"比對 - 語者: {speaker_name}, 更新次數: {update_count}, 餘弦距離: {distance_str}")
+            # 直接使用 logger 避免與 _print 函數重複輸出
+            logger.info(f"比對 - 語者: {speaker_name}, 更新次數: {update_count}, 餘弦距離: {distance_str}")
 
     # 修改 SpeakerIdentifier 類別中的方法來使用這些函數
     def process_audio_file(self, audio_file: str) -> Optional[Tuple[str, str, float]]:
