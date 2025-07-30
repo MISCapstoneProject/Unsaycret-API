@@ -5,6 +5,44 @@ except ModuleNotFoundError:
     import jieba
 from typing import List, Dict
 import re
+try:
+    from opencc import OpenCC
+    cc = OpenCC('s2twp')  # 簡→繁（台灣用字）
+except ImportError:
+    cc = None
+
+_normalize_pattern = re.compile(r'[^\u4e00-\u9fffA-Za-z0-9]')
+
+def normalize_zh(text: str) -> str:
+    """
+    先(可選)把簡體轉繁體，再移除標點與空白，只留中英數。
+    """
+    if cc:
+        text = cc.convert(text)
+    return _normalize_pattern.sub('', text)
+
+
+def cer_zh(ref_norm: str, hyp_norm: str) -> float:
+    """
+    ref_norm / hyp_norm 已經是 normalize_zh 後的字串
+    直接用字級 Levenshtein 距離算 CER
+    """
+    if not ref_norm:
+        return 0.0
+    dist = _levenshtein(list(ref_norm), list(hyp_norm))
+    return dist / len(ref_norm)
+
+
+def wer_zh(ref_norm: str, hyp_norm: str) -> float:
+    """
+    中文 WER：用 jieba 斷詞後計算。若只想看 CER，可不用此函式。
+    """
+    if not ref_norm:
+        return 0.0
+    ref_tok = list(jieba.cut(ref_norm))
+    hyp_tok = list(jieba.cut(hyp_norm))
+    dist = _levenshtein(ref_tok, hyp_tok)
+    return dist / len(ref_tok)
 
 # jieba.add_word("公務員")
 # jieba.add_word("畢業後")
