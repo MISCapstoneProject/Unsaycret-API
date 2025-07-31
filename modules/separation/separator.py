@@ -99,11 +99,6 @@ Weaviate 資料庫設定：
 """
 
 import os
-
-# 修復 SVML 錯誤：在導入 PyTorch 之前設定環境變數
-os.environ["MKL_DISABLE_FAST_MM"] = "1"
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
-
 import numpy as np
 import torch
 import torchaudio
@@ -120,8 +115,6 @@ import time
 from scipy import signal
 from scipy.ndimage import uniform_filter1d
 from enum import Enum
-from sklearn.cluster import DBSCAN # type: ignore
-import librosa # type: ignore
 
 # 修改模型載入方式
 try:
@@ -180,7 +173,7 @@ RATE = AUDIO_RATE
 TARGET_RATE = AUDIO_TARGET_RATE
 WINDOW_SIZE = AUDIO_WINDOW_SIZE
 OVERLAP = AUDIO_OVERLAP
-DEVICE_INDEX = 2
+DEVICE_INDEX = None
 
 # 處理參數（從配置讀取）
 MIN_ENERGY_THRESHOLD = AUDIO_MIN_ENERGY_THRESHOLD
@@ -294,12 +287,6 @@ class AudioSeparator:
         self.enable_noise_reduction = enable_noise_reduction
         self.snr_threshold = snr_threshold
         
-        # 語者偵測相關參數 - 進一步降低為更靈敏的設定
-        self.vad_threshold = 0.1  # 進一步降低語音活動檢測閾值（原0.08）
-        self.speaker_energy_threshold = 0.1  # 進一步降低說話者能量閾值（原0.15）
-        self.silence_threshold = 0.002  # 進一步降低靜音檢測閾值（原0.002）
-        self.min_speech_duration = 0.8  # 進一步降低最小語音持續時間（原0.3秒）
-
         logger.info(f"使用設備: {self.device}")
         logger.info(f"模型類型: {model_type.value}")
         logger.info(f"載入模型: {self.model_config['model_name']}")
@@ -1228,11 +1215,7 @@ class AudioSeparator:
                 
                 saved_count = 0
                 start_time = current_t0
-                
-                # 根據偵測到的說話者數量限制輸出
-                effective_speakers = min(detected_speakers, num_speakers, self.num_speakers)
-                
-                for i in range(effective_speakers):
+                for i in range(min(num_speakers, self.num_speakers)):
                     try:
                         if speaker_dim == 1:
                             speaker_audio = enhanced_separated[0, i, :].cpu()
@@ -1283,7 +1266,7 @@ class AudioSeparator:
                         logger.warning(f"儲存語者 {i+1} 失敗: {e}")
                 
                 if saved_count > 0:
-                    logger.info(f"片段 {segment_index} 完成，實際儲存 {saved_count}/{effective_speakers} 個檔案")
+                    logger.info(f"片段 {segment_index} 完成，儲存 {saved_count} 個檔案")
                 
             # 更新累計時間到下一段
             current_t0 += seg_duration
@@ -1304,15 +1287,6 @@ class AudioSeparator:
     def separate_and_identify(self, audio_tensor: torch.Tensor, output_dir: str, segment_index: int) -> None:
         """分離音訊並直接進行語音識別，可選擇是否儲存音訊檔案"""
         try:
-            # 新增：在分離前先偵測說話者數量
-            detected_speakers = self.detect_speaker_count(audio_tensor)
-            logger.info(f"片段 {segment_index} - 偵測到 {detected_speakers} 位說話者")
-            
-            # 如果沒有偵測到說話者，跳過處理
-            if detected_speakers == 0:
-                logger.info(f"片段 {segment_index} - 未偵測到說話者，跳過處理")
-                return []
-            
             audio_files = []
             audio_streams = []
             
