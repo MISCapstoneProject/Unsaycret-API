@@ -32,30 +32,33 @@ if torch.cuda.is_available():
     logger.info("   Device: %s", torch.cuda.get_device_name(0))
 
 # ---------- 1. GPU/CPU 設備選擇 ----------
-current_cuda_device = CUDA_DEVICE_INDEX  # 建立本地變數避免修改全域變數
+def init_pipeline_modules():
+    """初始化 sep / spk / asr，考慮 CUDA 設定，並回傳模組實例們"""
+    current_cuda_device = CUDA_DEVICE_INDEX  # 建立本地變數避免修改全域變數
 
-if FORCE_CPU:
-    use_gpu = False
-    logger.info("🔧 FORCE_CPU=true，強制使用 CPU")
-else:
-    use_gpu = torch.cuda.is_available()
-    if use_gpu:
-        # 檢查指定的設備是否存在
-        if current_cuda_device < torch.cuda.device_count():
-            torch.cuda.set_device(current_cuda_device)
-            logger.info(f"🎯 設定 CUDA 設備索引: {current_cuda_device}")
-            logger.info(f"   使用設備: {torch.cuda.get_device_name(current_cuda_device)}")
-        else:
-            logger.warning(f"⚠️  CUDA 設備索引 {current_cuda_device} 不存在，使用預設設備 0")
-            current_cuda_device = 0
-            torch.cuda.set_device(current_cuda_device)  # 確實設定設備 0
-            logger.info(f"   已設定為設備 0: {torch.cuda.get_device_name(0)}")
+    if FORCE_CPU:
+        use_gpu = False
+        logger.info("🔧 FORCE_CPU=true，強制使用 CPU")
+    else:
+        use_gpu = torch.cuda.is_available()
+        if use_gpu:
+            if current_cuda_device < torch.cuda.device_count():
+                torch.cuda.set_device(current_cuda_device)
+                logger.info(f"🎯 設定 CUDA 設備索引: {current_cuda_device}")
+                logger.info(f"   使用設備: {torch.cuda.get_device_name(current_cuda_device)}")
+            else:
+                logger.warning(f"⚠️  CUDA 設備索引 {current_cuda_device} 不存在，使用預設設備 0")
+                current_cuda_device = 0
+                torch.cuda.set_device(current_cuda_device)
+                logger.info(f"   已設定為設備 0: {torch.cuda.get_device_name(0)}")
 
-logger.info(f"🚀 使用設備: {'cuda:' + str(current_cuda_device) if use_gpu else 'cpu'}")
+    logger.info(f"🚀 使用設備: {'cuda:' + str(current_cuda_device) if use_gpu else 'cpu'}")
 
-sep = AudioSeparator()
-spk = SpeakerIdentifier()
-asr = WhisperASR(model_name=DEFAULT_WHISPER_MODEL, gpu=use_gpu, beam=DEFAULT_WHISPER_BEAM_SIZE)
+    sep = AudioSeparator()
+    spk = SpeakerIdentifier()
+    asr = WhisperASR(model_name=DEFAULT_WHISPER_MODEL, gpu=use_gpu, beam=DEFAULT_WHISPER_BEAM_SIZE)
+
+    return sep, spk, asr,use_gpu
 
 def _timed_call(func, *args):
     t0 = time.perf_counter()
@@ -63,7 +66,7 @@ def _timed_call(func, *args):
     return res, time.perf_counter() - t0
 
 
-def process_segment(seg_path: str, t0: float, t1: float, absolute_timestamp: float = None) -> dict:
+def process_segment(seg_path: str, t0: float, t1: float, absolute_timestamp: float = None, *, sep=None, spk=None, asr=None) -> dict:
     """Process a single separated segment."""
     logger.info(
         f"🔧 執行緒 {threading.get_ident()} 處理 ({t0:.2f}-{t1:.2f}) → {os.path.basename(seg_path)}"
@@ -110,6 +113,7 @@ def process_segment(seg_path: str, t0: float, t1: float, absolute_timestamp: flo
         "words": adjusted_words,
         "spk_time": spk_time,
         "asr_time": asr_time,
+        "path": seg_path
     }
     
     # 如果有絕對時間戳，加入到結果中
@@ -136,7 +140,7 @@ def make_pretty(seg: dict) -> dict:
     }
 
 
-def run_pipeline_file(raw_wav: str, max_workers: int = 3):
+def run_pipeline_file(raw_wav: str, max_workers: int = 3,sep=None, spk=None, asr=None):
     """Run pipeline on an existing wav file."""
     total_start = time.perf_counter()
 
@@ -157,20 +161,26 @@ def run_pipeline_file(raw_wav: str, max_workers: int = 3):
     sep_end = time.perf_counter()
     logger.info(f"⏱ 分離耗時 {sep_end - sep_start:.3f}s, 共 {len(segments)} 段")
 
-    # 2) 多執行緒處理所有段 (現在 segments 包含絕對時間戳)
+    # 2) 多執行緒處理所有段（同時支援含/不含 absolute_timestamp，並注入 sep/spk/asr）
     logger.info(f"🔄 處理 {len(segments)} 段... (max_workers={max_workers})")
-    with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        # 根據 segment 資料結構處理
-        if segments and len(segments[0]) == 4:
+
+    def _run(seg):
+        if len(seg) >= 4:
             # 新格式：(path, start, end, absolute_timestamp)
-            bundle = [r for r in ex.map(lambda s: process_segment(s[0], s[1], s[2], s[3]), segments) if r]
+            return process_segment(seg[0], seg[1], seg[2], seg[3],
+                                sep=sep, spk=spk, asr=asr)
         else:
             # 舊格式：(path, start, end)
-            bundle = [r for r in ex.map(lambda s: process_segment(s[0], s[1], s[2]), segments) if r]
+            return process_segment(seg[0], seg[1], seg[2],
+                                sep=sep, spk=spk, asr=asr)
+
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        bundle = [r for r in ex.map(_run, segments) if r]
 
     spk_time = max((s.get("spk_time", 0.0) for s in bundle), default=0.0)
     asr_time = max((s.get("asr_time", 0.0) for s in bundle), default=0.0)
     pipeline_total = (sep_end - sep_start) + spk_time + asr_time
+
 
     stages_path = pathlib.Path("pipeline_stages.csv")
     if not stages_path.exists():
@@ -242,7 +252,7 @@ def load_truth_map(path: str) -> dict[str, str]:
 def run_pipeline_dir(
     dir_path: str,
     truth_map_path: str = "truth_map.txt",
-    max_workers: int = 3,
+    max_workers: int = 3, sep=None, spk=None, asr=None
 ) -> str:
     """
     批次處理資料夾內所有音檔，輸出：
@@ -268,7 +278,7 @@ def run_pipeline_dir(
     file_results: list[tuple[int, Path, dict, list[dict]]] = []
     for idx, audio in enumerate(sorted(audio_files), start=1):
         logger.info(f"===== 處理檔案 {audio.name} ({idx}/{len(audio_files)}) =====")
-        segments, pretty, stats = run_pipeline_file(str(audio), max_workers)
+        segments, pretty, stats = run_pipeline_file(str(audio), max_workers , sep=sep, spk=spk, asr=asr)
 
         # 用 truth_map 覆寫 WER/CER
         gt = truth_map.get(audio.name)
@@ -326,6 +336,7 @@ def run_pipeline_stream(
     queue_out: "queue.Queue[dict] | None" = None,
     stop_event: threading.Event | None = None,
     in_bytes_queue: "queue.Queue[bytes] | None" = None,
+    sep=None, spk=None, asr=None
 ):
     """串流模式：每 chunk_secs 做一次分離/識別/ASR。"""
 
@@ -366,14 +377,17 @@ def run_pipeline_stream(
             # 如果 segments 包含絕對時間戳，傳遞給 process_segment
             if segments and len(segments) > sp_idx - 1 and len(segments[sp_idx - 1]) == 4:
                 absolute_timestamp = segments[sp_idx - 1][3]
-                res = process_segment(str(wav_path), t0, t1, absolute_timestamp)
+                res = process_segment(str(wav_path), t0, t1, absolute_timestamp,
+                                    sep=sep, spk=spk, asr=asr)
             else:
-                res = process_segment(str(wav_path), t0, t1)
-                
+                res = process_segment(str(wav_path), t0, t1,
+                                    sep=sep, spk=spk, asr=asr)
+
             if not res["text"].strip() or res["confidence"] < 0.1:
                 continue
             res["speaker_index"] = sp_idx
             speaker_results.append(res)
+
 
         # 去重：同 speaker 留最高信心
         unique: dict[str, dict] = {}
@@ -510,6 +524,7 @@ run_pipeline_DIR = run_pipeline_dir
 
 # ───────────────────────── CLI ─────────────────────────
 def main():
+    sep, spk, asr, use_gpu = init_pipeline_modules()
     parser = argparse.ArgumentParser(description="Speech pipeline")
     sub = parser.add_subparsers(dest="mode", required=True)
 
@@ -542,15 +557,17 @@ def main():
     args = parser.parse_args()
 
     # 用 CLI 覆蓋 ASR 設定
-    global asr
+    # 如果命令行 override 模型，就重新拿一个新的 asr
     asr = WhisperASR(model_name=args.model, gpu=use_gpu, beam=args.beam)
 
     if args.mode == "file":
-        run_pipeline_file(args.path, args.workers)
+        run_pipeline_file(args.path,
+                          args.workers,
+                          sep=sep, spk=spk, asr=asr)    
     elif args.mode == "stream":
-        run_pipeline_stream(chunk_secs=args.chunk, max_workers=args.workers)
+        run_pipeline_stream(chunk_secs=args.chunk, max_workers=args.workers, sep=sep, spk=spk, asr=asr)
     elif args.mode == "dir":
-        run_pipeline_dir(args.path, truth_map_path=args.truth_map, max_workers=args.workers)
+        run_pipeline_dir(args.path, truth_map_path=args.truth_map, max_workers=args.workers, sep=sep, spk=spk, asr=asr)
 
 
 if __name__ == "__main__":
