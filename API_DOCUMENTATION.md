@@ -38,7 +38,7 @@
 ### ⚙️ 語音處理 API (Core Processing)
 - `POST /transcribe` - 語音轉錄與語者識別
 - `POST /transcribe_dir` - 批次轉錄
-- `WS /ws/stream` - 即時串流轉錄
+- `WS /ws/stream?session={uuid}` - 即時串流轉錄
 
 
 ## 📋 API 詳細說明

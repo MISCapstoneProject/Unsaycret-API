@@ -48,7 +48,7 @@ if __name__ == "__main__":
         print("🔌 可用的API端點：")
         print("  📝 POST /transcribe              - 語音轉錄（分離+辨識+ASR）")
         print("  📁 POST /transcribe_dir          - 批次轉錄（目錄/ZIP檔）")
-        print("  🌐 WebSocket /ws/stream          - 即時語音處理")
+        print("  🌐 WebSocket /ws/stream?session={uuid} - 即時語音處理")
         print("")
         print("  � 語者管理 API:")
         print("     📋 GET    /speakers           - 列出所有語者")

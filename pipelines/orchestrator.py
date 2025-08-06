@@ -6,7 +6,7 @@ import threading
 import time
 import queue
 from pathlib import Path
-from datetime import datetime as dt
+from datetime import datetime as dt, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor, Future
 
 # 修復 SVML 錯誤：在導入 PyTorch 之前設定環境變數
@@ -63,7 +63,7 @@ def _timed_call(func, *args):
     return res, time.perf_counter() - t0
 
 
-def process_segment(seg_path: str, t0: float, t1: float) -> dict:
+def process_segment(seg_path: str, t0: float, t1: float, absolute_timestamp: float = None) -> dict:
     """Process a single separated segment."""
     logger.info(
         f"🔧 執行緒 {threading.get_ident()} 處理 ({t0:.2f}-{t1:.2f}) → {os.path.basename(seg_path)}"
@@ -99,10 +99,11 @@ def process_segment(seg_path: str, t0: float, t1: float) -> dict:
     total = time.perf_counter() - start
     logger.info(f"⏱ segment 總耗時 {total:.3f}s")
 
-    return {
+    result = {
         "start": round(t0, 2),
         "end": round(t1, 2),
         "speaker": name,
+        "speaker_id": speaker_id,
         "distance": round(float(dist), 3),
         "text": text,
         "confidence": round(conf, 2),
@@ -110,6 +111,16 @@ def process_segment(seg_path: str, t0: float, t1: float) -> dict:
         "spk_time": spk_time,
         "asr_time": asr_time,
     }
+    
+    # 如果有絕對時間戳，加入到結果中
+    if absolute_timestamp is not None:
+        result["absolute_timestamp"] = absolute_timestamp
+        # 使用台北時間戳轉換 (UTC+8)
+        taipei_tz = timezone(timedelta(hours=8))
+        result["absolute_start_time"] = dt.fromtimestamp(absolute_timestamp, tz=taipei_tz).isoformat()
+        result["absolute_end_time"] = dt.fromtimestamp(absolute_timestamp + (t1 - t0), tz=taipei_tz).isoformat()
+    
+    return result
 
 
 
@@ -138,17 +149,24 @@ def run_pipeline_file(raw_wav: str, max_workers: int = 3):
 
     # 1) 分離
     sep_start = time.perf_counter()
-    segments = sep.separate_and_save(waveform, str(out_dir), segment_index=0)
+    file_start_time = dt.now()  # 記錄處理檔案的開始時間
+    segments = sep.separate_and_save(waveform, str(out_dir), segment_index=0, absolute_start_time=file_start_time)
     if not segments:                           # ← 新增
         logger.error("🚨 語者分離失敗：回傳空值 / None")
         raise RuntimeError("Speaker separation failed – no segments returned")
     sep_end = time.perf_counter()
     logger.info(f"⏱ 分離耗時 {sep_end - sep_start:.3f}s, 共 {len(segments)} 段")
 
-    # 2) 多執行緒處理所有段
+    # 2) 多執行緒處理所有段 (現在 segments 包含絕對時間戳)
     logger.info(f"🔄 處理 {len(segments)} 段... (max_workers={max_workers})")
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
-        bundle = [r for r in ex.map(lambda s: process_segment(*s), segments) if r]
+        # 根據 segment 資料結構處理
+        if segments and len(segments[0]) == 4:
+            # 新格式：(path, start, end, absolute_timestamp)
+            bundle = [r for r in ex.map(lambda s: process_segment(s[0], s[1], s[2], s[3]), segments) if r]
+        else:
+            # 舊格式：(path, start, end)
+            bundle = [r for r in ex.map(lambda s: process_segment(s[0], s[1], s[2]), segments) if r]
 
     spk_time = max((s.get("spk_time", 0.0) for s in bundle), default=0.0)
     asr_time = max((s.get("asr_time", 0.0) for s in bundle), default=0.0)
@@ -317,8 +335,11 @@ def run_pipeline_stream(
 
     executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=max_workers)
     futures: list[Future] = []
+    # 使用台北時間作為串流開始時間 (UTC+8)
+    taipei_tz = timezone(timedelta(hours=8))
+    stream_start_time = dt.now(taipei_tz)
 
-    def process_chunk(raw_bytes: bytes, idx: int):
+    def process_chunk(raw_bytes: bytes, idx: int, chunk_start_time: dt = None):
         t0 = idx * chunk_secs
         t1 = t0 + chunk_secs
 
@@ -330,7 +351,11 @@ def run_pipeline_stream(
         mix_path = seg_dir / "mix.wav"
         torchaudio.save(mix_path.as_posix(), waveform, rate)
 
-        sep.separate_and_save(waveform, seg_dir.as_posix(), segment_index=idx)
+        # 計算這個 chunk 的絕對開始時間
+        if chunk_start_time is None:
+            chunk_start_time = stream_start_time + timedelta(seconds=t0)
+
+        segments = sep.separate_and_save(waveform, seg_dir.as_posix(), segment_index=idx, absolute_start_time=chunk_start_time)
         speaker_paths = sorted(seg_dir.glob("speaker*.wav"))
         if not speaker_paths:
             logger.warning("segment %d 無 speaker wav", idx)
@@ -338,7 +363,13 @@ def run_pipeline_stream(
 
         speaker_results: list[dict] = []
         for sp_idx, wav_path in enumerate(speaker_paths, 1):
-            res = process_segment(str(wav_path), t0, t1)
+            # 如果 segments 包含絕對時間戳，傳遞給 process_segment
+            if segments and len(segments) > sp_idx - 1 and len(segments[sp_idx - 1]) == 4:
+                absolute_timestamp = segments[sp_idx - 1][3]
+                res = process_segment(str(wav_path), t0, t1, absolute_timestamp)
+            else:
+                res = process_segment(str(wav_path), t0, t1)
+                
             if not res["text"].strip() or res["confidence"] < 0.1:
                 continue
             res["speaker_index"] = sp_idx

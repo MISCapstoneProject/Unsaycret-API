@@ -150,18 +150,22 @@ from utils.env_config import WEAVIATE_HOST, WEAVIATE_PORT, WEAVIATE_CONNECTION_T
 def format_rfc3339(dt: Optional[datetime] = None) -> str:
     """
     將 datetime 轉換為 RFC3339 格式字串，用於 Weaviate 時間戳記。
-    若未提供時間，則使用當前時間。
+    若未提供時間，則使用當前台北時間。
     
     Args:
-        dt: 要格式化的 datetime 物件，若 None 則使用當前時間
+        dt: 要格式化的 datetime 物件，若 None 則使用當前台北時間
         
     Returns:
         str: RFC3339 格式的時間字串
     """
     if dt is None:
-        dt = datetime.now(timezone.utc)
+        # 使用台北時間 (UTC+8)
+        taipei_tz = timezone(timedelta(hours=8))
+        dt = datetime.now(taipei_tz)
     elif dt.tzinfo is None:
-        dt = dt.replace(tzinfo=timezone.utc)
+        # 如果沒有時區資訊，假設為台北時間
+        taipei_tz = timezone(timedelta(hours=8))
+        dt = dt.replace(tzinfo=taipei_tz)
     return dt.isoformat()
 
 # UUID 驗證工具
@@ -1856,10 +1860,34 @@ class DatabaseService:
             # 預設時間為當下
             current_time = format_rfc3339()
             
+            # 處理時間戳，確保是 RFC3339 格式
+            request_timestamp = getattr(request, 'timestamp', None)
+            if request_timestamp:
+                # 如果是字串，檢查是否已經是 RFC3339 格式
+                if isinstance(request_timestamp, str):
+                    # 如果是 UTC 時間（Z 結尾），轉換為台北時間
+                    if request_timestamp.endswith('Z'):
+                        from datetime import datetime
+                        utc_time = datetime.fromisoformat(request_timestamp[:-1] + '+00:00')
+                        taipei_tz = timezone(timedelta(hours=8))
+                        taipei_time = utc_time.astimezone(taipei_tz)
+                        timestamp_to_use = taipei_time.isoformat()
+                    # 如果沒有時區資訊，添加台北時區
+                    elif not ('+' in request_timestamp[-6:] or request_timestamp.endswith('UTC')):
+                        request_timestamp = request_timestamp + '+08:00'
+                        timestamp_to_use = request_timestamp
+                    else:
+                        timestamp_to_use = request_timestamp
+                else:
+                    # 如果是 datetime 物件，格式化為 RFC3339
+                    timestamp_to_use = format_rfc3339(request_timestamp)
+            else:
+                timestamp_to_use = current_time
+            
             # 準備屬性
             properties = {
                 "content": getattr(request, 'content', None) or "",
-                "timestamp": getattr(request, 'timestamp', None) or current_time,
+                "timestamp": timestamp_to_use,
                 "confidence": getattr(request, 'confidence', None),
                 "duration": getattr(request, 'duration', None),
                 "language": getattr(request, 'language', None) or ""

@@ -47,7 +47,7 @@ uvicorn api.api:app --host 0.0.0.0 --port 8000 --reload
 ### 語音處理
 - `POST /transcribe` - 單檔轉錄（分離+辨識+ASR）
 - `POST /transcribe_dir` - 批次轉錄（目錄/ZIP）
-- `WS /ws/stream` - 即時語音處理
+- `WS /ws/stream?session={uuid}` - 即時語音處理
 
 ### 語者管理  
 - `GET /speakers` - 列出所有語者
