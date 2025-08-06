@@ -103,6 +103,7 @@ def process_segment(seg_path: str, t0: float, t1: float) -> dict:
         "start": round(t0, 2),
         "end": round(t1, 2),
         "speaker": name,
+        "speaker_id": speaker_id,
         "distance": round(float(dist), 3),
         "text": text,
         "confidence": round(conf, 2),

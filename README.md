@@ -116,7 +116,7 @@ python main.py
 ### 🚀 核心功能
 - **語音轉錄**: `POST /transcribe` - 單檔語音轉錄（分離+辨識+ASR）
 - **批次轉錄**: `POST /transcribe_dir` - 批次轉錄（目錄/ZIP檔）
-- **即時處理**: `WS /ws/stream` - 即時語音處理串流
+- **即時處理**: `WS /ws/stream?session={uuid}` - 即時語音處理串流
 
 ### 📊 資料管理
 - **語者管理**: 完整的CRUD操作（查詢、更新、刪除）

@@ -363,9 +363,19 @@ async def transcribe_dir(path: str = Form(None), zip_file: UploadFile = File(Non
 async def ws_stream(ws: WebSocket):
     """WebSocket即時語音處理"""
     raw_q = queue.Queue()   # 前端上送的音訊
-    result_q = queue.Queue()   # 新增：後端要推給前端的結果
+    result_q = queue.Queue()   # 後端要推給前端的結果
     stop_evt = threading.Event()
     backend_thread = None
+
+    # 讀取並驗證 Session UUID
+    session_uuid = ws.query_params.get("session")
+    if not session_uuid or not UUID_PATTERN.match(session_uuid):
+        await ws.close(code=1008, reason="Missing or invalid session UUID")
+        return
+
+    # 取得 Session 既有參與者
+    session_info = data_facade.get_session_info(session_uuid) or {}
+    session_participants = set(session_info.get("participants") or [])
 
     try:
         await ws.accept()
@@ -396,6 +406,27 @@ async def ws_stream(ws: WebSocket):
                 seg = result_q.get_nowait()
                 if seg is None:          # backend 完成
                     break
+
+                # 儲存 SpeechLog 並更新 Session 參與者
+                for sp in seg.get("speakers", []):
+                    speaker_id = sp.get("speaker_id")
+                    if speaker_id:
+                        sl_req = SpeechLogCreateRequest(
+                            content=sp.get("text"),
+                            confidence=sp.get("confidence"),
+                            duration=(seg.get("end", 0) - seg.get("start", 0)),
+                            speaker=speaker_id,
+                            session=session_uuid,
+                        )
+                        data_facade.create_speechlog(sl_req)
+
+                        if speaker_id not in session_participants:
+                            session_participants.add(speaker_id)
+                            data_facade.update_session(
+                                session_uuid,
+                                {"participants": list(session_participants)},
+                            )
+
                 await ws.send_text(json.dumps(seg, ensure_ascii=False))
             except queue.Empty:
                 pass
@@ -411,7 +442,7 @@ async def ws_stream(ws: WebSocket):
             elif "text" in data and data["text"] == "stop":
                 stop_evt.set()
                 break
-                
+
     except WebSocketDisconnect:
         logger.info("WebSocket客戶端斷線")
     except Exception as e:
