@@ -622,14 +622,25 @@ class DataFacade:
     # ------------------------- SpeechLog CRUD -------------------------
     def create_speechlog(self, request: Any) -> dict:
         """
-        新增 SpeechLog 紀錄
+        新增 SpeechLog 紀錄，並自動更新對應 Session 的時間範圍
         Args:
             request: SpeechLogCreateRequest
         Returns:
             dict: 操作結果
         """
         try:
-            return self.speechlog_manager.create_speechlog(request)
+            # 1. 建立 SpeechLog
+            result = self.speechlog_manager.create_speechlog(request)
+            
+            # 2. 如果建立成功且有關聯的 Session，自動更新 Session 時間範圍
+            if result.get("success") and hasattr(request, 'session') and request.session:
+                try:
+                    self._update_session_timerange(request.session)
+                except Exception as e:
+                    logger.warning(f"更新 Session {request.session} 時間範圍失敗: {e}")
+                    # 不影響 SpeechLog 建立的成功結果
+            
+            return result
         except Exception as e:
             logger.error(f"建立 SpeechLog 發生錯誤: {e}")
             return {"success": False, "message": str(e), "data": None}
@@ -731,3 +742,151 @@ class DataFacade:
         except Exception as e:
             logger.error(f"查詢 Session 的 SpeechLog 發生錯誤: {e}")
             return []
+
+    # ------------------------- Session 時間範圍自動計算 -------------------------
+    def _update_session_timerange(self, session_id: str) -> None:
+        """
+        根據關聯的 SpeechLog 自動更新 Session 的時間範圍
+        Args:
+            session_id: Session UUID
+        """
+        try:
+            # 1. 取得 Session 相關的所有 SpeechLog
+            speechlogs = self.get_session_speechlogs(session_id)
+            
+            if not speechlogs:
+                logger.info(f"Session {session_id} 尚無 SpeechLog，跳過時間範圍更新")
+                return
+            
+            # 2. 計算時間範圍
+            timestamps = []
+            durations = []
+            
+            for log in speechlogs:
+                if log.get('timestamp'):
+                    timestamps.append(log['timestamp'])
+                    # 計算結束時間（開始時間 + 持續時間）
+                    if log.get('duration'):
+                        try:
+                            from datetime import datetime, timedelta, timezone
+                            # 處理不同的時間格式
+                            timestamp_str = log['timestamp']
+                            
+                            # 解析時間戳並確保時區一致性
+                            if timestamp_str.endswith('Z') or timestamp_str.endswith('+00:00'):
+                                # UTC 格式，轉換為台北時間
+                                if timestamp_str.endswith('Z'):
+                                    utc_time = datetime.fromisoformat(timestamp_str[:-1] + '+00:00')
+                                else:
+                                    utc_time = datetime.fromisoformat(timestamp_str)
+                                taipei_tz = timezone(timedelta(hours=8))
+                                start_time = utc_time.astimezone(taipei_tz)
+                            else:
+                                start_time = datetime.fromisoformat(timestamp_str)
+                                # 如果沒有時區資訊，假設為台北時間
+                                if start_time.tzinfo is None:
+                                    taipei_tz = timezone(timedelta(hours=8))
+                                    start_time = start_time.replace(tzinfo=taipei_tz)
+                            
+                            end_time = start_time + timedelta(seconds=float(log['duration']))
+                            
+                            # 使用 format_rfc3339 確保正確格式
+                            from modules.database.database import format_rfc3339
+                            durations.append(format_rfc3339(end_time))
+                        except Exception as e:
+                            logger.warning(f"計算 SpeechLog 結束時間失敗: {e}")
+                            # 如果計算失敗，使用原始時間戳
+                            durations.append(log['timestamp'])
+            
+            if not timestamps:
+                logger.warning(f"Session {session_id} 的 SpeechLog 都沒有有效的時間戳，跳過更新")
+                return
+            
+            # 3. 找出最早和最晚時間，並確保格式一致
+            # 將所有時間戳轉換為 datetime 物件進行比較
+            parsed_timestamps = []
+            parsed_durations = []
+            
+            # 解析開始時間，確保所有時間都轉換為台北時間
+            for ts in timestamps:
+                try:
+                    if ts.endswith('Z') or ts.endswith('+00:00'):
+                        # UTC 格式，轉換為台北時間
+                        if ts.endswith('Z'):
+                            utc_time = datetime.fromisoformat(ts[:-1] + '+00:00')
+                        else:
+                            utc_time = datetime.fromisoformat(ts)
+                        taipei_tz = timezone(timedelta(hours=8))
+                        dt = utc_time.astimezone(taipei_tz)
+                    else:
+                        dt = datetime.fromisoformat(ts)
+                        if dt.tzinfo is None:
+                            taipei_tz = timezone(timedelta(hours=8))
+                            dt = dt.replace(tzinfo=taipei_tz)
+                    parsed_timestamps.append(dt)
+                except Exception as e:
+                    logger.warning(f"解析時間戳失敗: {ts}, 錯誤: {e}")
+            
+            # 解析結束時間，確保所有時間都轉換為台北時間
+            for ts in durations:
+                try:
+                    if ts.endswith('Z') or ts.endswith('+00:00'):
+                        # UTC 格式，轉換為台北時間
+                        if ts.endswith('Z'):
+                            utc_time = datetime.fromisoformat(ts[:-1] + '+00:00')
+                        else:
+                            utc_time = datetime.fromisoformat(ts)
+                        taipei_tz = timezone(timedelta(hours=8))
+                        dt = utc_time.astimezone(taipei_tz)
+                    else:
+                        dt = datetime.fromisoformat(ts)
+                        if dt.tzinfo is None:
+                            taipei_tz = timezone(timedelta(hours=8))
+                            dt = dt.replace(tzinfo=taipei_tz)
+                    parsed_durations.append(dt)
+                except Exception as e:
+                    logger.warning(f"解析時間戳失敗: {ts}, 錯誤: {e}")
+            
+            if not parsed_timestamps:
+                logger.warning(f"Session {session_id} 沒有有效的時間戳，跳過更新")
+                return
+            
+            # 找出最早和最晚時間
+            earliest_time = min(parsed_timestamps)
+            latest_time = max(parsed_durations) if parsed_durations else max(parsed_timestamps)
+            
+            # 使用 format_rfc3339 確保正確格式
+            from modules.database.database import format_rfc3339
+            start_time_str = format_rfc3339(earliest_time)
+            end_time_str = format_rfc3339(latest_time)
+            
+            # 4. 更新 Session
+            update_fields = {
+                "start_time": start_time_str,
+                "end_time": end_time_str
+            }
+            
+            result = self.update_session(session_id, update_fields)
+            if result.get("success"):
+                logger.info(f"Session {session_id} 時間範圍已更新: {start_time_str} ~ {end_time_str}")
+            else:
+                logger.error(f"更新 Session {session_id} 時間範圍失敗: {result.get('message')}")
+                
+        except Exception as e:
+            logger.error(f"更新 Session {session_id} 時間範圍時發生錯誤: {e}")
+            raise
+    
+    def recalculate_session_timerange(self, session_id: str) -> dict:
+        """
+        手動重新計算 Session 的時間範圍（公開方法，供 API 調用）
+        Args:
+            session_id: Session UUID
+        Returns:
+            dict: 操作結果
+        """
+        try:
+            self._update_session_timerange(session_id)
+            return {"success": True, "message": "Session 時間範圍重新計算完成", "data": None}
+        except Exception as e:
+            logger.error(f"重新計算 Session {session_id} 時間範圍失敗: {e}")
+            return {"success": False, "message": str(e), "data": None}

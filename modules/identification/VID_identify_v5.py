@@ -140,8 +140,7 @@ def _print(*args, **kwargs) -> None:
         if prefix:
             message = f"{prefix} {message}"
         logger.info(message)
-        # 保留對終端的直接輸出以保持兼容性
-        original_print(message, **kwargs)
+        # 移除重複的 print 輸出，只使用 logger
 
 # 設置輸出開關的函數
 def set_output_enabled(enable: bool) -> None:
@@ -156,9 +155,9 @@ def set_output_enabled(enable: bool) -> None:
     _ENABLE_OUTPUT = enable
     
     if enable and not old_value:
-        original_print("已啟用 main_identify_v5 模組的輸出")
+        logger.info("已啟用 main_identify_v5 模組的輸出")
     elif not enable and old_value:
-        original_print("已禁用 main_identify_v5 模組的輸出")
+        logger.info("已禁用 main_identify_v5 模組的輸出")
 
 # 替換原始 print 函數，以實現控制輸出
 print = _print  # 替換全局 print 函數，使模組中的所有 print 調用都經過控制
@@ -313,7 +312,7 @@ class AudioProcessor:
             return self.extract_embedding_from_stream(signal, sr)
 
         except Exception as e:
-            print(f"從檔案提取嵌入向量時發生錯誤: {e}")
+            logger.error(f"從檔案提取嵌入向量時發生錯誤: {e}")
             raise
 
     def extract_embedding_from_stream(self, signal: np.ndarray, sr: int) -> np.ndarray:
@@ -360,7 +359,7 @@ class AudioProcessor:
             return embedding
 
         except Exception as e:
-            print(f"從音訊流提取嵌入向量時發生錯誤: {e}")
+            logger.error(f"從音訊流提取嵌入向量時發生錯誤: {e}")
             raise
 
 
@@ -371,34 +370,34 @@ class WeaviateRepository:
         """初始化 Weaviate 連接（V2版本）"""
         try:
             self.client = weaviate.connect_to_local()
-            print("成功連接到 Weaviate V2 資料庫！")
+            logger.info("成功連接到 Weaviate V2 資料庫！")
             
             # 檢查必要的V2集合是否存在
             if not self.client.collections.exists("VoicePrint") or not self.client.collections.exists("Speaker"):
-                print("警告：Weaviate 中缺少必要的V2集合 (VoicePrint / Speaker)!")
-                print("請先運行 modules/database/init_v2_collections.py 建立所需的V2集合")
-                print("正在嘗試自動初始化V2集合...")
+                logger.warning("警告：Weaviate 中缺少必要的V2集合 (VoicePrint / Speaker)!")
+                logger.info("請先運行 modules/database/init_v2_collections.py 建立所需的V2集合")
+                logger.info("正在嘗試自動初始化V2集合...")
                 
                 # 嘗試自動初始化V2集合
                 try:
                     from modules.database.init_v2_collections import ensure_weaviate_collections
                     if ensure_weaviate_collections():
-                        print("✅ 已自動初始化V2集合！")
+                        logger.info("✅ 已自動初始化V2集合！")
                     else:
-                        print("❌ 自動初始化V2集合失敗！")
+                        logger.error("❌ 自動初始化V2集合失敗！")
                         raise RuntimeError("無法初始化V2集合")
                 except ImportError:
-                    print("無法導入V2集合初始化模組")
-                    print("使用命令 'python -m modules.database.init_v2_collections' 手動初始化V2集合")
+                    logger.error("無法導入V2集合初始化模組")
+                    logger.info("使用命令 'python -m modules.database.init_v2_collections' 手動初始化V2集合")
                     raise
         
         except Exception as e:
-            print(f"無法連接到 Weaviate V2 資料庫：{e}")
-            print("請確認：")
-            print("1. Docker 服務是否正在運行")
-            print("2. Weaviate 容器是否已經啟動")
-            print("3. weaviate_study/docker-compose.yml 中的配置是否正確")
-            print("使用命令 'docker-compose -f weaviate_study/docker-compose.yml up -d' 啟動 Weaviate")
+            logger.error(f"無法連接到 Weaviate V2 資料庫：{e}")
+            logger.info("請確認：")
+            logger.info("1. Docker 服務是否正在運行")
+            logger.info("2. Weaviate 容器是否已經啟動")
+            logger.info("3. weaviate_study/docker-compose.yml 中的配置是否正確")
+            logger.info("使用命令 'docker-compose -f weaviate_study/docker-compose.yml up -d' 啟動 Weaviate")
             raise
     
     def compare_embedding(self, new_embedding: np.ndarray) -> Tuple[Optional[str], Optional[str], float, List[Tuple[str, str, float, int]]]:
@@ -424,7 +423,7 @@ class WeaviateRepository:
             
             # 如果沒有找到任何結果
             if not results.objects:
-                print("資料庫中尚無任何嵌入向量")
+                logger.info("資料庫中尚無任何嵌入向量")
                 return None, None, float('inf'), []
             
             # 處理結果，計算距離
@@ -1020,8 +1019,10 @@ class SpeakerIdentifier:
             verbose: 是否輸出詳細信息，預設為 True
         """
         if verbose:
-            # 直接使用 logger 避免與 _print 函數重複輸出
-            logger.info(message)
+            # 使用帶前綴的 logger
+            prefix = _current_process_prefix.get()
+            message_with_prefix = f"{prefix} {message}" if prefix else message
+            logger.info(message_with_prefix)
 
     # 格式化輸出比對結果
     def format_comparison_result(self, speaker_name: str, update_count: int, distance: float, verbose: bool = True) -> None:
@@ -1036,8 +1037,11 @@ class SpeakerIdentifier:
         """
         if verbose:
             distance_str = f"{distance:.4f}" if distance is not None else "未知"
-            # 直接使用 logger 避免與 _print 函數重複輸出
-            logger.info(f"比對 - 語者: {speaker_name}, 更新次數: {update_count}, 餘弦距離: {distance_str}")
+            # 使用帶前綴的 logger
+            prefix = _current_process_prefix.get()
+            message = f"比對 - 語者: {speaker_name}, 更新次數: {update_count}, 餘弦距離: {distance_str}"
+            message_with_prefix = f"{prefix} {message}" if prefix else message
+            logger.info(message_with_prefix)
 
     # 修改 SpeakerIdentifier 類別中的方法來使用這些函數
     def process_audio_file(self, audio_file: str) -> Optional[Tuple[str, str, float]]:

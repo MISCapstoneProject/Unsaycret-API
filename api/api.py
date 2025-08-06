@@ -6,6 +6,7 @@ Unsaycret API 主要服務入口
 負責處理客戶端請求並委託給相應的業務邏輯處理器。
 """
 from fastapi import FastAPI, Request, UploadFile, File, HTTPException, Form
+from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 from fastapi import WebSocket, WebSocketDisconnect
@@ -46,6 +47,15 @@ def validate_id_parameter(id_value: str, param_name: str = "ID") -> str:
         return id_value
 
 app = FastAPI(title="Unsaycret API")
+
+# 添加 CORS 支援
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # 在生產環境中應該限制為特定域名
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 # 初始化資料存取接口
 data_facade = DataFacade()
@@ -141,12 +151,12 @@ async def health_check():
 # Sessions API - 會議/場次管理
 # ----------------------------------------------------------------------------
 class SessionCreateRequest(BaseModel):
-    session_type: Optional[str] = None
-    title: Optional[str] = None
-    start_time: Optional[str] = None  # ISO 格式字串，預設為當下時間
-    end_time: Optional[str] = None    # ISO 格式字串
-    summary: Optional[str] = None
-    participants: Optional[List[str]] = None  # 語者 UUID 列表
+    session_type: str  # 必填
+    title: str         # 必填
+    # start_time: Optional[str] = None  # 自動從第一個 SpeechLog 設定
+    # end_time: Optional[str] = None    # 自動從最後一個 SpeechLog 設定
+    # summary: Optional[str] = None
+    # participants: Optional[List[str]] = None  # 語者 UUID 列表
 
 class SessionUpdateRequest(BaseModel):
     session_type: Optional[str] = None
@@ -218,6 +228,18 @@ async def delete_session(session_id: str) -> ApiResponse:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"刪除Session時發生內部錯誤: {str(e)}")
+
+@app.post("/sessions/{session_id}/recalculate-timerange", response_model=ApiResponse)
+async def recalculate_session_timerange(session_id: str) -> ApiResponse:
+    """手動重新計算 Session 的時間範圍"""
+    try:
+        session_id = validate_id_parameter(session_id, "Session ID")
+        result = data_facade.recalculate_session_timerange(session_id)
+        return ApiResponse(**result)
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"重新計算時間範圍時發生內部錯誤: {str(e)}")
 
 # ----------------------------------------------------------------------------
 # SpeechLogs API - 語音記錄管理  
@@ -400,48 +422,134 @@ async def ws_stream(ws: WebSocket):
         backend_thread.start()
 
         # -------------- 主收/發 loop -------------- #
+        processing_complete = False
+        
         while True:
-            # 1) 先把後端產生的結果 non-blocking 取出、推給前端
+            # 1) 處理後端產生的結果
             try:
-                seg = result_q.get_nowait()
+                # 使用較短的超時時間，避免阻塞太久
+                seg = result_q.get(timeout=0.1)
+                
                 if seg is None:          # backend 完成
+                    processing_complete = True
+                    logger.info("pipeline 處理完成")
                     break
 
+                logger.info(f"收到 pipeline 結果: segment {seg.get('segment', 'N/A')}")
+
                 # 儲存 SpeechLog 並更新 Session 參與者
+                speechlog_created = False
                 for sp in seg.get("speakers", []):
                     speaker_id = sp.get("speaker_id")
                     if speaker_id:
+                        # 使用語音分離的絕對時間戳
+                        absolute_start_time = sp.get("absolute_start_time")
+                        start_time = seg.get("start", 0)
+                        end_time = seg.get("end", 0)
+                        
                         sl_req = SpeechLogCreateRequest(
                             content=sp.get("text"),
                             confidence=sp.get("confidence"),
-                            duration=(seg.get("end", 0) - seg.get("start", 0)),
+                            timestamp=absolute_start_time,
+                            duration=(end_time - start_time),
                             speaker=speaker_id,
                             session=session_uuid,
                         )
-                        data_facade.create_speechlog(sl_req)
+                        
+                        try:
+                            result = data_facade.create_speechlog(sl_req)
+                            if result.get("success"):
+                                logger.info(f"成功建立 SpeechLog: {speaker_id} - {sp.get('text', 'N/A')}")
+                                speechlog_created = True
+                            else:
+                                logger.error(f"建立 SpeechLog 失敗: {result.get('message')}")
+                        except Exception as e:
+                            logger.error(f"建立 SpeechLog 時發生錯誤: {e}")
 
                         if speaker_id not in session_participants:
                             session_participants.add(speaker_id)
-                            data_facade.update_session(
-                                session_uuid,
-                                {"participants": list(session_participants)},
-                            )
+                            try:
+                                data_facade.update_session(
+                                    session_uuid,
+                                    {"participants": list(session_participants)},
+                                )
+                                logger.info(f"更新 Session 參與者: {speaker_id}")
+                            except Exception as e:
+                                logger.error(f"更新 Session 參與者失敗: {e}")
+
+                if not speechlog_created and seg.get("speakers"):
+                    logger.warning(f"segment {seg.get('segment')} 未能建立任何 SpeechLog")
 
                 await ws.send_text(json.dumps(seg, ensure_ascii=False))
+                
             except queue.Empty:
+                # 佇列為空，檢查是否還有音訊資料要處理
                 pass
+            except Exception as e:
+                logger.error(f"處理 pipeline 結果時發生錯誤: {e}")
 
-            # 2) 再 non-blocking 收前端的音訊
+            # 2) 接收前端的音訊資料
             try:
-                data = await asyncio.wait_for(ws.receive(), timeout=WEBSOCKET_TIMEOUT)
+                data = await asyncio.wait_for(ws.receive(), timeout=0.1)
+                
+                if "bytes" in data:
+                    raw_q.put(data["bytes"])                 # 給後端
+                elif "text" in data and data["text"] == "stop":
+                    logger.info("收到停止信號")
+                    stop_evt.set()
+                    # 不要立即 break，等待 pipeline 完成處理
+                    
             except asyncio.TimeoutError:
+                # 檢查是否應該結束
+                if stop_evt.is_set() and processing_complete:
+                    break
                 continue
-
-            if "bytes" in data:
-                raw_q.put(data["bytes"])                 # 給後端
-            elif "text" in data and data["text"] == "stop":
-                stop_evt.set()
+            except WebSocketDisconnect:
+                logger.info("客戶端主動斷線")
                 break
+            except Exception as e:
+                logger.warning(f"接收訊息時發生錯誤: {e}")
+                break
+                
+        # 確保處理完所有剩餘結果
+        logger.info("主迴圈結束，檢查是否有剩餘結果...")
+        remaining_results = 0
+        try:
+            while True:
+                seg = result_q.get_nowait()
+                if seg is None:
+                    break
+                remaining_results += 1
+                logger.info(f"處理剩餘結果 {remaining_results}: segment {seg.get('segment', 'N/A')}")
+                
+                # 處理剩餘的 SpeechLog
+                for sp in seg.get("speakers", []):
+                    speaker_id = sp.get("speaker_id")
+                    if speaker_id:
+                        absolute_start_time = sp.get("absolute_start_time")
+                        start_time = seg.get("start", 0)
+                        end_time = seg.get("end", 0)
+                        
+                        sl_req = SpeechLogCreateRequest(
+                            content=sp.get("text"),
+                            confidence=sp.get("confidence"),
+                            timestamp=absolute_start_time,
+                            duration=(end_time - start_time),
+                            speaker=speaker_id,
+                            session=session_uuid,
+                        )
+                        
+                        try:
+                            result = data_facade.create_speechlog(sl_req)
+                            if result.get("success"):
+                                logger.info(f"建立剩餘 SpeechLog: {speaker_id} - {sp.get('text', 'N/A')}")
+                        except Exception as e:
+                            logger.error(f"建立剩餘 SpeechLog 時發生錯誤: {e}")
+        except queue.Empty:
+            pass
+        
+        if remaining_results > 0:
+            logger.info(f"處理了 {remaining_results} 個剩餘結果")
 
     except WebSocketDisconnect:
         logger.info("WebSocket客戶端斷線")
@@ -467,6 +575,17 @@ async def ws_stream(ws: WebSocket):
                 result_q.get_nowait()
         except:
             pass
+        
+        # WebSocket 連線結束時自動更新 Session 時間範圍
+        try:
+            logger.info(f"WebSocket 連線結束，開始重新計算 Session {session_uuid} 的時間範圍")
+            result = data_facade.recalculate_session_timerange(session_uuid)
+            if result.get("success"):
+                logger.info(f"Session {session_uuid} 時間範圍更新成功")
+            else:
+                logger.warning(f"Session {session_uuid} 時間範圍更新失敗: {result.get('message')}")
+        except Exception as e:
+            logger.error(f"WebSocket 結束時更新 Session 時間範圍失敗: {e}")
         
         # 關閉WebSocket連接
         try:

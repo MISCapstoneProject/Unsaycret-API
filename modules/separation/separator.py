@@ -334,6 +334,10 @@ class AudioSeparator:
         self.output_files = []  # 儲存分離後的音檔路徑
         self.save_audio_files = True  # 設定: 是否將分離後的音訊儲存為wav檔案
         
+        # 時間追蹤相關變數
+        self.session_start_time = None  # 記錄 session 開始的絕對時間
+        self._current_t0 = 0.0  # 累計相對時間
+        
         # 處理統計
         self.processing_stats = {
             'segments_processed': 0,
@@ -1141,8 +1145,16 @@ class AudioSeparator:
                 logger.info("所有檢測都失敗，預設回傳1")
                 return 1  # 最保險的選擇
 
-    def separate_and_save(self, audio_tensor, output_dir, segment_index):
-        """分離並儲存音訊，並回傳 (path, start, end) 列表。"""
+    def separate_and_save(self, audio_tensor, output_dir, segment_index, absolute_start_time=None):
+        """
+        分離並儲存音訊，並回傳 (path, start, end) 列表。
+        
+        Args:
+            audio_tensor: 音訊張量
+            output_dir: 輸出目錄
+            segment_index: 片段索引
+            absolute_start_time: 音訊的絕對開始時間（datetime 物件）
+        """
         try:
             # 新增：在分離前先偵測說話者數量
             detected_speakers = self.detect_speaker_count(audio_tensor)
@@ -1153,9 +1165,15 @@ class AudioSeparator:
                 logger.info(f"片段 {segment_index} - 未偵測到說話者，跳過處理")
                 return []
             
+            # 記錄絕對時間戳
+            if absolute_start_time is None:
+                from datetime import timezone, timedelta
+                taipei_tz = timezone(timedelta(hours=8))
+                absolute_start_time = datetime.now(taipei_tz)
+            
             # 初始化累計時間戳
             current_t0 = getattr(self, "_current_t0", 0.0)
-            results = []   # 用來收 (path, start, end)
+            results = []   # 用來收 (path, start, end, absolute_timestamp)
             seg_duration = audio_tensor.shape[-1] / TARGET_RATE
             
             with torch.no_grad():
@@ -1251,9 +1269,13 @@ class AudioSeparator:
                                 TARGET_RATE
                             )
 
+                            # 計算絕對時間戳
+                            absolute_timestamp = absolute_start_time.timestamp() + start_time
+
                             results.append((output_file,
                                     start_time,
-                                    start_time + seg_duration))
+                                    start_time + seg_duration,
+                                    absolute_timestamp))  # 加入絕對時間戳
                             self.output_files.append(output_file)
 
                             saved_count += 1

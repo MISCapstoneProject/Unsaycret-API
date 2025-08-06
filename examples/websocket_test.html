@@ -1,0 +1,596 @@
+<!DOCTYPE html>
+<html lang="zh-TW">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Unsaycret WebSocket 測試</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 1200px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #f5f5f5;
+        }
+        .container {
+            background: white;
+            padding: 30px;
+            border-radius: 10px;
+            box-shadow: 0 2px 10px rgba(0,0,0,0.1);
+        }
+        h1 {
+            color: #333;
+            text-align: center;
+            border-bottom: 3px solid #007bff;
+            padding-bottom: 10px;
+        }
+        .section {
+            margin: 20px 0;
+            padding: 20px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            background: #fafafa;
+        }
+        .section h3 {
+            margin-top: 0;
+            color: #007bff;
+        }
+        .form-group {
+            margin: 15px 0;
+        }
+        label {
+            display: block;
+            margin-bottom: 5px;
+            font-weight: bold;
+            color: #555;
+        }
+        input, select, textarea {
+            width: 100%;
+            padding: 10px;
+            border: 1px solid #ddd;
+            border-radius: 4px;
+            font-size: 14px;
+            box-sizing: border-box;
+        }
+        button {
+            background: #007bff;
+            color: white;
+            padding: 12px 24px;
+            border: none;
+            border-radius: 4px;
+            cursor: pointer;
+            font-size: 14px;
+            margin: 5px;
+        }
+        button:hover {
+            background: #0056b3;
+        }
+        button:disabled {
+            background: #6c757d;
+            cursor: not-allowed;
+        }
+        .success {
+            background: #28a745;
+        }
+        .danger {
+            background: #dc3545;
+        }
+        .warning {
+            background: #ffc107;
+            color: #333;
+        }
+        .status {
+            padding: 10px;
+            margin: 10px 0;
+            border-radius: 4px;
+            font-weight: bold;
+        }
+        .status.connected {
+            background: #d4edda;
+            color: #155724;
+            border: 1px solid #c3e6cb;
+        }
+        .status.disconnected {
+            background: #f8d7da;
+            color: #721c24;
+            border: 1px solid #f5c6cb;
+        }
+        .status.connecting {
+            background: #fff3cd;
+            color: #856404;
+            border: 1px solid #ffeaa7;
+        }
+        #log {
+            height: 300px;
+            overflow-y: auto;
+            background: #f8f9fa;
+            padding: 15px;
+            border: 1px solid #dee2e6;
+            border-radius: 4px;
+            font-family: 'Courier New', monospace;
+            font-size: 12px;
+            white-space: pre-wrap;
+        }
+        .responses {
+            max-height: 400px;
+            overflow-y: auto;
+            background: #f8f9fa;
+            padding: 15px;
+            border: 1px solid #dee2e6;
+            border-radius: 4px;
+        }
+        .response-item {
+            background: white;
+            padding: 10px;
+            margin: 10px 0;
+            border-left: 4px solid #007bff;
+            border-radius: 4px;
+        }
+        .speaker-item {
+            background: #e9ecef;
+            padding: 8px;
+            margin: 5px 0;
+            border-radius: 4px;
+        }
+        .file-drop {
+            border: 2px dashed #007bff;
+            padding: 40px;
+            text-align: center;
+            border-radius: 8px;
+            background: #f8f9fa;
+            cursor: pointer;
+            transition: all 0.3s;
+        }
+        .file-drop:hover {
+            background: #e9ecef;
+        }
+        .file-drop.dragover {
+            background: #cce5ff;
+            border-color: #0056b3;
+        }
+        .recording {
+            background: #dc3545 !important;
+            animation: pulse 1.5s infinite;
+        }
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>🎙️ Unsaycret WebSocket 測試工具</h1>
+        
+        <!-- 連線設定 -->
+        <div class="section">
+            <h3>📡 連線設定</h3>
+            <div class="form-group">
+                <label for="wsUrl">WebSocket URL:</label>
+                <input type="text" id="wsUrl" value="ws://localhost:8000/ws/stream">
+            </div>
+            <div class="form-group">
+                <label for="sessionUuid">Session UUID:</label>
+                <input type="text" id="sessionUuid" placeholder="請輸入有效的 Session UUID">
+                <button onclick="createTestSession()">建立測試 Session</button>
+            </div>
+            <div id="connectionStatus" class="status disconnected">🔴 未連線</div>
+            <button id="connectBtn" onclick="toggleConnection()">🔗 連線</button>
+            <button onclick="clearLog()">🧹 清除日誌</button>
+        </div>
+        
+        <!-- 音訊測試 -->
+        <div class="section">
+            <h3>🎵 即時錄音測試</h3>
+            
+            <!-- 麥克風錄音 -->
+            <div class="form-group">
+                <button id="recordBtn" onclick="toggleRecording()">🎤 開始錄音</button>
+                <span id="recordStatus"></span>
+            </div>
+            
+            <button onclick="sendStopSignal()" id="stopBtn" disabled>🛑 停止錄音</button>
+            <button onclick="checkSessionStatus()" id="checkBtn">📊 檢查 Session 狀態</button>
+        </div>
+        
+        <!-- 日誌 -->
+        <div class="section">
+            <h3>📄 連線日誌</h3>
+            <div id="log"></div>
+        </div>
+        
+        <!-- 回應結果 -->
+        <div class="section">
+            <h3>📥 WebSocket 回應</h3>
+            <div id="responses" class="responses"></div>
+        </div>
+    </div>
+
+    <script>
+        let ws = null;
+        let isConnected = false;
+        let audioContext = null;
+        let processor = null;
+        let isRecording = false;
+        let audioStream = null;
+        let audioDataSent = 0;  // 追蹤已發送的音訊資料量
+
+        // 更新連線狀態
+        function updateConnectionStatus(status, message) {
+            const statusEl = document.getElementById('connectionStatus');
+            const connectBtn = document.getElementById('connectBtn');
+            const recordBtn = document.getElementById('recordBtn');
+            const stopBtn = document.getElementById('stopBtn');
+            
+            statusEl.className = `status ${status}`;
+            
+            switch(status) {
+                case 'connected':
+                    statusEl.textContent = `🟢 已連線 - ${message}`;
+                    connectBtn.textContent = '🔌 斷線';
+                    recordBtn.disabled = false;
+                    stopBtn.disabled = false;
+                    break;
+                case 'connecting':
+                    statusEl.textContent = `🟡 連線中... - ${message}`;
+                    connectBtn.disabled = true;
+                    recordBtn.disabled = true;
+                    stopBtn.disabled = true;
+                    break;
+                case 'disconnected':
+                default:
+                    statusEl.textContent = `🔴 未連線 - ${message}`;
+                    connectBtn.textContent = '🔗 連線';
+                    connectBtn.disabled = false;
+                    recordBtn.disabled = true;
+                    stopBtn.disabled = true;
+                    break;
+            }
+        }
+
+        // 日誌記錄
+        function log(message, type = 'info') {
+            const logEl = document.getElementById('log');
+            const timestamp = new Date().toLocaleTimeString();
+            const prefix = type === 'error' ? '❌' : type === 'success' ? '✅' : type === 'warning' ? '⚠️' : 'ℹ️';
+            logEl.textContent += `[${timestamp}] ${prefix} ${message}\n`;
+            logEl.scrollTop = logEl.scrollHeight;
+        }
+
+        // 清除日誌
+        function clearLog() {
+            document.getElementById('log').textContent = '';
+            document.getElementById('responses').innerHTML = '';
+        }
+
+        // 建立測試 Session
+        async function createTestSession() {
+            try {
+                const response = await fetch('http://localhost:8000/sessions', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json'
+                    },
+                    body: JSON.stringify({
+                        session_type: 'test',
+                        title: '瀏覽器 WebSocket 測試',
+                        summary: '使用瀏覽器介面測試 WebSocket 功能'
+                    })
+                });
+                
+                const result = await response.json();
+                if (result.success) {
+                    const uuid = result.data.uuid;
+                    document.getElementById('sessionUuid').value = uuid;
+                    log(`成功建立測試 Session: ${uuid}`, 'success');
+                } else {
+                    log(`建立 Session 失敗: ${result.message}`, 'error');
+                }
+            } catch (error) {
+                log(`建立 Session 錯誤: ${error.message}`, 'error');
+            }
+        }
+
+        // 切換連線
+        function toggleConnection() {
+            if (isConnected) {
+                disconnect();
+            } else {
+                connect();
+            }
+        }
+
+        // 連線到 WebSocket
+        function connect() {
+            const wsUrl = document.getElementById('wsUrl').value;
+            const sessionUuid = document.getElementById('sessionUuid').value;
+            
+            if (!sessionUuid) {
+                log('請先輸入 Session UUID', 'error');
+                return;
+            }
+            
+            const fullUrl = `${wsUrl}?session=${sessionUuid}`;
+            updateConnectionStatus('connecting', '建立連線中...');
+            log(`嘗試連線到: ${fullUrl}`);
+            
+            try {
+                ws = new WebSocket(fullUrl);
+                
+                ws.onopen = function() {
+                    isConnected = true;
+                    updateConnectionStatus('connected', sessionUuid.substring(0, 8) + '...');
+                    log('WebSocket 連線成功', 'success');
+                };
+                
+                ws.onmessage = function(event) {
+                    try {
+                        const data = JSON.parse(event.data);
+                        log(`收到回應: Segment ${data.segment || 'N/A'}`);
+                        displayResponse(data);
+                    } catch (error) {
+                        log(`解析回應錯誤: ${error.message}`, 'error');
+                        log(`原始資料: ${event.data}`);
+                    }
+                };
+                
+                ws.onclose = function(event) {
+                    isConnected = false;
+                    if (event.code === 1008) {
+                        updateConnectionStatus('disconnected', 'Session UUID 無效');
+                        log('連線被拒絕: Session UUID 無效', 'error');
+                    } else {
+                        updateConnectionStatus('disconnected', `關閉代碼: ${event.code}`);
+                        log(`WebSocket 連線關閉: ${event.code} - ${event.reason}`, 'warning');
+                    }
+                    
+                    // 連線關閉後自動檢查 Session 狀態
+                    setTimeout(() => {
+                        log('連線已關閉，檢查 Session 狀態...', 'info');
+                        checkSessionStatus();
+                    }, 2000);
+                };
+                
+                ws.onerror = function(error) {
+                    log(`WebSocket 錯誤: ${error}`, 'error');
+                    updateConnectionStatus('disconnected', '連線錯誤');
+                };
+                
+            } catch (error) {
+                log(`建立連線失敗: ${error.message}`, 'error');
+                updateConnectionStatus('disconnected', '連線失敗');
+            }
+        }
+
+        // 斷線
+        function disconnect() {
+            // 停止錄音
+            if (isRecording) {
+                stopRecording();
+            }
+            
+            if (ws) {
+                ws.close();
+                ws = null;
+            }
+            isConnected = false;
+            updateConnectionStatus('disconnected', '手動斷線');
+            log('已斷線', 'warning');
+        }
+
+        // 顯示回應
+        function displayResponse(data) {
+            const responsesEl = document.getElementById('responses');
+            const responseDiv = document.createElement('div');
+            responseDiv.className = 'response-item';
+            
+            let html = `
+                <strong>Segment ${data.segment || 'N/A'}</strong>
+                <br>時間: ${data.start || 'N/A'}s - ${data.end || 'N/A'}s
+                <br>語者數量: ${(data.speakers || []).length}
+            `;
+            
+            if (data.speakers && data.speakers.length > 0) {
+                html += '<br><br><strong>語者詳情:</strong>';
+                data.speakers.forEach((speaker, index) => {
+                    html += `
+                        <div class="speaker-item">
+                            <strong>語者 ${index + 1}:</strong> ${speaker.speaker_id || 'N/A'}<br>
+                            <strong>文字:</strong> "${speaker.text || 'N/A'}"<br>
+                            <strong>信心值:</strong> ${(speaker.confidence * 100).toFixed(1)}%<br>
+                            ${speaker.absolute_start_time ? `<strong>絕對時間:</strong> ${speaker.absolute_start_time}<br>` : ''}
+                        </div>
+                    `;
+                });
+            }
+            
+            responseDiv.innerHTML = html;
+            responsesEl.insertBefore(responseDiv, responsesEl.firstChild);
+            
+            // 限制顯示數量
+            while (responsesEl.children.length > 10) {
+                responsesEl.removeChild(responsesEl.lastChild);
+            }
+        }
+
+        // 即時錄音功能
+        async function toggleRecording() {
+            if (!isConnected) {
+                log('請先連線到 WebSocket', 'error');
+                return;
+            }
+
+            if (isRecording) {
+                stopRecording();
+            } else {
+                await startRecording();
+            }
+        }
+
+        async function startRecording() {
+            try {
+                // 請求麥克風權限
+                audioStream = await navigator.mediaDevices.getUserMedia({
+                    audio: {
+                        sampleRate: 16000,
+                        channelCount: 1,
+                        echoCancellation: true,
+                        noiseSuppression: true
+                    }
+                });
+
+                log('已獲得麥克風權限，設定音訊處理...', 'success');
+
+                // 創建 AudioContext 處理音訊
+                audioContext = new (window.AudioContext || window.webkitAudioContext)({
+                    sampleRate: 16000
+                });
+
+                const source = audioContext.createMediaStreamSource(audioStream);
+                
+                // 創建 ScriptProcessor 或 AudioWorklet 處理音訊
+                if (audioContext.createScriptProcessor) {
+                    // 使用 ScriptProcessor (較舊但相容性好)
+                    processor = audioContext.createScriptProcessor(4096, 1, 1);
+                    
+                    processor.onaudioprocess = function(event) {
+                        if (!isRecording || !isConnected || !ws) return;
+                        
+                        const inputData = event.inputBuffer.getChannelData(0);
+                        
+                        // 簡單音量檢測
+                        let sum = 0;
+                        for (let i = 0; i < inputData.length; i++) {
+                            sum += Math.abs(inputData[i]);
+                        }
+                        const avgVolume = sum / inputData.length;
+                        
+                        // 轉換為 16-bit PCM
+                        const pcmData = new Int16Array(inputData.length);
+                        for (let i = 0; i < inputData.length; i++) {
+                            // 將 float32 (-1 to 1) 轉換為 int16 (-32768 to 32767)
+                            pcmData[i] = Math.max(-32768, Math.min(32767, inputData[i] * 32768));
+                        }
+                        
+                        // 發送 PCM 資料
+                        ws.send(pcmData.buffer);
+                        audioDataSent += pcmData.buffer.byteLength;
+                        
+                        // 每10次只顯示一次日誌，並顯示音量
+                        if (audioDataSent % (8192 * 10) === 0) {
+                            log(`音訊資料: ${(audioDataSent / 1024).toFixed(0)}KB，音量: ${(avgVolume * 100).toFixed(1)}%`);
+                        }
+                    };
+                    
+                    source.connect(processor);
+                    processor.connect(audioContext.destination);
+                }
+
+                isRecording = true;
+
+                // 更新UI
+                const recordBtn = document.getElementById('recordBtn');
+                const recordStatus = document.getElementById('recordStatus');
+                recordBtn.textContent = '🛑 停止錄音';
+                recordBtn.classList.add('recording');
+                recordStatus.textContent = '🔴 錄音中...';
+
+                log('開始即時錄音 (PCM 16kHz)', 'success');
+
+            } catch (error) {
+                log(`無法啟動錄音: ${error.message}`, 'error');
+                if (error.name === 'NotAllowedError') {
+                    log('請允許瀏覽器存取麥克風', 'error');
+                } else if (error.name === 'NotFoundError') {
+                    log('找不到麥克風設備', 'error');
+                }
+            }
+        }
+
+        function stopRecording() {
+            if (isRecording) {
+                isRecording = false;
+                log(`停止錄音，總共發送 ${(audioDataSent / 1024).toFixed(0)}KB 音訊資料`, 'warning');
+                audioDataSent = 0;  // 重置計數
+            }
+
+            if (processor) {
+                processor.disconnect();
+                processor = null;
+            }
+
+            if (audioContext) {
+                audioContext.close();
+                audioContext = null;
+            }
+
+            if (audioStream) {
+                audioStream.getTracks().forEach(track => track.stop());
+                audioStream = null;
+            }
+
+            // 更新UI
+            const recordBtn = document.getElementById('recordBtn');
+            const recordStatus = document.getElementById('recordStatus');
+            recordBtn.textContent = '🎤 開始錄音';
+            recordBtn.classList.remove('recording');
+            recordStatus.textContent = '';
+        }
+
+        // 發送停止信號
+        function sendStopSignal() {
+            stopRecording();
+            
+            if (isConnected && ws) {
+                ws.send('stop');
+                log('發送停止信號', 'warning');
+            }
+        }
+
+        // 檢查 Session 狀態
+        async function checkSessionStatus() {
+            const sessionUuid = document.getElementById('sessionUuid').value;
+            if (!sessionUuid) {
+                log('請先輸入 Session UUID', 'error');
+                return;
+            }
+
+            try {
+                // 檢查 Session 資訊
+                const sessionResponse = await fetch(`http://localhost:8000/sessions/${sessionUuid}`);
+                const sessionData = await sessionResponse.json();
+                
+                log('=== Session 狀態檢查 ===', 'info');
+                log(`Session ID: ${sessionData.session_id || 'N/A'}`, 'info');
+                log(`標題: ${sessionData.title || 'N/A'}`, 'info');
+                log(`開始時間: ${sessionData.start_time || 'N/A'}`, 'info');
+                log(`結束時間: ${sessionData.end_time || 'N/A'}`, 'info');
+                log(`參與者數量: ${(sessionData.participants || []).length}`, 'info');
+
+                // 檢查 SpeechLog
+                const speechlogResponse = await fetch(`http://localhost:8000/sessions/${sessionUuid}/speechlogs`);
+                const speechlogData = await speechlogResponse.json();
+                
+                log(`SpeechLog 數量: ${speechlogData.length || 0}`, 'info');
+                
+                if (speechlogData.length > 0) {
+                    speechlogData.forEach((log, index) => {
+                        log(`  ${index + 1}. [${log.timestamp || 'N/A'}] ${log.content || 'N/A'} (${log.duration || 'N/A'}s)`, 'info');
+                    });
+                }
+                
+                log('=== 檢查完成 ===', 'success');
+                
+            } catch (error) {
+                log(`檢查 Session 狀態失敗: ${error.message}`, 'error');
+            }
+        }
+
+        // 初始化
+        updateConnectionStatus('disconnected', '等待連線');
+        log('WebSocket 即時錄音測試工具已準備就緒');
+        log('注意: 需要 HTTPS 或 localhost 才能使用麥克風功能', 'warning');
+    </script>
+</body>
+</html>
