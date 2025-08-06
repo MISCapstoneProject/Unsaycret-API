@@ -39,9 +39,7 @@ def validate_id_parameter(id_value: str, param_name: str = "ID") -> str:
     if not id_value or not id_value.strip():
         raise HTTPException(status_code=400, detail=f"{param_name}參數不能為空")
     
-    uuid_pattern = r'^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$'
-    
-    if re.match(uuid_pattern, id_value):
+    if re.match(UUID_PATTERN, id_value):
         return id_value
     else:
         # 非標準UUID格式，原樣返回以便後續處理

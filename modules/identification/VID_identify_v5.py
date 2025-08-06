@@ -105,9 +105,15 @@ from typing import Tuple, List, Dict, Optional, Union, Any
 import weaviate  # type: ignore
 from weaviate.classes.query import MetadataQuery # type: ignore
 from weaviate.classes.query import QueryReference # type: ignore
+from contextvars import ContextVar
+from itertools import count
+from utils.path_utils import format_process_prefix
 
 # 控制輸出的全局變數
 _ENABLE_OUTPUT =True  # 預設為 True，即輸出詳細訊息
+# 用於標記每次處理流程的前綴
+_current_process_prefix: ContextVar[str] = ContextVar("current_process_prefix", default="")
+_process_counter = count(1)
 
 # 保存原始 print 函數的引用
 original_print = print
@@ -130,8 +136,12 @@ def _print(*args, **kwargs) -> None:
     if _ENABLE_OUTPUT:
         # 將多個參數轉換為單個字符串
         message = " ".join(str(arg) for arg in args)
+        prefix = _current_process_prefix.get()
+        if prefix:
+            message = f"{prefix} {message}"
         logger.info(message)
-        # 移除重複的直接輸出，避免雙重顯示
+        # 保留對終端的直接輸出以保持兼容性
+        original_print(message, **kwargs)
 
 # 設置輸出開關的函數
 def set_output_enabled(enable: bool) -> None:
@@ -1040,7 +1050,11 @@ class SpeakerIdentifier:
         Returns:
             Optional[Tuple[str, str, float]]: (語者ID, 語者名稱, 相似度) 或 None 表示處理失敗
         """
+        token = None
         try:
+            process_id = next(_process_counter)
+            prefix = format_process_prefix(process_id, audio_file)
+            token = _current_process_prefix.set(prefix)
             self.simplified_print(f"\n處理音檔: {audio_file}", self.verbose)
             if not os.path.exists(audio_file):
                 self.simplified_print(f"音檔 {audio_file} 不存在，取消處理。", self.verbose)
@@ -1051,12 +1065,15 @@ class SpeakerIdentifier:
 
             # 直接使用完整路徑，統一轉換為正斜線格式
             audio_source = audio_file.replace('\\', '/')
-            
+
             return self.process_audio_stream(signal, sr, audio_source=audio_source)
 
         except Exception as e:
             self.simplified_print(f"處理音檔 {audio_file} 時發生錯誤: {e}", self.verbose)
             return None
+        finally:
+            if token:
+                _current_process_prefix.reset(token)
 
     def process_audio_stream(self, signal: np.ndarray, sr: int, audio_source: str = "無", timestamp: Optional[datetime] = None) -> Optional[Tuple[str, str, float]]:
         """
@@ -1071,7 +1088,12 @@ class SpeakerIdentifier:
         Returns:
             Optional[Tuple[str, str, float]]: (語者ID, 語者名稱, 相似度) 或 None 表示處理失敗
         """
+        token = None
         try:
+            if not _current_process_prefix.get():
+                process_id = next(_process_counter)
+                prefix = format_process_prefix(process_id, audio_source)
+                token = _current_process_prefix.set(prefix)
             self.simplified_print(f"\n處理來源: {audio_source}", self.verbose)
 
             # 提取嵌入向量
@@ -1108,6 +1130,9 @@ class SpeakerIdentifier:
         except Exception as e:
             self.simplified_print(f"處理音訊流 '{audio_source}' 時發生錯誤: {e}", self.verbose)
             return None
+        finally:
+            if token:
+                _current_process_prefix.reset(token)
 
     def process_audio_directory(self, directory: str) -> Dict[str, Any]:
         """

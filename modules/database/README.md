@@ -99,10 +99,10 @@ docker-compose up -d
 {
     "session_id": str,           # 會議/對話ID
     "session_type": str,         # 會議類型
-    "title": str,               # 會議標題 (支援語意搜尋)
+    "title": str,               # 會議標題 
     "start_time": datetime,      # 開始時間
     "end_time": datetime,        # 結束時間
-    "summary": str,              # 會議摘要 (支援語意搜尋)
+    "summary": str,              # 會議摘要 
     "participants": Reference[]  # 參與語者列表 (關聯到Speaker)
 }
 ```
@@ -110,7 +110,7 @@ docker-compose up -d
 ### SpeechLog 集合
 ```python
 {
-    "content": str,              # 語音轉錄文字 (支援語意搜尋)
+    "content": str,              # 語音轉錄文字 
     "timestamp": datetime,       # 發言時間戳
     "confidence": float,         # ASR 信心值
     "duration": float,           # 語音長度(秒)

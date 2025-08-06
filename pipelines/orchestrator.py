@@ -2,13 +2,16 @@ import argparse
 import json
 import os
 import pathlib
-import tempfile
 import threading
 import time
 import queue
 from pathlib import Path
 from datetime import datetime as dt
 from concurrent.futures import ThreadPoolExecutor, Future
+
+# 修復 SVML 錯誤：在導入 PyTorch 之前設定環境變數
+os.environ["MKL_DISABLE_FAST_MM"] = "1"
+os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 import torch
 import torchaudio
@@ -21,10 +24,6 @@ from modules.separation.separator import AudioSeparator
 from modules.identification.VID_identify_v5 import SpeakerIdentifier
 from modules.asr.whisper_asr import WhisperASR
 from modules.asr.text_utils import compute_cer, compute_wer
-
-# 修復 SVML 錯誤：在導入 PyTorch 之前設定環境變數
-os.environ["MKL_DISABLE_FAST_MM"] = "1"
-os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 
 logger = get_logger(__name__)
 
@@ -115,7 +114,6 @@ def process_segment(seg_path: str, t0: float, t1: float) -> dict:
 
 
 def make_pretty(seg: dict) -> dict:
-    """Convert a segment dict to human friendly format."""
     """Convert a segment dict to human friendly format."""
     return {
         "time": f"{seg['start']:.2f}s → {seg['end']:.2f}s",
