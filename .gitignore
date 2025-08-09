@@ -35,3 +35,6 @@ unsaycret_venv
 # VS Code 設定
 .vscode/
 .github
+
+# 垃圾
+.DS_Store

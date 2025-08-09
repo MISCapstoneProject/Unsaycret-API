@@ -144,6 +144,9 @@ def get_env_str(key: str, default: str = "") -> str:
     """
     return os.getenv(key, default)
 
+# Hugging Face 配置 (從環境變數讀取)
+HF_ACCESS_TOKEN = get_env_str('HF_ACCESS_TOKEN', '')
+
 # API 服務配置 (從環境變數讀取)
 API_HOST = get_env_str('API_HOST', '0.0.0.0')
 API_PORT = get_env_int('API_PORT', 8000)

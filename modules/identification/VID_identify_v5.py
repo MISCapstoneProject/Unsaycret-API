@@ -193,8 +193,8 @@ logging.getLogger("speechbrain").setLevel(logging.ERROR)
 
 # 導入日誌模組
 from utils.logger import get_logger
-from utils.env_config import WEAVIATE_HOST, WEAVIATE_PORT, get_model_save_dir
-from utils.constants import THRESHOLD_LOW, THRESHOLD_UPDATE, THRESHOLD_NEW, SPEECHBRAIN_SPEAKER_MODEL, AUDIO_TARGET_RATE
+from utils.env_config import WEAVIATE_HOST, WEAVIATE_PORT, get_model_save_dir, HF_ACCESS_TOKEN
+from utils.constants import THRESHOLD_LOW, THRESHOLD_UPDATE, THRESHOLD_NEW, SPEECHBRAIN_SPEAKER_MODEL,PYANNOTE_SPEAKER_MODEL, AUDIO_TARGET_RATE
 
 # 創建模組專屬日誌器
 logger = get_logger(__name__)
@@ -209,67 +209,92 @@ DEFAULT_FULL_NAME_PREFIX = "n"  # V2版本：預設full_name前綴
 
 class AudioProcessor:
     """音訊處理類別，負責音訊處理和嵌入向量提取"""
-    
+
     def __init__(self) -> None:
-        """初始化 SpeechBrain 模型"""
-        try:
-            import os
-            import shutil
-            
-            # 檢查本地模型目錄是否包含無效的符號連結
-            local_model_path = get_model_save_dir("speechbrain_recognition")
-            if os.path.exists(local_model_path):
-                logger.info(f"檢查本地語者識別模型路徑: {local_model_path}")
-                
-                # 檢查是否有無效的符號連結 (Windows JUNCTION 指向 Linux 路徑)
-                hyperparams_file = os.path.join(local_model_path, "hyperparams.yaml")
-                if os.path.exists(hyperparams_file):
-                    try:
-                        # 測試檔案讀取權限
-                        with open(hyperparams_file, 'r', encoding='utf-8') as f:
-                            content = f.read(100)  # 讀取前100個字符來測試
-                        logger.info("本地語者識別模型檔案可正常讀取")
-                    except (PermissionError, OSError, UnicodeDecodeError) as e:
-                        logger.warning(f"本地語者識別模型檔案無法讀取: {e}")
-                        logger.info("檢測到無效的符號連結，需要重新下載模型...")
-                        
-                        # 刪除包含無效符號連結的目錄
-                        try:
-                            shutil.rmtree(local_model_path, ignore_errors=True)
-                            logger.info(f"已刪除無效的語者識別模型目錄: {local_model_path}")
-                        except Exception as rm_error:
-                            logger.warning(f"刪除語者識別模型目錄時出現問題: {rm_error}")
-            
+        """
+        初始化模型
+        想切換模型時，直接改下面的 self.model_type
+        可選值: "speechbrain" 或 "pyannote"
+        """
+        # ====== 這裡改模型類型 ======
+        self.model_type = "pyannote"
+        # =========================
+
+        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        if self.model_type == "speechbrain":
+            from speechbrain.inference import SpeakerRecognition
             self.model = SpeakerRecognition.from_hparams(
                 source=SPEECHBRAIN_SPEAKER_MODEL,
                 savedir=get_model_save_dir("speechbrain_recognition")
             )
-            logger.info("SpeechBrain 語者識別模型加載成功！")
-        except ImportError as e:
-            logger.error(f"SpeechBrain 未正確安裝: {e}")
-            logger.error("請運行: pip install speechbrain")
-            raise
-        except Exception as e:
-            logger.error(f"載入 SpeechBrain 模型時發生錯誤: {e}")
-            
-            # 如果載入失敗，嘗試強制重新下載
-            try:
-                logger.info("嘗試強制重新下載語者識別模型...")
-                import os
-                import shutil
-                local_model_path = get_model_save_dir("speechbrain_recognition")
-                if os.path.exists(local_model_path):
-                    shutil.rmtree(local_model_path, ignore_errors=True)
-                    logger.info("已清除本地語者識別模型快取")
+            logger.info("已載入 SpeechBrain ECAPA-TDNN 模型")
+
+        elif self.model_type == "pyannote":
+            from pyannote.audio import Inference
+            from pyannote.core import Segment
+            # ⚠️ .env 檔案中必須設定 HF_ACCESS_TOKEN
+            hf_token = HF_ACCESS_TOKEN
+            self.model = Inference(PYANNOTE_SPEAKER_MODEL, window="whole", use_auth_token=hf_token)
+            self.Segment = Segment  # 保存 Segment 類別以便後續使用
+            logger.info("已載入 pyannote/embedding 模型 (使用 Inference)")
+
+        else:
+            raise ValueError(f"不支援的模型類型: {self.model_type}")
+
+    def resample_audio(self, signal: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+        """使用 scipy 進行高品質重新採樣"""
+        return resample_poly(signal, target_sr, orig_sr)
+
+    def extract_embedding_from_stream(self, signal: np.ndarray, sr: int) -> np.ndarray:
+        """從音訊流提取嵌入向量"""
+        try:
+            if not isinstance(signal, np.ndarray):
+                signal = np.array(signal)
+            if signal.ndim > 1:
+                signal = signal.mean(axis=1)
+
+            target_sr = AUDIO_TARGET_RATE
+            if sr != target_sr:
+                signal = self.resample_audio(signal, sr, target_sr)
+
+            signal_tensor = torch.tensor(signal, dtype=torch.float32).unsqueeze(0).to(self.device)
+
+            if self.model_type == "speechbrain":
+                embedding = self.model.encode_batch(signal_tensor).squeeze().cpu().numpy()
+
+            elif self.model_type == "pyannote":
+                # pyannote 的 Inference 需要從文件中讀取，所以我們需要創建臨時文件
+                import tempfile
+                import soundfile as sf
                 
-                self.model = SpeakerRecognition.from_hparams(
-                    source=SPEECHBRAIN_SPEAKER_MODEL,
-                    savedir=get_model_save_dir("speechbrain_recognition")
-                )
-                logger.info("強制重新下載後語者識別模型載入成功")
-            except Exception as final_error:
-                logger.error(f"所有嘗試都失敗了: {final_error}")
-                raise Exception(f"語者識別模型載入完全失敗。請檢查網路連接和模型可用性。原始錯誤: {e}")
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+                    temp_path = temp_file.name
+                    # 將信號寫入臨時文件
+                    sf.write(temp_path, signal, target_sr)
+                
+                try:
+                    # 創建涵蓋整個音頻的 Segment
+                    duration = len(signal) / target_sr
+                    segment = self.Segment(0, duration)
+                    
+                    # 使用 crop 方法提取嵌入向量
+                    embedding = self.model.crop(temp_path, segment)
+                    # embedding 已經是 numpy array，形狀為 (1, D)
+                    embedding = embedding.squeeze()  # 移除第一維
+                    embedding = embedding / np.linalg.norm(embedding)  # 正規化
+                finally:
+                    # 清理臨時文件
+                    import os
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
+
+            return embedding
+
+        except Exception as e:
+            logger.error(f"提取嵌入向量時發生錯誤: {e}")
+            raise
+
     
     def resample_audio(self, signal: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
         """
@@ -302,64 +327,62 @@ class AudioProcessor:
             4. 其他取樣率，則重新採樣到 16kHz
         """
         try:
-            signal, sr = sf.read(audio_path)
+            # 對於 pyannote 模型，直接使用文件路徑更高效
+            if self.model_type == "pyannote":
+                # 獲取音頻文件信息
+                signal, sr = sf.read(audio_path)
+                
+                # 處理立體聲轉單聲道並重採樣（如果需要）
+                if signal.ndim > 1:
+                    signal = signal.mean(axis=1)
+                
+                target_sr = AUDIO_TARGET_RATE
+                if sr != target_sr:
+                    signal = self.resample_audio(signal, sr, target_sr)
+                    
+                    # 創建重採樣後的臨時文件
+                    import tempfile
+                    with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+                        temp_path = temp_file.name
+                        sf.write(temp_path, signal, target_sr)
+                    
+                    try:
+                        # 創建涵蓋整個音頻的 Segment
+                        duration = len(signal) / target_sr
+                        segment = self.Segment(0, duration)
+                        
+                        # 使用 crop 方法提取嵌入向量
+                        embedding = self.model.crop(temp_path, segment)
+                        embedding = embedding.squeeze()  # 移除第一維
+                        embedding = embedding / np.linalg.norm(embedding)  # 正規化
+                    finally:
+                        # 清理臨時文件
+                        import os
+                        if os.path.exists(temp_path):
+                            os.unlink(temp_path)
+                else:
+                    # 如果取樣率已經正確，直接使用原文件
+                    duration = len(signal) / sr
+                    segment = self.Segment(0, duration)
+                    embedding = self.model.crop(audio_path, segment)
+                    embedding = embedding.squeeze()
+                    embedding = embedding / np.linalg.norm(embedding)
+                
+                return embedding
+            
+            else:
+                # 對於其他模型（如 speechbrain），使用原有的流程
+                signal, sr = sf.read(audio_path)
 
-            # 處理立體聲轉單聲道
-            if signal.ndim > 1:
-                signal = signal.mean(axis=1)
+                # 處理立體聲轉單聲道
+                if signal.ndim > 1:
+                    signal = signal.mean(axis=1)
 
-            # 使用新的 stream 方法處理核心邏輯
-            return self.extract_embedding_from_stream(signal, sr)
+                # 使用新的 stream 方法處理核心邏輯
+                return self.extract_embedding_from_stream(signal, sr)
 
         except Exception as e:
             logger.error(f"從檔案提取嵌入向量時發生錯誤: {e}")
-            raise
-
-    def extract_embedding_from_stream(self, signal: np.ndarray, sr: int) -> np.ndarray:
-        """
-        從音訊流 (NumPy 陣列) 提取嵌入向量
-
-        Args:
-            signal: 音訊信號 (NumPy 陣列)
-            sr: 音訊信號的取樣率
-
-        Returns:
-            np.ndarray: 音檔的嵌入向量
-        """
-        try:
-            # 確保信號是 NumPy 陣列
-            if not isinstance(signal, np.ndarray):
-                signal = np.array(signal) # 嘗試轉換
-
-            # 處理立體聲轉單聲道 (如果需要)
-            if signal.ndim > 1:
-                signal = signal.mean(axis=1)
-
-            # 根據取樣率處理
-            target_sr = AUDIO_TARGET_RATE
-            if sr == target_sr:
-                signal_16k = signal
-            elif sr != target_sr:
-                # 重新採樣到 16kHz
-                signal_16k = self.resample_audio(signal, sr, target_sr)
-            # else: # 移除多餘的 else，因為 sr == target_sr 的情況已處理
-            #      # 已經是 16kHz
-            #      signal_16k = signal
-
-            # 轉換為 PyTorch 張量
-            signal_16k_tensor = torch.tensor(signal_16k, dtype=torch.float32).unsqueeze(0)
-
-            # 限制音檔長度（最多 10 秒）
-            max_length = target_sr * 10
-            if signal_16k_tensor.shape[1] > max_length:
-                signal_16k_tensor = signal_16k_tensor[:, :max_length]
-
-            # 提取嵌入向量
-            embedding = self.model.encode_batch(signal_16k_tensor).squeeze().numpy()
-            return embedding
-
-        except Exception as e:
-            logger.error(f"從音訊流提取嵌入向量時發生錯誤: {e}")
             raise
 
 
@@ -440,7 +463,7 @@ class WeaviateRepository:
                     distance = -1  # 使用預設值
                     print(f"警告：無法從結果中獲取距離信息，使用預設值 {distance}")
                 
-                object_id = obj.uuid
+                object_id = str(obj.uuid)  # 確保 UUID 是字符串格式
                 speaker_name = obj.properties.get("speaker_name")
                 update_count = obj.properties.get("update_count")  # 恢復使用update_count
                 
@@ -955,7 +978,7 @@ class SpeakerIdentifier:
             refs = voice_print_obj.references.get("speaker", []).objects
             if not refs:
                 raise ValueError(f"聲紋向量 {voice_print_id} 沒有對應的語者參考")
-            return refs[0].uuid
+            return str(refs[0].uuid)  # 確保返回字符串而非 Weaviate UUID 對象
         except Exception as e:
             print(f"獲取語者ID時發生錯誤: {e}")
             raise

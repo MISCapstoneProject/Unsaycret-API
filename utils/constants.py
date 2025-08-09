@@ -20,7 +20,9 @@ DEFAULT_WHISPER_BEAM_SIZE = 5
 DEFAULT_SEPARATION_MODEL = "sepformer_2speaker"
 
 # 模型名稱常數 (固定的 HuggingFace 模型ID)
+
 SPEECHBRAIN_SPEAKER_MODEL = "speechbrain/spkrec-ecapa-voxceleb"
+PYANNOTE_SPEAKER_MODEL = "pyannote/embedding"
 SPEECHBRAIN_SEPARATOR_MODEL = "speechbrain/sepformer-whamr16k"
 
 # Whisper 模型對照表
