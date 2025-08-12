@@ -219,6 +219,12 @@ class AudioProcessor:
         # ====== 這裡改模型類型 ======
         self.model_type = "pyannote"
         # =========================
+        
+        # ====== pyannote 滑窗設定 ======
+        self.use_sliding_window = False  # True: 使用滑窗模式, False: 處理整個音頻
+        self.window_duration = 2.0       # 滑窗持續時間（秒）
+        self.window_step = 1.0           # 滑動步長（秒）
+        # =============================
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
@@ -235,9 +241,22 @@ class AudioProcessor:
             from pyannote.core import Segment
             # ⚠️ .env 檔案中必須設定 HF_ACCESS_TOKEN
             hf_token = HF_ACCESS_TOKEN
-            self.model = Inference(PYANNOTE_SPEAKER_MODEL, window="whole", use_auth_token=hf_token)
+            
+            # 根據滑窗設定配置模型
+            if self.use_sliding_window:
+                self.model = Inference(
+                    PYANNOTE_SPEAKER_MODEL, 
+                    window="sliding",
+                    duration=self.window_duration,
+                    step=self.window_step,
+                    use_auth_token=hf_token
+                )
+                logger.info(f"已載入 pyannote/embedding 模型 (滑窗模式: duration={self.window_duration}s, step={self.window_step}s)")
+            else:
+                self.model = Inference(PYANNOTE_SPEAKER_MODEL, window="whole", use_auth_token=hf_token)
+                logger.info("已載入 pyannote/embedding 模型 (整個音頻模式)")
+            
             self.Segment = Segment  # 保存 Segment 類別以便後續使用
-            logger.info("已載入 pyannote/embedding 模型 (使用 Inference)")
 
         else:
             raise ValueError(f"不支援的模型類型: {self.model_type}")
@@ -274,15 +293,21 @@ class AudioProcessor:
                     sf.write(temp_path, signal, target_sr)
                 
                 try:
-                    # 創建涵蓋整個音頻的 Segment
-                    duration = len(signal) / target_sr
-                    segment = self.Segment(0, duration)
-                    
-                    # 使用 crop 方法提取嵌入向量
-                    embedding = self.model.crop(temp_path, segment)
-                    # embedding 已經是 numpy array，形狀為 (1, D)
-                    embedding = embedding.squeeze()  # 移除第一維
-                    embedding = embedding / np.linalg.norm(embedding)  # 正規化
+                    if self.use_sliding_window:
+                        # 滑窗模式：直接使用 inference 處理整個文件
+                        embeddings = self.model(temp_path)
+                        # embeddings 是 SlidingWindowFeature，包含多個嵌入向量
+                        # 轉換為 numpy array 並計算平均值
+                        embedding_array = np.array([embeddings[i] for i in range(len(embeddings))])
+                        embedding = np.mean(embedding_array, axis=0)  # 對所有滑窗取平均
+                        embedding = embedding / np.linalg.norm(embedding)  # 正規化
+                    else:
+                        # 整個音頻模式：使用 crop 方法
+                        duration = len(signal) / target_sr
+                        segment = self.Segment(0, duration)
+                        embedding = self.model.crop(temp_path, segment)
+                        embedding = embedding.squeeze()  # 移除第一維
+                        embedding = embedding / np.linalg.norm(embedding)  # 正規化
                 finally:
                     # 清理臨時文件
                     import os
@@ -347,14 +372,20 @@ class AudioProcessor:
                         sf.write(temp_path, signal, target_sr)
                     
                     try:
-                        # 創建涵蓋整個音頻的 Segment
-                        duration = len(signal) / target_sr
-                        segment = self.Segment(0, duration)
-                        
-                        # 使用 crop 方法提取嵌入向量
-                        embedding = self.model.crop(temp_path, segment)
-                        embedding = embedding.squeeze()  # 移除第一維
-                        embedding = embedding / np.linalg.norm(embedding)  # 正規化
+                        if self.use_sliding_window:
+                            # 滑窗模式：直接使用 inference 處理整個文件
+                            embeddings = self.model(temp_path)
+                            # embeddings 是 SlidingWindowFeature，包含多個嵌入向量
+                            embedding_array = np.array([embeddings[i] for i in range(len(embeddings))])
+                            embedding = np.mean(embedding_array, axis=0)  # 對所有滑窗取平均
+                            embedding = embedding / np.linalg.norm(embedding)  # 正規化
+                        else:
+                            # 整個音頻模式：使用 crop 方法
+                            duration = len(signal) / target_sr
+                            segment = self.Segment(0, duration)
+                            embedding = self.model.crop(temp_path, segment)
+                            embedding = embedding.squeeze()
+                            embedding = embedding / np.linalg.norm(embedding)
                     finally:
                         # 清理臨時文件
                         import os
@@ -362,11 +393,20 @@ class AudioProcessor:
                             os.unlink(temp_path)
                 else:
                     # 如果取樣率已經正確，直接使用原文件
-                    duration = len(signal) / sr
-                    segment = self.Segment(0, duration)
-                    embedding = self.model.crop(audio_path, segment)
-                    embedding = embedding.squeeze()
-                    embedding = embedding / np.linalg.norm(embedding)
+                    if self.use_sliding_window:
+                        # 滑窗模式：直接使用 inference 處理整個文件
+                        embeddings = self.model(audio_path)
+                        # embeddings 是 SlidingWindowFeature，包含多個嵌入向量
+                        embedding_array = np.array([embeddings[i] for i in range(len(embeddings))])
+                        embedding = np.mean(embedding_array, axis=0)  # 對所有滑窗取平均
+                        embedding = embedding / np.linalg.norm(embedding)  # 正規化
+                    else:
+                        # 整個音頻模式：使用 crop 方法
+                        duration = len(signal) / sr
+                        segment = self.Segment(0, duration)
+                        embedding = self.model.crop(audio_path, segment)
+                        embedding = embedding.squeeze()
+                        embedding = embedding / np.linalg.norm(embedding)
                 
                 return embedding
             

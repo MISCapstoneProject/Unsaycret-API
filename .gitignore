@@ -25,6 +25,7 @@ pipeline_stages.csv
 
 # 測試檔案
 *test_report.json
+*.json
 
 # 虛擬環境
 venv
