@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """
-批次語者識別測試檔
+批次語者識別測試檔（完整識別流程版）
 ================
 
 批次處理指定資料夾內所有 .wav 檔案的語者識別功能，支援遞歸搜索子資料夾。
-輸出結果包含最近的3個匹配距離，並按照自訂命名規則生成聲紋名稱。
+使用完整的識別流程，模擬真實 API 使用情況，會自動處理新語者註冊和現有語者更新。
 
 使用方法：
 1. 修改下方的 TARGET_DIRECTORY 變數
@@ -13,12 +13,14 @@
 
 功能特色：
 - 遞歸處理整個資料夾及其子資料夾的 .wav 檔案
-- 按照檔案路徑排序處理
-- 顯示最近3個匹配結果及其距離
-- 聲紋命名：僅使用音檔名稱（無副檔名）
+- 使用完整的識別流程（process_audio_file），模擬真實使用場景
+- 自動註冊新語者、更新現有語者聲紋
+- 顯示詳細的處理結果和動作描述
 - 每個資料夾檔案數量限制（可設定前n個檔案進行快速測試）
-- 生成詳細的處理報告與統計資訊
+- 生成詳細的處理報告與統計資訊，包含新創建語者列表
 - 支援中斷恢復（可選）
+
+⚠️ 注意：此版本會實際修改資料庫，新增語者和聲紋資料！
 """
 
 import os
@@ -40,16 +42,15 @@ from modules.identification.VID_identify_v5 import SpeakerIdentifier
 
 # ==================== 設定區域 ====================
 # 👇 請修改這裡的目標資料夾路徑
-TARGET_DIRECTORY = "stream_output"  # 修改為您要批次處理的資料夾路徑
+TARGET_DIRECTORY = "separated_output"  # 修改為您要批次處理的資料夾路徑
 
 # 其他設定
 ENABLE_VERBOSE = True          # 是否顯示詳細輸出
 SAVE_DETAILED_RESULTS = True   # 是否保存詳細結果到 JSON 檔案
 SAVE_SUMMARY_RESULTS = True    # 是否保存摘要結果
-SHOW_TOP_N_MATCHES = 3         # 顯示前 N 個最佳匹配結果
 ENABLE_PROGRESS_SAVE = True    # 是否啟用進度保存（可中斷恢復）
 PROGRESS_SAVE_INTERVAL = 10    # 每處理幾個檔案保存一次進度
-MAX_FILES_PER_FOLDER = 5       # 每個資料夾最多處理的檔案數量（0 = 無限制）
+MAX_FILES_PER_FOLDER = 6       # 每個資料夾最多處理的檔案數量（0 = 無限制）
                               # 例如：設定為 5，則每個子資料夾只處理前 5 個音檔
                               # 用於快速測試，避免處理太多檔案
 
@@ -154,80 +155,11 @@ def get_action_description(status: str) -> str:
     }
     return action_map.get(status, "❓ 未知動作")
 
-def format_identification_result(result: Optional[Tuple[str, str, float]], 
-                               all_distances: List[Tuple[str, str, float, int]] = None) -> Dict:
-    """
-    格式化識別結果為易讀的字典格式
-    
-    Args:
-        result: 識別結果 (speaker_id, speaker_name, distance) 或 None
-        all_distances: 所有距離列表 [(id, name, distance, update_count), ...]
-        
-    Returns:
-        Dict: 格式化後的結果字典
-    """
-    if result is None:
-        return {
-            "status": "failed",
-            "error": "識別失敗",
-            "best_match": None,
-            "top_matches": []
-        }
-    
-    speaker_id, speaker_name, best_distance = result
-    
-    # 判斷識別狀態
-    if best_distance == -1:
-        status = "new_speaker"
-        status_desc = "新語者"
-    elif best_distance < 0.26:  # THRESHOLD_LOW
-        status = "exact_match"
-        status_desc = "完全匹配（無需更新）"
-    elif best_distance < 0.34:  # THRESHOLD_UPDATE
-        status = "updated"
-        status_desc = "已更新現有語者聲紋"
-    elif best_distance < 0.385:  # THRESHOLD_NEW
-        status = "added_voiceprint"
-        status_desc = "已為現有語者新增聲紋"
-    else:
-        status = "new_speaker"
-        status_desc = "識別為新語者"
-    
-    # 準備最佳匹配資訊
-    best_match = {
-        "speaker_id": speaker_id,
-        "speaker_name": speaker_name,
-        "distance": round(best_distance, 4),
-        "status": status,
-        "status_description": status_desc
-    }
-    
-    # 準備前N個匹配結果
-    top_matches = []
-    if all_distances:
-        # 按距離排序並取前N個
-        sorted_distances = sorted(all_distances, key=lambda x: x[2])
-        for i, (match_id, match_name, distance, update_count) in enumerate(sorted_distances[:SHOW_TOP_N_MATCHES]):
-            match_info = {
-                "rank": i + 1,
-                "speaker_id": match_id,
-                "speaker_name": match_name,
-                "distance": round(distance, 4),
-                "update_count": update_count
-            }
-            top_matches.append(match_info)
-    
-    return {
-        "status": "success",
-        "best_match": best_match,
-        "top_matches": top_matches
-    }
-
 def test_single_audio_file(identifier: SpeakerIdentifier, 
                           audio_path: str, 
                           base_directory: str) -> Dict:
     """
-    測試單個音檔的語者識別
+    測試單個音檔的語者識別（使用完整的識別流程）
     
     Args:
         identifier: 語者識別器實例
@@ -238,7 +170,6 @@ def test_single_audio_file(identifier: SpeakerIdentifier,
         Dict: 測試結果字典
     """
     import soundfile as sf
-    import numpy as np
     
     start_time = time.time()
     voiceprint_name = generate_voiceprint_name(audio_path, base_directory)
@@ -254,57 +185,99 @@ def test_single_audio_file(identifier: SpeakerIdentifier,
         "voiceprint_name": voiceprint_name,
         "relative_path": str(Path(audio_path).relative_to(base_directory)),
         "processing_time": 0,
-        "timestamp": datetime.now().isoformat()
+        "timestamp": datetime.now().isoformat(),
+        "comparison_details": []  # 新增比對詳情
     }
     
     try:
-        # 讀取音檔並直接處理以獲取所有距離資訊
+        # 先獲取比對距離詳情（不進行實際註冊）
         signal, sr = sf.read(audio_path)
-        audio_source = str(Path(audio_path).relative_to(base_directory))
-        
-        # 提取嵌入向量
         new_embedding = identifier.audio_processor.extract_embedding_from_stream(signal, sr)
         
         # 與 Weaviate 中的嵌入向量比對，獲取所有距離資訊
         best_id, best_name, best_distance, all_distances = identifier.database.compare_embedding(new_embedding)
         
-        # 構建基本結果元組
-        if best_id is not None:
-            result = (best_id, best_name, best_distance)
-        else:
-            result = None
+        # 記錄比對詳情
+        comparison_details = []
+        if all_distances:
+            for match_id, match_name, distance, update_count in all_distances:
+                comparison_details.append({
+                    "speaker_id": match_id,
+                    "speaker_name": match_name,
+                    "distance": round(distance, 4),
+                    "update_count": update_count
+                })
         
-        # 格式化結果（包含所有距離資訊）
-        formatted_result = format_identification_result(result, all_distances)
-        result_dict.update(formatted_result)
+        result_dict["comparison_details"] = comparison_details
+        result_dict["best_comparison"] = {
+            "speaker_id": best_id,
+            "speaker_name": best_name,
+            "distance": best_distance
+        } if best_id is not None else None
         
-        # 顯示結果摘要
-        print(f"\n🎵 音檔名稱: {Path(audio_path).name}")
+        # 然後使用完整的識別流程（這會自動處理新語者註冊、現有語者更新等）
+        result = identifier.process_audio_file(audio_path)
         
-        if formatted_result["status"] == "success":
-            # 顯示比對的3個聲紋
-            if formatted_result["top_matches"]:
-                print(f"🔍 比對結果:")
-                for match in formatted_result["top_matches"]:
-                    speaker_id_short = match['speaker_id'][:8] + "..." if len(match['speaker_id']) > 8 else match['speaker_id']
-                    status_icon = "🎯" if match['rank'] == 1 else "  "
-                    print(f"   {status_icon} 聲紋 {match['rank']}: {match['speaker_name']} (距離: {match['distance']}, ID: {speaker_id_short})")
+        if result is not None:
+            speaker_id, speaker_name, distance = result
             
-            # 顯示最終處理結果
-            best_match = formatted_result["best_match"]
-            print(f"📋 處理結果: {best_match['status_description']}")
-            print(f"   ├─ 匹配語者: {best_match['speaker_name']}")
-            print(f"   ├─ 最小距離: {best_match['distance']}")
-            print(f"   └─ 執行動作: {get_action_description(best_match['status'])}")
-        else:
-            print(f"❌ 處理失敗: {formatted_result.get('error', '未知錯誤')}")
-            if all_distances:
-                print(f"🔍 仍有比對結果:")
-                for i, (match_id, match_name, distance, update_count) in enumerate(all_distances[:3], 1):
-                    speaker_id_short = match_id[:8] + "..." if len(match_id) > 8 else match_id
-                    print(f"   聲紋 {i}: {match_name} (距離: {distance:.4f}, ID: {speaker_id_short})")
+            # 判斷處理狀態
+            if distance == -1:
+                status = "new_speaker"
+                status_desc = "新語者"
+            elif distance < 0.26:  # THRESHOLD_LOW
+                status = "exact_match"
+                status_desc = "完全匹配（無需更新）"
+            elif distance < 0.34:  # THRESHOLD_UPDATE
+                status = "updated"
+                status_desc = "已更新現有語者聲紋"
+            elif distance < 0.385:  # THRESHOLD_NEW
+                status = "added_voiceprint"
+                status_desc = "已為現有語者新增聲紋"
             else:
-                print(f"🔍 無任何比對結果（資料庫可能為空）")
+                status = "new_speaker"
+                status_desc = "識別為新語者"
+            
+            # 準備成功結果
+            result_dict.update({
+                "status": "success",
+                "speaker_id": speaker_id,
+                "speaker_name": speaker_name,
+                "distance": round(distance, 4),
+                "action_status": status,
+                "action_description": status_desc
+            })
+            
+            # 顯示結果摘要
+            print(f"\n🎵 音檔名稱: {Path(audio_path).name}")
+            print(f"✅ 識別成功！")
+            
+            # 顯示比對詳情（前3個）
+            if comparison_details:
+                print(f"🔍 比對結果:")
+                for i, detail in enumerate(comparison_details[:3], 1):
+                    speaker_id_short = detail['speaker_id'][:8] + "..." if len(detail['speaker_id']) > 8 else detail['speaker_id']
+                    print(f"   {i}. {detail['speaker_name']} (距離: {detail['distance']}, ID: {speaker_id_short})")
+            
+            print(f"📋 處理結果: {status_desc}")
+            print(f"   ├─ 語者 ID: {speaker_id}")
+            print(f"   ├─ 語者名稱: {speaker_name}")
+            print(f"   ├─ 處理距離: {distance}")
+            print(f"   └─ 執行動作: {get_action_description(status)}")
+            
+        else:
+            # 處理失敗
+            result_dict.update({
+                "status": "error",
+                "error": "識別處理失敗",
+                "speaker_id": None,
+                "speaker_name": None,
+                "distance": None,
+                "action_status": "failed",
+                "action_description": "處理失敗"
+            })
+            print(f"\n🎵 音檔名稱: {Path(audio_path).name}")
+            print(f"❌ 處理失敗：識別處理失敗")
             
     except Exception as e:
         error_msg = f"處理失敗: {str(e)}"
@@ -316,8 +289,11 @@ def test_single_audio_file(identifier: SpeakerIdentifier,
         result_dict.update({
             "status": "error",
             "error": error_msg,
-            "best_match": None,
-            "top_matches": []
+            "speaker_id": None,
+            "speaker_name": None,
+            "distance": None,
+            "action_status": "error",
+            "action_description": "發生錯誤"
         })
     
     # 計算處理時間
@@ -365,11 +341,16 @@ def generate_summary_report(results: List[Dict], total_time: float) -> Dict:
     # 統計各種狀態
     status_counts = {}
     processing_times = []
+    speakers_created = []
     
     for result in results:
-        if result.get("status") == "success" and result.get("best_match"):
-            status = result["best_match"]["status"]
-            status_counts[status] = status_counts.get(status, 0) + 1
+        if result.get("status") == "success":
+            action_status = result.get("action_status", "unknown")
+            status_counts[action_status] = status_counts.get(action_status, 0) + 1
+            
+            # 收集新創建的語者
+            if action_status == "new_speaker" and result.get("speaker_name"):
+                speakers_created.append(result["speaker_name"])
         
         if "processing_time" in result:
             processing_times.append(result["processing_time"])
@@ -384,7 +365,9 @@ def generate_summary_report(results: List[Dict], total_time: float) -> Dict:
         "失敗檔案": failed_files,
         "成功率": f"{(successful_files/total_files*100):.1f}%" if total_files > 0 else "0%",
         "平均單檔處理時間": f"{avg_processing_time:.3f} 秒",
-        "狀態統計": status_counts,
+        "動作統計": status_counts,
+        "新創建語者數": len(set(speakers_created)),  # 去重計算
+        "新創建語者列表": list(set(speakers_created)) if speakers_created else [],
         "處理時間範圍": {
             "最快": f"{min(processing_times):.3f} 秒" if processing_times else "N/A",
             "最慢": f"{max(processing_times):.3f} 秒" if processing_times else "N/A"
@@ -402,7 +385,6 @@ def batch_test_speaker_identification(target_directory: str):
     """
     print("🚀 批次語者識別測試工具")
     print(f"目標資料夾: {target_directory}")
-    print(f"顯示匹配結果數量: 前 {SHOW_TOP_N_MATCHES} 個")
     print("=" * 80)
     
     # 檢查目標資料夾
@@ -508,8 +490,7 @@ def main():
     
     # 提示用戶可以修改設定
     print(f"📂 目標資料夾: {TARGET_DIRECTORY}")
-    print(f"📊 顯示匹配結果: 前 {SHOW_TOP_N_MATCHES} 個")
-    print(f"🔧 詳細輸出: {'開啟' if ENABLE_VERBOSE else '關閉'}")
+    print(f" 詳細輸出: {'開啟' if ENABLE_VERBOSE else '關閉'}")
     print(f"💾 保存結果: {'開啟' if SAVE_DETAILED_RESULTS else '關閉'}")
     print(f"🔄 進度保存: {'開啟' if ENABLE_PROGRESS_SAVE else '關閉'}")
     print()

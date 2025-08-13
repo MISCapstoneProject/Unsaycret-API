@@ -1,7 +1,7 @@
 # Unsaycret-API
 
 **版本**: v0.4.1  <br>
-**最後更新**: 2025-07-28
+**最後更新**: 2025-08-13
 
 ## 專案簡介
 Unsaycret-API 是一套模組化的語音處理系統，整合語音分離、說者辨識、語音辨識、API 服務，並支援 Weaviate 向量資料庫串接。
@@ -11,7 +11,10 @@ Unsaycret-API 是一套模組化的語音處理系統，整合語音分離、說
 
 - 🎙 **語者分離**：採用 SpeechBrain Sepformer (2人) / ConvTasNet (3人)，支援多人語音分離
 - 🧠 **語音辨識（ASR）**：Faster-Whisper，支援 GPU/CPU 動態切換，逐詞時間戳與信心值
-- 🗣 **說話人辨識**：ECAPA-TDNN 語者聲紋比對，支援聲紋自動更新
+- 🗣 **說話人辨識**：提供雙模型使用 (正在測試哪一個更優)
+  - SpeechBrain ECAPA-TDNN
+  - PyAnnote Embedding
+  - 支援聲紋自動更新與多聲紋映射
 - 🛜 **API 服務**：FastAPI 提供完整的 RESTful 與 WebSocket 介面
 - 🧠 **Weaviate V2 整合**：語音向量與辨識結果存入 Weaviate V2，支援高效語者搜尋與比對
 - ⚙️ **分層配置**：環境變數(.env) 與應用常數(constants.py) 分離管理
@@ -41,7 +44,7 @@ Unsaycret-API/
 │   ├── database/            # Weaviate V2 資料庫操作
 │   │   ├── database.py
 │   │   └── init_v2_collections.py
-│   ├── identification/      # 語者識別 (ECAPA-TDNN)
+│   ├── identification/      # 語者識別 (ECAPA-TDNN / PyAnnote Embedding)
 │   ├── management/          # 語者管理
 │   └── separation/          # 語者分離 (Sepformer/ConvTasNet)
 ├── pipelines/               # 處理流程編排
@@ -72,6 +75,7 @@ cp .env.example .env
 # - WEAVIATE_PORT=8080  
 # - API_HOST=0.0.0.0
 # - API_PORT=8000
+# - HF_ACCESS_TOKEN=hf_xxx...  (PyAnnote 模型需要)
 # 其他設定可自行判斷
 ```
 
@@ -191,6 +195,7 @@ THRESHOLD_NEW = 0.385     # 超過此值視為新語者
 # 模型配置
 DEFAULT_WHISPER_MODEL = "medium"
 SPEECHBRAIN_SPEAKER_MODEL = "speechbrain/spkrec-ecapa-voxceleb"
+PYANNOTE_SPEAKER_MODEL = "pyannote/embedding"
 ```
 
 ## 🔧 開發指南
@@ -241,6 +246,7 @@ python weaviate_study/tool_search.py
 2. **Weaviate 連接失敗**：確認 Docker 服務運行且端口未被占用
 3. **模型下載失敗**：檢查網路連接，系統會自動重試下載
 4. **GPU 記憶體不足**：設定 `FORCE_CPU=true` 強制使用 CPU
+5. **PyAnnote 模型載入失敗**：確認 `.env` 中設定了有效的 `HF_ACCESS_TOKEN`
 
 ### 設備控制
 ```bash  
