@@ -131,8 +131,19 @@ def make_pretty(seg: dict) -> dict:
     }
 
 
-def run_pipeline_file(raw_wav: str, max_workers: int = 3,sep=None, spk=None, asr=None):
-    """Run pipeline on an existing wav file."""
+def run_pipeline_file(raw_wav: str, max_workers: int = 3, sep=None, spk=None, asr=None):
+    """Run pipeline on an existing wav file.
+
+    If the separator / speaker identifier / ASR modules are not provided,
+    they will be initialized automatically. This preserves backwards
+    compatibility for callers that import :func:`run_pipeline_file` directly
+    without using :func:`init_pipeline_modules` first (e.g. older API code).
+    """
+
+    # Allow legacy usage where modules are not injected explicitly.
+    if sep is None or spk is None or asr is None:
+        sep, spk, asr, _ = init_pipeline_modules()
+
     total_start = time.perf_counter()
 
     waveform, sr = torchaudio.load(raw_wav)
@@ -152,12 +163,17 @@ def run_pipeline_file(raw_wav: str, max_workers: int = 3,sep=None, spk=None, asr
     logger.info(f"⏱ 分離耗時 {sep_end - sep_start:.3f}s, 共 {len(segments)} 段")
 
     # 2) 多執行緒處理所有段
+    torch.cuda.empty_cache()                 # ★ 釋放分離占用的 VRAM
     logger.info(f"🔄 處理 {len(segments)} 段... (max_workers={max_workers})")
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         bundle = [
             r for r in ex.map(
-                lambda s: process_segment(s[0], s[1], s[2],
-                                        sep=sep, spk=spk, asr=asr),
+                lambda s: process_segment(
+                    s[0], s[1], s[2],
+                    sep=sep,            # ← 仍傳 sep，但此時顯存已空閒
+                    spk=spk,
+                    asr=asr             # Whisper v3 現在才真正占用 GPU
+                ),
                 segments
             )
             if r
@@ -245,6 +261,11 @@ def run_pipeline_dir(
       - summary.tsv：檔案級統計 + 段落詳情
       - asr_report.tsv：ASR 指標 (avg_conf, WER, CER)
     """
+    
+    # Lazily initialize modules for legacy callers that do not provide them.
+    if sep is None or spk is None or asr is None:
+        sep, spk, asr, _ = init_pipeline_modules()
+
     timestamp = dt.now().strftime("%Y%m%d_%H%M%S")
     out_dir = pathlib.Path("work_output") / f"batch_{timestamp}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -325,6 +346,10 @@ def run_pipeline_stream(
     sep=None, spk=None, asr=None
 ):
     """串流模式：每 chunk_secs 做一次分離/識別/ASR。"""
+
+    # Initialize modules when not supplied to maintain backward compatibility
+    if sep is None or spk is None or asr is None:
+        sep, spk, asr, _ = init_pipeline_modules()
 
     total_start = time.perf_counter()
     out_root = Path("stream_output") / dt.now().strftime("%Y%m%d_%H%M%S")

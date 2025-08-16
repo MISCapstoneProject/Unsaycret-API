@@ -4,9 +4,9 @@
 """
 
 # 語者識別閾值 (演算法核心參數，經過實驗調校)
-THRESHOLD_LOW = 0.26      # 過於相似，不更新向量
-THRESHOLD_UPDATE = 0.34   # 相似度足夠，更新向量
-THRESHOLD_NEW = 0.385     # 超過此值視為新語者
+THRESHOLD_LOW = 0.2      # 過於相似，不更新向量
+THRESHOLD_UPDATE = 0.33   # 相似度足夠，更新向量
+THRESHOLD_NEW = 0.37     # 超過此值視為新語者
 
 # 音訊處理固定參數 (技術規格要求)
 AUDIO_SAMPLE_RATE = 16000    # SpeechBrain 模型要求的取樣率
@@ -15,8 +15,8 @@ AUDIO_CHANNELS = 1           # 單聲道
 WHISPER_MODEL_CACHE_DIR = "models/faster-whisper"
 
 # 預設模型配置 (經過測試的穩定版本)
-DEFAULT_WHISPER_MODEL = "large-v3"
-DEFAULT_WHISPER_BEAM_SIZE = 3
+DEFAULT_WHISPER_MODEL = "medium"
+DEFAULT_WHISPER_BEAM_SIZE = 5
 DEFAULT_SEPARATION_MODEL = "sepformer_2speaker"
 
 # 模型名稱常數 (固定的 HuggingFace 模型ID)
