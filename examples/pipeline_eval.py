@@ -269,33 +269,39 @@ def process_one_mixture(
             # print(f"🔍 正規化文字1：{ref_norm1}"
             #         f" 正規化文字2：{ref_norm2}")
 
-            # 3) 從 bundle 中找出對應 true speaker 的預測文字
-            pred_text1 = ""
-            pred_text2 = ""
-            for seg in bundle:
-                if seg.get("speaker") == true_spk1:
-                    pred_text1 = seg.get("text", "")
-                elif seg.get("speaker") == true_spk2:
-                    pred_text2 = seg.get("text", "")
-            pred_norm1 = normalize_numbers_to_zh(normalize_zh(pred_text1))
-            pred_norm2 = normalize_numbers_to_zh(normalize_zh(pred_text2))
+            # 3) 直接抓 bundle 前兩段文字，不理會 speaker id
+            pred_texts = [seg.get("text", "") for seg in bundle if seg.get("text")]
+            if len(pred_texts) < 2:                            # 若只抓到 1 段，就補空
+                pred_texts.append("")
+            predA, predB = pred_texts[:2]                      # A = 第一段, B = 第二段
 
+            normA = normalize_numbers_to_zh(normalize_zh(predA))
+            normB = normalize_numbers_to_zh(normalize_zh(predB))
             # print(f"🔍 預測文字1：{pred_norm1}"
             #         f" 預測文字2：{pred_norm2}")
-            # 4) 計算 CER
-            cer1 = compute_cer(ref_norm1, pred_norm1) if ref_norm1 else None
-            cer2 = compute_cer(ref_norm2, pred_norm2) if ref_norm2 else None
+            # 4) 交叉計算 4 個 CER
+            cA1 = compute_cer(ref_norm1, normA) if ref_norm1 else None
+            cB2 = compute_cer(ref_norm2, normB) if ref_norm2 else None
+            cA2 = compute_cer(ref_norm2, normA) if ref_norm2 else None
+            cB1 = compute_cer(ref_norm1, normB) if ref_norm1 else None
             # print(f"🔍 CER1：{cer1:.4f} CER2：{cer2:.4f}")
+            
+                        # 5) 選「加總最小」的配對
+            if (cA1 or 0) + (cB2 or 0) <= (cA2 or 0) + (cB1 or 0):
+                final_pred1, final_pred2 = normA, normB
+                cer1, cer2 = cA1, cB2
+            else:
+                final_pred1, final_pred2 = normB, normA
+                cer1, cer2 = cB1, cA2
             # 5) 寫入結果
             result.update({
                 "ref_text1": ref_norm1,
-                "pred_text1": pred_norm1,
+                "pred_text1": final_pred1,
                 "cer1": cer1,
                 "ref_text2": ref_norm2,
-                "pred_text2": pred_norm2,
+                "pred_text2": final_pred2,
                 "cer2": cer2,
             })
-            del asr
             torch.cuda.empty_cache()
             gc.collect()
         else:
@@ -350,7 +356,7 @@ def main():
 
     # 2️⃣ 載入所有參數與資料
     #    --mix-dir、--clean-dir、--truth-map、--test-list、--out 都已設預設
-    args, mix_dir, clean_dir, truth_map, _ = load_config_and_data()
+    args, mix_dir, clean_dir, truth_map, mixture_rows = load_config_and_data()
 
     # 3️⃣ 初始化模型
     sep, spk, asr, _ = init_pipeline_modules()
@@ -365,8 +371,8 @@ def main():
     )
 
     # # ④ 測試一組混音
-    # test_mix_id = "m01"  # 你可以自訂一個 ID
-    # test_mix_path = "data/mix/m01.wav"  # ← 改成你實際有的音檔路徑！
+    # test_mix_id = "m05"  # 你可以自訂一個 ID
+    # test_mix_path = "data/mix/m05.wav"  # ← 改成你實際有的音檔路徑！
 
     # print(f"👉 處理測試音檔：{test_mix_path}")
     # result = process_one_mixture(

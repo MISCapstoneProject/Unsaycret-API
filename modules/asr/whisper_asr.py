@@ -20,7 +20,7 @@ class WhisperASR:
         text, confidence, words = asr.transcribe("path/to/audio.wav")
     """
 
-    def __init__(self, model_name: str = None, gpu: bool = False, beam: int = None, lang: str = "auto"):
+    def __init__(self, model_name: str = None, gpu: bool = False, beam: int = None, lang: str = "zh"):
         self.gpu = gpu
         self.beam = beam if beam is not None else DEFAULT_WHISPER_BEAM_SIZE
         self.lang = lang
