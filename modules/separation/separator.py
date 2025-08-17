@@ -99,7 +99,9 @@ Weaviate 資料庫設定：
 """
 
 import os
+import librosa
 import numpy as np
+from sklearn.cluster import DBSCAN
 import torch
 import torchaudio
 import pyaudio # type: ignore
@@ -1143,14 +1145,14 @@ class AudioSeparator:
             absolute_start_time: 音訊的絕對開始時間（datetime 物件）
         """
         try:
-            # 新增：在分離前先偵測說話者數量
-            detected_speakers = self.detect_speaker_count(audio_tensor)
-            logger.info(f"片段 {segment_index} - 偵測到 {detected_speakers} 位說話者")
+            # # 新增：在分離前先偵測說話者數量
+            # detected_speakers = self.detect_speaker_count(audio_tensor)
+            # logger.info(f"片段 {segment_index} - 偵測到 {detected_speakers} 位說話者")
             
-            # 如果沒有偵測到說話者，跳過處理
-            if detected_speakers == 0:
-                logger.info(f"片段 {segment_index} - 未偵測到說話者，跳過處理")
-                return []
+            # # 如果沒有偵測到說話者，跳過處理
+            # if detected_speakers == 0:
+            #     logger.info(f"片段 {segment_index} - 未偵測到說話者，跳過處理")
+            #     return []
             
             # 記錄絕對時間戳
             if absolute_start_time is None:

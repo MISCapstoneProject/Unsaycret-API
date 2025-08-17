@@ -33,7 +33,7 @@ import sys
 from pathlib import Path
 from typing import List, Dict, Tuple, Optional
 from datetime import datetime
-
+import re
 # 添加專案根目錄到 Python 路徑
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
@@ -42,7 +42,7 @@ from modules.identification.VID_identify_v5 import SpeakerIdentifier
 
 # ==================== 設定區域 ====================
 # 👇 請修改這裡的目標資料夾路徑
-TARGET_DIRECTORY = "separated_output"  # 修改為您要批次處理的資料夾路徑
+TARGET_DIRECTORY = "data\clean"  # 修改為您要批次處理的資料夾路徑
 
 # 其他設定
 ENABLE_VERBOSE = True          # 是否顯示詳細輸出
@@ -50,13 +50,29 @@ SAVE_DETAILED_RESULTS = True   # 是否保存詳細結果到 JSON 檔案
 SAVE_SUMMARY_RESULTS = True    # 是否保存摘要結果
 ENABLE_PROGRESS_SAVE = True    # 是否啟用進度保存（可中斷恢復）
 PROGRESS_SAVE_INTERVAL = 10    # 每處理幾個檔案保存一次進度
-MAX_FILES_PER_FOLDER = 6       # 每個資料夾最多處理的檔案數量（0 = 無限制）
+MAX_FILES_PER_FOLDER = 0       # 每個資料夾最多處理的檔案數量（0 = 無限制）
                               # 例如：設定為 5，則每個子資料夾只處理前 5 個音檔
                               # 用於快速測試，避免處理太多檔案
 
 # 檔案篩選設定
 SUPPORTED_EXTENSIONS = ['.wav', '.WAV']  # 支援的音檔副檔名
 SKIP_HIDDEN_FILES = True       # 是否跳過隱藏檔案（以 . 開頭）
+# 僅處理白名單中的檔案編號（留空則不限制）
+# key = speaker 資料夾名（相對 TARGET_DIRECTORY 的第一層資料夾）
+# value = 要保留的「號碼」字串列表（例如 ["01","04","05",...])
+SPEAKER_INCLUDE_IDX: dict[str, list[str]] = {
+    # 範例：
+    "speaker1": ["01", "04", "05", "07", "08", "09", "12", "14", "15", "17", "18", "19", "20"],
+    "speaker2": ["01", "03", "07", "08", "10", "11", "12", "14", "15", "17", "18", "20"],
+    "speaker3": ["01", "02", "04", "05", "07", "08", "09", "14", "16", "17", "18"],
+    "speaker4": ["02", "05", "06", "07", "08", "10", "11", "13", "14", "15", "17", "19", "20"],
+    "speaker5": ["01", "03", "04", "07", "09", "12", "14", "15", "16", "17", "18", "19", "20"],
+    "speaker6": ["01", "02", "03", "04", "05", "06", "09", "10", "11", "12", "13", "15", "16", "18", "19", "20"],
+    "speaker7": ["01", "02", "08", "09", "10", "11", "13", "14", "16", "18", "19", "20"],
+    "speaker8": ["02", "04", "05", "06", "09", "10", "11", "12", "15", "17", "20"],
+    "speaker9": ["01", "03", "04", "05", "06", "07", "08", "09", "10", "12", "13", "14", "15", "17", "18", "19"],
+    "speaker10": ["02", "04", "09", "10", "13", "19"],
+}
 # ==================================================
 
 def generate_voiceprint_name(file_path: str, base_directory: str) -> str:
@@ -75,6 +91,47 @@ def generate_voiceprint_name(file_path: str, base_directory: str) -> str:
     file_path = Path(file_path)
     # 只返回檔案名稱（無副檔名）
     return file_path.stem
+
+def _get_speaker_folder(file_path: Path, base_dir: Path) -> str:
+    """
+    取得 speaker 資料夾名稱：相對 base_dir 的第一層資料夾
+    若層級不規則，退回上一層資料夾名
+    """
+    try:
+        rel = file_path.resolve().relative_to(base_dir.resolve())
+        return rel.parts[0]
+    except Exception:
+        return file_path.parent.name
+
+def _keep_by_include_rule(file_path: Path, base_dir: Path, include_map: dict[str, list[str]]) -> bool:
+    """
+    只保留在 include_map 指定號碼清單內的檔案。
+    規則：
+      - 若該 speaker 不在 include_map => 不限制（保留）
+      - 若在 include_map 且清單非空 => 檔名需命中任一「號碼」才保留
+    比對方式：
+      - 使用數字「邊界」正則，避免 '01' 誤配 '101'
+      - 允許前後非數字（底線、點、開頭/結尾皆可）
+    """
+    if not include_map:
+        return True
+
+    speaker = _get_speaker_folder(file_path, base_dir)
+    tokens = include_map.get(speaker)
+    if not tokens:
+        # 該 speaker 未設定白名單 => 不限制
+        return True
+
+    name = file_path.name
+    # 命中任一 token 即保留
+    for tok in tokens:
+        # 允許前後是「非數字或邊界」，中間允許前置 0
+        # 例如：_01.wav、01.wav、x01_x.wav 都會命中；但 101 不會
+        pattern = rf'(?<!\d)0*{re.escape(tok)}(?!\d)'
+        if re.search(pattern, name):
+            return True
+    return False
+
 
 def find_all_audio_files(directory: str) -> List[str]:
     """
@@ -115,7 +172,11 @@ def find_all_audio_files(directory: str) -> List[str]:
             
             # 檢查副檔名
             if file_path.suffix in SUPPORTED_EXTENSIONS:
+                # 依白名單保留；若該 speaker 沒設白名單 => 不限制
+                if not _keep_by_include_rule(file_path, directory_path, SPEAKER_INCLUDE_IDX):
+                    continue
                 folder_audio_files.append(str(file_path))
+
         
         # 排序當前資料夾的音檔
         folder_audio_files.sort()
