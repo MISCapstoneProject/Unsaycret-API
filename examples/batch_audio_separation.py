@@ -14,9 +14,14 @@
 - 遞歸處理整個資料夾及其子資料夾的 .wav 檔案
 - 保持原有目錄結構輸出分離後的音檔
 - 支援多種分離模型（ConvTasNet、SepFormer等）
-- 自動檢測語者數量
+- 🔥 新增強制雙語者模式：繞過聚類分析，固定產生兩個音檔
+- 自動檢測語者數量（可選擇關閉）
 - 生成詳細的處理報告與統計資訊
 - 支援中斷恢復（可選）
+
+新功能說明：
+- FORCE_TWO_SPEAKERS = True: 強制產生兩個音檔，不依賴說話者檢測
+- FORCE_TWO_SPEAKERS = False: 使用原始邏輯，依賴聚類分析判斷說話者數量
 """
 
 import os
@@ -39,12 +44,13 @@ from modules.separation.separator import AudioSeparator
 
 # ==================== 設定區域 ====================
 # 👇 請修改這裡的資料夾路徑
-INPUT_DIRECTORY = "data/clean/speaker4"       # 輸入音檔資料夾路徑
-OUTPUT_DIRECTORY = "separated_output" # 輸出分離音檔資料夾路徑
+INPUT_DIRECTORY = "data/clean"       # 輸入音檔資料夾路徑
+OUTPUT_DIRECTORY = "data_separated" # 輸出分離音檔資料夾路徑
 
 # 分離設定
 ENABLE_NOISE_REDUCTION = True       # 是否啟用降噪
 SNR_THRESHOLD = 5.0                 # 信噪比閾值
+FORCE_TWO_SPEAKERS = True           # 🔥 是否強制產生兩個音檔（繞過說話者檢測）
 
 # 處理設定
 ENABLE_VERBOSE = True               # 是否顯示詳細輸出
@@ -139,11 +145,250 @@ def get_output_path(input_path: str, input_directory: str, output_directory: str
     
     return output_base
 
+def separate_single_audio_file_force_two_speakers(separator: AudioSeparator, 
+                                                input_path: str, 
+                                                output_base: Path) -> Dict:
+    """
+    分離單個音檔 - 強制產生兩個音檔版本
+    繞過說話者數量檢測，直接執行分離並強制輸出兩個檔案
+    
+    Args:
+        separator: 音頻分離器實例
+        input_path: 輸入音檔路徑
+        output_base: 輸出基礎路徑（不含副檔名）
+        
+    Returns:
+        Dict: 處理結果字典
+    """
+    start_time = time.time()
+    
+    print(f"\n{'='*80}")
+    print(f"🎯 分離音檔 (強制雙語者模式): {Path(input_path).name}")
+    print(f"📂 輸入路徑: {input_path}")
+    print(f"📤 輸出基礎路徑: {output_base}")
+    print(f"{'='*80}")
+    
+    result_dict = {
+        "input_file": input_path,
+        "output_base": str(output_base),
+        "processing_time": 0,
+        "timestamp": datetime.now().isoformat(),
+        "status": "processing",
+        "force_two_speakers": True
+    }
+    
+    try:
+        # 檢查輸入檔案
+        if not os.path.exists(input_path):
+            raise FileNotFoundError(f"輸入音檔不存在: {input_path}")
+        
+        # 讀取音檔
+        print("🔄 讀取音檔...")
+        audio_data, sample_rate = sf.read(input_path)
+        
+        # 音檔信息
+        duration = len(audio_data) / sample_rate
+        print(f"📊 音檔信息:")
+        print(f"   - 取樣率: {sample_rate} Hz")
+        print(f"   - 音檔長度: {duration:.2f} 秒")
+        print(f"   - 聲道數: {audio_data.shape[1] if len(audio_data.shape) > 1 else 1}")
+        
+        # 轉換為適當格式
+        if len(audio_data.shape) > 1:
+            audio_data = audio_data.mean(axis=1)  # 轉為單聲道
+        
+        # 轉換為 tensor
+        audio_tensor = torch.from_numpy(audio_data).float().unsqueeze(0)  # 添加 batch 維度
+        
+        # 重採樣至目標取樣率（如果需要）
+        if sample_rate != OUTPUT_SAMPLE_RATE:
+            print(f"🔄 重採樣至 {OUTPUT_SAMPLE_RATE} Hz...")
+            import torchaudio
+            resampler = torchaudio.transforms.Resample(sample_rate, OUTPUT_SAMPLE_RATE)
+            audio_tensor = resampler(audio_tensor)
+        
+        # 確保輸出目錄存在
+        output_base.parent.mkdir(parents=True, exist_ok=True)
+        
+        # 🔥 直接執行分離，繞過說話者數量檢測
+        print("🔄 執行音頻分離 (強制雙語者模式)...")
+        separated_files = force_two_speaker_separation(separator, audio_tensor, output_base, duration)
+        
+        # 更新結果
+        result_dict.update({
+            "status": "success",
+            "separated_files": separated_files,
+            "num_speakers_detected": len(separated_files),
+            "num_speakers_forced": 2,
+            "original_duration": duration,
+            "original_sample_rate": sample_rate,
+            "output_sample_rate": OUTPUT_SAMPLE_RATE
+        })
+        
+        print(f"✅ 強制分離完成，產生 {len(separated_files)} 個檔案")
+        
+    except Exception as e:
+        error_msg = f"分離失敗: {str(e)}"
+        print(f"❌ {error_msg}")
+        if ENABLE_VERBOSE:
+            print("🔍 錯誤詳情:")
+            traceback.print_exc()
+        
+        result_dict.update({
+            "status": "error",
+            "error": error_msg,
+            "separated_files": [],
+            "num_speakers_detected": 0,
+            "num_speakers_forced": 0
+        })
+    
+    # 計算處理時間
+    processing_time = time.time() - start_time
+    result_dict["processing_time"] = round(processing_time, 3)
+    print(f"⏱️  處理時間: {processing_time:.3f} 秒")
+    
+    return result_dict
+
+def force_two_speaker_separation(separator: AudioSeparator, audio_tensor: torch.Tensor, 
+                               output_base: Path, duration: float) -> List[Dict]:
+    """
+    強制執行雙語者分離，繞過說話者數量檢測
+    
+    Args:
+        separator: 音頻分離器實例
+        audio_tensor: 音頻張量
+        output_base: 輸出基礎路徑
+        duration: 音頻時長
+        
+    Returns:
+        List[Dict]: 分離檔案信息列表
+    """
+    separated_files = []
+    
+    try:
+        with torch.no_grad():
+            # 直接執行分離模型，不進行說話者數量檢測
+            if separator.model_config["use_speechbrain"]:
+                # 確保輸入是 [batch, samples] 格式
+                if len(audio_tensor.shape) == 3:
+                    if audio_tensor.shape[1] == 1:
+                        audio_tensor = audio_tensor.squeeze(1)
+                separated = separator.model.separate_batch(audio_tensor)
+            else:
+                # ConvTasNet 需要 [batch, channels, samples] 格式
+                if len(audio_tensor.shape) == 2:
+                    audio_tensor = audio_tensor.unsqueeze(0)
+                separated = separator.model(audio_tensor)
+            
+            # 應用降噪（如果啟用）
+            if separator.enable_noise_reduction:
+                enhanced_separated = separator.enhance_separation(separated)
+            else:
+                enhanced_separated = separated
+            
+            # 清理記憶體
+            del separated
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+            
+            # 處理輸出格式並強制產生兩個檔案
+            if separator.model_config["use_speechbrain"]:
+                # SpeechBrain 模型輸出處理
+                if len(enhanced_separated.shape) == 3:
+                    num_speakers = min(enhanced_separated.shape[2], 2)  # 強制限制為2
+                    speaker_dim = 2
+                else:
+                    num_speakers = 1
+                    speaker_dim = 0
+            else:
+                # ConvTasNet 模型輸出處理
+                if len(enhanced_separated.shape) == 3:
+                    if enhanced_separated.shape[1] >= 2:
+                        num_speakers = 2  # 強制設定為2
+                        speaker_dim = 1
+                    else:
+                        num_speakers = enhanced_separated.shape[2]
+                        speaker_dim = 2
+                else:
+                    num_speakers = 1
+                    speaker_dim = 0
+            
+            # 強制產生兩個音檔
+            target_speakers = 2
+            
+            for i in range(target_speakers):
+                try:
+                    if i < num_speakers:
+                        # 正常分離的音檔
+                        if speaker_dim == 1:
+                            speaker_audio = enhanced_separated[0, i, :].cpu()
+                        elif speaker_dim == 2:
+                            speaker_audio = enhanced_separated[0, :, i].cpu()
+                        else:
+                            # 如果只有一個輸出，第一個音檔使用原始輸出
+                            if i == 0:
+                                speaker_audio = enhanced_separated.cpu().squeeze()
+                            else:
+                                # 第二個音檔使用反向音檔或降低音量的版本
+                                speaker_audio = enhanced_separated.cpu().squeeze() * 0.3
+                    else:
+                        # 如果模型輸出不足兩個，創建第二個音檔
+                        # 使用第一個音檔的降低音量版本作為第二個音檔
+                        if speaker_dim == 1:
+                            speaker_audio = enhanced_separated[0, 0, :].cpu() * 0.2
+                        elif speaker_dim == 2:
+                            speaker_audio = enhanced_separated[0, :, 0].cpu() * 0.2
+                        else:
+                            speaker_audio = enhanced_separated.cpu().squeeze() * 0.2
+                    
+                    # 音頻處理
+                    if len(speaker_audio.shape) > 1:
+                        speaker_audio = speaker_audio.squeeze()
+                    
+                    # 正規化處理
+                    max_val = torch.max(torch.abs(speaker_audio))
+                    if max_val > 0:
+                        normalized = speaker_audio / max_val
+                        speaker_audio = torch.tanh(normalized * 0.9) * 0.85
+                    
+                    final_tensor = speaker_audio.unsqueeze(0)
+                    
+                    # 生成輸出檔案名稱
+                    output_file = output_base.parent / f"{output_base.name}_{SPEAKER_PREFIX}{i+1}.{OUTPUT_FORMAT}"
+                    
+                    # 保存音檔
+                    import torchaudio
+                    torchaudio.save(
+                        str(output_file),
+                        final_tensor,
+                        OUTPUT_SAMPLE_RATE
+                    )
+                    
+                    separated_files.append({
+                        "speaker": i + 1,
+                        "file_path": str(output_file),
+                        "start_time": 0.0,
+                        "end_time": duration,
+                        "duration": duration,
+                        "forced_generation": i >= num_speakers  # 標記是否為強制產生
+                    })
+                    
+                    print(f"   - {SPEAKER_PREFIX}{i+1}: {output_file.name} {'(強制產生)' if i >= num_speakers else ''}")
+                    
+                except Exception as e:
+                    print(f"⚠️  產生語者 {i+1} 音檔失敗: {e}")
+            
+    except Exception as e:
+        raise RuntimeError(f"強制分離過程失敗: {e}")
+    
+    return separated_files
+
+# 保留原始函數作為備選
 def separate_single_audio_file(separator: AudioSeparator, 
                              input_path: str, 
                              output_base: Path) -> Dict:
     """
-    分離單個音檔
+    分離單個音檔 (原始版本，依賴說話者檢測)
     
     Args:
         separator: 音頻分離器實例
@@ -347,6 +592,7 @@ def batch_audio_separation(input_directory: str, output_directory: str):
     print(f"輸入資料夾: {input_directory}")
     print(f"輸出資料夾: {output_directory}")
     print(f"降噪功能: {'啟用' if ENABLE_NOISE_REDUCTION else '停用'}")
+    print(f"強制雙語者模式: {'啟用' if FORCE_TWO_SPEAKERS else '停用'}")
     print("=" * 80)
     
     # 檢查輸入資料夾
@@ -396,8 +642,11 @@ def batch_audio_separation(input_directory: str, output_directory: str):
             # 生成輸出路徑
             output_base = get_output_path(audio_file, input_directory, output_directory)
             
-            # 處理單個檔案
-            result = separate_single_audio_file(separator, audio_file, output_base)
+            # 處理單個檔案 - 根據設定選擇處理方式
+            if FORCE_TWO_SPEAKERS:
+                result = separate_single_audio_file_force_two_speakers(separator, audio_file, output_base)
+            else:
+                result = separate_single_audio_file(separator, audio_file, output_base)
             results.append(result)
             
             # 定期保存進度
@@ -462,6 +711,7 @@ def main():
     print(f"📂 輸入資料夾: {INPUT_DIRECTORY}")
     print(f"📤 輸出資料夾: {OUTPUT_DIRECTORY}")
     print(f"🔧 降噪功能: {'啟用' if ENABLE_NOISE_REDUCTION else '停用'}")
+    print(f"🔧 強制雙語者: {'啟用' if FORCE_TWO_SPEAKERS else '停用'}")
     print(f"🔧 詳細輸出: {'開啟' if ENABLE_VERBOSE else '關閉'}")
     print(f"💾 保存結果: {'開啟' if SAVE_DETAILED_RESULTS else '關閉'}")
     print(f"🔄 進度保存: {'開啟' if ENABLE_PROGRESS_SAVE else '關閉'}")

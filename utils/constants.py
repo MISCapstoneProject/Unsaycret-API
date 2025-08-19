@@ -4,9 +4,9 @@
 """
 
 # 語者識別閾值 (演算法核心參數，經過實驗調校)
-THRESHOLD_LOW = 0.2      # 過於相似，不更新向量
-THRESHOLD_UPDATE = 0.33   # 相似度足夠，更新向量
-THRESHOLD_NEW = 0.37     # 超過此值視為新語者
+THRESHOLD_LOW = 0.1      # 低於此閾值表示過於相似，不更新向量
+THRESHOLD_UPDATE = 0.28   # 低於此閾值更新向量，進行加權平均，高於此閾值則新增一筆聲紋至同一語者
+THRESHOLD_NEW = 0.38     # 超過此值視為新語者
 
 # 音訊處理固定參數 (技術規格要求)
 AUDIO_SAMPLE_RATE = 16000    # SpeechBrain 模型要求的取樣率
