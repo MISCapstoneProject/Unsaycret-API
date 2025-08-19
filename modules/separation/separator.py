@@ -1,12 +1,11 @@
 """
 ===============================================================================
-Voice_ID
 即時語者分離與識別系統 (Real-time Speech Separation and Speaker Identification System)
 ===============================================================================
 
-版本：v2.2.0
+版本：v3.0.0
 作者：EvanLo62, CYouuu
-最後更新：2025-07-09
+最後更新：2025-08-18
 
 功能摘要：
 -----------
@@ -97,41 +96,36 @@ Weaviate 資料庫設定：
 
 ===============================================================================
 """
-
+from __future__ import annotations
 import os
-import librosa
 import numpy as np
-from sklearn.cluster import DBSCAN
 import torch
 import torchaudio
 import pyaudio # type: ignore
 import logging
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
-from typing import List, Dict, Optional, Tuple, Any, Union
 from speechbrain.inference import SepformerSeparation as separator
 from speechbrain.inference import SpeakerRecognition
 import noisereduce as nr # type: ignore
 import threading
 import time
+import argparse
+from typing import Union
+from pathlib import Path
 from scipy import signal
 from scipy.ndimage import uniform_filter1d
 from enum import Enum
 
-# 修改模型載入方式
-try:
-    from asteroid.models import ConvTasNet
-    USE_ASTEROID = True
-except ImportError:
-    from transformers import AutoModel
-    USE_ASTEROID = False
+# 導入語者數量識別模組
+from pyannote.audio import Pipeline
 
 # 導入日誌模組
 from utils.logger import get_logger
 
 # 導入配置 (環境變數)
 from utils.env_config import (
-    AUDIO_RATE, MODELS_BASE_DIR, FORCE_CPU, CUDA_DEVICE_INDEX
+    AUDIO_RATE, MODELS_BASE_DIR, FORCE_CPU, CUDA_DEVICE_INDEX, HF_ACCESS_TOKEN
 )
 
 # 導入常數 (應用程式參數)  
@@ -148,22 +142,20 @@ from modules.identification import VID_identify_v5 as speaker_id
 
 # 新增模型類型枚舉
 class SeparationModel(Enum):
-    CONVTASNET_3SPEAKER = "convtasnet_3speaker"  # ConvTasNet 3人模型
-    SEPFORMER_2SPEAKER = "sepformer_2speaker"    # SepFormer 2人模型
+    SEPFORMER_2SPEAKER = "sepformer_2speaker"    # SepFormer 2人語者分離模型（預訓練）
+    SEPFORMER_3SPEAKER = "sepformer_3speaker"    # SepFormer 3人語者分離模型（自訓練）
 
 # 模型配置
 MODEL_CONFIGS = {
-    SeparationModel.CONVTASNET_3SPEAKER: {
-        "model_name": "JorisCos/ConvTasNet_Libri3Mix_sepnoisy_16k",
-        "num_speakers": 3,
-        "sample_rate": AUDIO_SAMPLE_RATE,
-        "use_speechbrain": False
-    },
     SeparationModel.SEPFORMER_2SPEAKER: {
         "model_name": SPEECHBRAIN_SEPARATOR_MODEL,
         "num_speakers": 2,
-        "sample_rate": AUDIO_SAMPLE_RATE,
-        "use_speechbrain": True
+        "sample_rate": AUDIO_SAMPLE_RATE
+    },
+    SeparationModel.SEPFORMER_3SPEAKER: {
+        "model_name": "AlvinLo62/sepformer-tcc300-3spks-16k-noisy",
+        "num_speakers": 3,
+        "sample_rate": AUDIO_SAMPLE_RATE
     }
 }
 
@@ -192,15 +184,16 @@ WIENER_FILTER_STRENGTH = 0.01  # 更溫和的維納濾波
 HIGH_FREQ_CUTOFF = 7500  # 提高高頻截止點
 DYNAMIC_RANGE_COMPRESSION = 0.7  # 動態範圍壓縮
 
-# ConvTasNet 模型參數 (使用常數配置)
+
 DEFAULT_MODEL = DEFAULT_SEPARATION_MODEL
+
 # 修正 DEFAULT_MODEL 的賦值
 if DEFAULT_SEPARATION_MODEL == "sepformer_2speaker":
     DEFAULT_MODEL = SeparationModel.SEPFORMER_2SPEAKER
-elif DEFAULT_SEPARATION_MODEL == "convtasnet_3speaker":
-    DEFAULT_MODEL = SeparationModel.CONVTASNET_3SPEAKER
+elif DEFAULT_SEPARATION_MODEL == "sepformer_3speaker":
+    DEFAULT_MODEL = SeparationModel.SEPFORMER_3SPEAKER
 else:
-    DEFAULT_MODEL = SeparationModel.SEPFORMER_2SPEAKER  # 預設值
+    DEFAULT_MODEL = SeparationModel.SEPFORMER_3SPEAKER  # 預設值改為您的模型
 
 MODEL_NAME = MODEL_CONFIGS[DEFAULT_MODEL]["model_name"]
 NUM_SPEAKERS = MODEL_CONFIGS[DEFAULT_MODEL]["num_speakers"]
@@ -217,8 +210,8 @@ def set_default_model(model_type: SeparationModel):
 def get_available_models():
     """取得可用的模型列表"""
     return {
-        "convtasnet_3speaker": "ConvTasNet 3人語者分離模型",
-        "sepformer_2speaker": "SepFormer 2人語者分離模型"
+        "sepformer_2speaker": "SepFormer 2人語者分離模型（預訓練）",
+        "sepformer_3speaker": "SepFormer 3人語者分離模型（自訓練）"
     }
 
 def create_separator(model_name: str = None, **kwargs):
@@ -226,17 +219,17 @@ def create_separator(model_name: str = None, **kwargs):
     建立 AudioSeparator 實例的便利函式
     
     Args:
-        model_name: 模型名稱 ("convtasnet_3speaker" 或 "sepformer_2speaker")
+        model_name: 模型名稱 ("sepformer_2speaker" 或 "sepformer_3speaker")
         **kwargs: 其他參數傳遞給 AudioSeparator
     
     Returns:
         AudioSeparator 實例
     """
     if model_name:
-        if model_name == "convtasnet_3speaker":
-            model_type = SeparationModel.CONVTASNET_3SPEAKER
-        elif model_name == "sepformer_2speaker":
+        if model_name == "sepformer_2speaker":
             model_type = SeparationModel.SEPFORMER_2SPEAKER
+        elif model_name == "sepformer_3speaker":
+            model_type = SeparationModel.SEPFORMER_3SPEAKER
         else:
             raise ValueError(f"不支援的模型: {model_name}。可用模型: {list(get_available_models().keys())}")
     else:
@@ -286,7 +279,9 @@ class AudioSeparator:
         self.model_type = model_type
         self.model_config = MODEL_CONFIGS[model_type]
         self.num_speakers = self.model_config["num_speakers"]
-        self.enable_noise_reduction = enable_noise_reduction
+        
+        # 關閉降噪功能以保持原始音質
+        self.enable_noise_reduction = enable_noise_reduction  # 強制關閉以保持音質一致性
         self.snr_threshold = snr_threshold
         
         logger.info(f"使用設備: {self.device}")
@@ -341,120 +336,77 @@ class AudioSeparator:
         """載入語者分離模型"""
         model_name = self.model_config["model_name"]
         
-        if self.model_config["use_speechbrain"]:
-            # 使用 SpeechBrain SepFormer 模型
-            try:
-                logger.info(f"載入 SpeechBrain 模型: {model_name}")
+        # 使用 SpeechBrain SepFormer 模型
+        try:
+            logger.info(f"載入 SpeechBrain 模型: {model_name}")
+            
+            # 檢查本地模型目錄是否包含無效的符號連結
+            local_model_path = os.path.abspath(f"models/{self.model_type.value}")
+            if os.path.exists(local_model_path):
+                logger.info(f"檢查本地模型路徑: {local_model_path}")
                 
-                # 檢查本地模型目錄是否包含無效的符號連結
+                # 檢查是否有無效的符號連結 (Windows JUNCTION 指向 Linux 路徑)
+                hyperparams_file = os.path.join(local_model_path, "hyperparams.yaml")
+                if os.path.exists(hyperparams_file):
+                    try:
+                        # 測試檔案讀取權限
+                        with open(hyperparams_file, 'r', encoding='utf-8') as f:
+                            content = f.read(100)  # 讀取前100個字符來測試
+                        logger.info("本地模型檔案讀取正常")
+                    except (PermissionError, OSError, UnicodeDecodeError) as e:
+                        logger.warning(f"本地模型檔案無法讀取: {e}")
+                        logger.info("偵測到無效的符號連結，準備重新下載模型...")
+                        
+                        # 刪除包含無效符號連結的目錄
+                        try:
+                            import shutil
+                            shutil.rmtree(local_model_path, ignore_errors=True)
+                            logger.info(f"已刪除無效的模型目錄: {local_model_path}")
+                        except Exception as rm_error:
+                            logger.warning(f"刪除模型目錄時發生錯誤: {rm_error}")
+            
+            # 嘗試載入模型 (如果本地檔案無效，SpeechBrain 會自動重新下載)
+            model = separator.from_hparams(
+                source=model_name,
+                savedir=os.path.abspath(f"models/{self.model_type.value}"),
+                run_opts={"device": self.device}
+            )
+            logger.info("SpeechBrain 模型載入成功")
+            return model
+            
+        except Exception as e:
+            logger.error(f"SpeechBrain 模型載入失敗: {e}")
+            
+            # 最後嘗試：強制重新下載
+            try:
+                logger.info("嘗試強制重新下載模型...")
+                import shutil
                 local_model_path = os.path.abspath(f"models/{self.model_type.value}")
                 if os.path.exists(local_model_path):
-                    logger.info(f"檢查本地模型路徑: {local_model_path}")
-                    
-                    # 檢查是否有無效的符號連結 (Windows JUNCTION 指向 Linux 路徑)
-                    hyperparams_file = os.path.join(local_model_path, "hyperparams.yaml")
-                    if os.path.exists(hyperparams_file):
-                        try:
-                            # 測試檔案讀取權限
-                            with open(hyperparams_file, 'r', encoding='utf-8') as f:
-                                content = f.read(100)  # 讀取前100個字符來測試
-                            logger.info("本地模型檔案讀取正常")
-                        except (PermissionError, OSError, UnicodeDecodeError) as e:
-                            logger.warning(f"本地模型檔案無法讀取: {e}")
-                            logger.info("偵測到無效的符號連結，準備重新下載模型...")
-                            
-                            # 刪除包含無效符號連結的目錄
-                            try:
-                                import shutil
-                                shutil.rmtree(local_model_path, ignore_errors=True)
-                                logger.info(f"已刪除無效的模型目錄: {local_model_path}")
-                            except Exception as rm_error:
-                                logger.warning(f"刪除模型目錄時發生錯誤: {rm_error}")
+                    shutil.rmtree(local_model_path, ignore_errors=True)
+                    logger.info("已清除本地模型快取")
                 
-                # 嘗試載入模型 (如果本地檔案無效，SpeechBrain 會自動重新下載)
                 model = separator.from_hparams(
                     source=model_name,
                     savedir=os.path.abspath(f"models/{self.model_type.value}"),
                     run_opts={"device": self.device}
                 )
-                logger.info("SpeechBrain 模型載入成功")
+                logger.info("強制重新下載後，模型載入成功")
                 return model
                 
-            except Exception as e:
-                logger.error(f"SpeechBrain 模型載入失敗: {e}")
-                
-                # 最後嘗試：強制重新下載
-                try:
-                    logger.info("嘗試強制重新下載模型...")
-                    import shutil
-                    local_model_path = os.path.abspath(f"models/{self.model_type.value}")
-                    if os.path.exists(local_model_path):
-                        shutil.rmtree(local_model_path, ignore_errors=True)
-                        logger.info("已清除本地模型快取")
-                    
-                    model = separator.from_hparams(
-                        source=model_name,
-                        savedir=os.path.abspath(f"models/{self.model_type.value}"),
-                        run_opts={"device": self.device}
-                    )
-                    logger.info("強制重新下載後，模型載入成功")
-                    return model
-                    
-                except Exception as final_error:
-                    logger.error(f"所有載入嘗試均失敗: {final_error}")
-                    raise Exception(f"模型載入完全失敗。請檢查網路連線和模型可用性。原始錯誤: {e}")
-        else:
-            # 使用 ConvTasNet 模型（原有邏輯）
-            if USE_ASTEROID:
-                try:
-                    model = ConvTasNet.from_pretrained(model_name)
-                    model = model.to(self.device)
-                    model.eval()
-                    return model
-                except Exception as e:
-                    logger.warning(f"Asteroid 載入失敗，嘗試其他載入方式...")
-            
-            try:
-                model = AutoModel.from_pretrained(
-                    model_name,
-                    trust_remote_code=True
-                )
-                model = model.to(self.device)
-                model.eval()
-                return model
-            except Exception as e:
-                logger.info("嘗試使用 torch.hub 載入...")
-                return self._manual_load_model()
-
-    def _manual_load_model(self):
-        """手動載入 ConvTasNet 模型"""
-        try:
-            model_dir = f"models/{self.model_type.value}"
-            os.makedirs(model_dir, exist_ok=True)
-            model = torch.hub.load('JorisCos/ConvTasNet', 'ConvTasNet_Libri3Mix_sepnoisy_16k', pretrained=True)
-            model = model.to(self.device)
-            model.eval()
-            return model
-        except Exception as e:
-            logger.error(f"所有載入方式均失敗: {e}")
-            raise
+            except Exception as final_error:
+                logger.error(f"所有載入嘗試均失敗: {final_error}")
+                raise Exception(f"模型載入完全失敗。請檢查網路連線和模型可用性。原始錯誤: {e}")
 
     def _test_model(self):
         """測試模型"""
         try:
             with torch.no_grad():
-                if self.model_config["use_speechbrain"]:
-                    # SpeechBrain SepFormer 模型測試
-                    # SepFormer 期望輸入格式為 [batch, samples]
-                    test_audio = torch.randn(1, AUDIO_SAMPLE_RATE).to(self.device)
-                    logger.debug(f"SpeechBrain 測試音訊形狀: {test_audio.shape}")
-                    output = self.model.separate_batch(test_audio)
-                else:
-                    # ConvTasNet 模型測試
-                    # ConvTasNet 期望輸入格式為 [batch, channels, samples]
-                    test_audio = torch.randn(1, 1, AUDIO_SAMPLE_RATE).to(self.device)
-                    logger.debug(f"ConvTasNet 測試音訊形狀: {test_audio.shape}")
-                    output = self.model(test_audio)
+                # SpeechBrain SepFormer 模型測試
+                # SepFormer 期望輸入格式為 [batch, samples]
+                test_audio = torch.randn(1, AUDIO_SAMPLE_RATE).to(self.device)
+                logger.debug(f"SpeechBrain 測試音訊形狀: {test_audio.shape}")
+                output = self.model.separate_batch(test_audio)
                     
             logger.info("模型測試通過")
             logger.debug(f"輸出形狀: {output.shape if hasattr(output, 'shape') else type(output)}")
@@ -569,53 +521,22 @@ class AudioSeparator:
         if not self.enable_noise_reduction:
             return separated_signals
         
-        # 處理形狀 - 根據不同模型調整
-        if self.model_config["use_speechbrain"]:
-            # SpeechBrain 模型輸出格式處理
-            if len(separated_signals.shape) == 3:
-                # 格式通常為 [batch, time, speakers]
-                enhanced_signals = torch.zeros_like(separated_signals)
-                speaker_dim = 2
-                time_dim = 1
-            else:
-                separated_signals = separated_signals.unsqueeze(0)
-                enhanced_signals = torch.zeros_like(separated_signals)
-                speaker_dim = 2
-                time_dim = 1
+        # SpeechBrain 模型輸出格式處理
+        if len(separated_signals.shape) == 3:
+            # 格式通常為 [batch, time, speakers]
+            enhanced_signals = torch.zeros_like(separated_signals)
+            speaker_dim = 2
+            time_dim = 1
         else:
-            # ConvTasNet 模型輸出格式處理（原有邏輯）
-            if len(separated_signals.shape) == 3:
-                if separated_signals.shape[1] == self.num_speakers:
-                    enhanced_signals = torch.zeros_like(separated_signals)
-                    speaker_dim = 1
-                    time_dim = 2
-                elif separated_signals.shape[2] == self.num_speakers:
-                    separated_signals = separated_signals.transpose(1, 2)
-                    enhanced_signals = torch.zeros_like(separated_signals)
-                    speaker_dim = 1
-                    time_dim = 2
-                else:
-                    enhanced_signals = torch.zeros_like(separated_signals)
-                    speaker_dim = 2
-                    time_dim = 1
-            else:
-                if separated_signals.shape[0] == self.num_speakers:
-                    separated_signals = separated_signals.unsqueeze(0)
-                    enhanced_signals = torch.zeros_like(separated_signals)
-                    speaker_dim = 1
-                    time_dim = 2
-                else:
-                    separated_signals = separated_signals.unsqueeze(0).transpose(1, 2)
-                    enhanced_signals = torch.zeros_like(separated_signals)
-                    speaker_dim = 1
-                    time_dim = 2
+            separated_signals = separated_signals.unsqueeze(0)
+            enhanced_signals = torch.zeros_like(separated_signals)
+            speaker_dim = 2
+            time_dim = 1
         
         num_speakers = separated_signals.shape[speaker_dim]
         
         for i in range(min(num_speakers, self.num_speakers)):
-            if speaker_dim == 1:
-                current_signal = separated_signals[0, i, :].cpu().numpy()
-            elif speaker_dim == 2:
+            if speaker_dim == 2:
                 current_signal = separated_signals[0, :, i].cpu().numpy()
             else:
                 current_signal = separated_signals[0, :, i].cpu().numpy()
@@ -645,9 +566,7 @@ class AudioSeparator:
             
             length = min(len(processed_signal), separated_signals.shape[time_dim])
             
-            if speaker_dim == 1:
-                enhanced_signals[0, i, :length] = torch.from_numpy(processed_signal[:length]).to(self.device)
-            elif speaker_dim == 2:
+            if speaker_dim == 2:
                 enhanced_signals[0, :length, i] = torch.from_numpy(processed_signal[:length]).to(self.device)
             else:
                 enhanced_signals[0, :length, i] = torch.from_numpy(processed_signal[:length]).to(self.device)
@@ -730,7 +649,7 @@ class AudioSeparator:
         
         try:
             # 步驟0: 初始化語者識別器
-            identifier = SpeakerIdentifier()
+            # identifier = SpeakerIdentifier()
 
             # 步驟1: 初始化錄音裝置
             p = pyaudio.PyAudio()
@@ -906,233 +825,97 @@ class AudioSeparator:
                        f"跳過: {stats['segments_skipped']}, "
                        f"錯誤: {stats['errors']}")
 
-    def detect_speaker_count(self, audio_tensor: torch.Tensor) -> int:
+    def count_speakers(
+        self,
+        audio: torch.Tensor,
+        sample_rate: int = TARGET_RATE,
+        hf_token: str | None = None,
+        num_speakers: int | None = None,
+        min_speakers: int | None = None,
+        max_speakers: int | None = None,
+        device: str | None = None,
+    ):
         """
-        偵測音訊中的說話者數量
-        
-        Args:
-            audio_tensor: 輸入音訊張量 [channels, samples] 或 [batch, channels, samples]
-            
-        Returns:
-            int: 偵測到的說話者數量
-        """
-        try:
-            # 確保音訊格式正確
-            if len(audio_tensor.shape) == 3:
-                audio_data = audio_tensor[0, 0, :].cpu().numpy()
-            elif len(audio_tensor.shape) == 2:
-                audio_data = audio_tensor[0, :].cpu().numpy()
-            else:
-                audio_data = audio_tensor.cpu().numpy()
-            
-            # 0. 基本靜音檢測 - 進一步放寬條件
-            audio_rms = np.sqrt(np.mean(audio_data ** 2))
-            audio_max = np.max(np.abs(audio_data))
-            audio_std = np.std(audio_data)
-            
-            logger.info(f"音訊統計 - RMS: {audio_rms:.6f}, Max: {audio_max:.6f}, STD: {audio_std:.6f}, 靜音閾值: {self.silence_threshold:.6f}")
-            
-            # 更寬鬆的靜音檢測：只要有一個指標超過閾值就認為可能有語音
-            is_silent = (audio_rms < self.silence_threshold and 
-                        audio_max < self.silence_threshold * 4 and 
-                        audio_std < self.silence_threshold * 1.5)
-            
-            if is_silent:
-                logger.info(f"判定為靜音 - 所有指標都低於閾值")
-                return 0
-            
-            logger.info(f"通過靜音檢測，進行語音活動偵測...")
-            
-            # 1. 簡化的語音活動檢測 (VAD)
-            frame_length = int(TARGET_RATE * 0.025)  # 25ms 幀
-            hop_length = int(TARGET_RATE * 0.010)   # 10ms 跳躍
-            
-            # 計算短時能量
-            frames = librosa.util.frame(audio_data, frame_length=frame_length, hop_length=hop_length)
-            energy = np.sum(frames ** 2, axis=0)
-            
-            # 正規化能量
-            if np.max(energy) > 0:
-                energy = energy / np.max(energy)
-            
-            # 簡化的VAD：主要基於能量檢測
-            energy_active = energy > self.vad_threshold
-            
-            # 額外的過零率檢測作為輔助（但不是必需的）
-            try:
-                zero_crossings = []
-                for i in range(min(frames.shape[1], 100)):  # 限制處理數量以提高速度
-                    frame = frames[:, i]
-                    zcr = np.sum(np.diff(np.sign(frame)) != 0) / len(frame)
-                    zero_crossings.append(zcr)
-                zero_crossings = np.array(zero_crossings)
-                
-                # 如果有合理的過零率，結合使用；否則只用能量
-                if len(zero_crossings) > 0:
-                    zcr_active = (zero_crossings > 0.005) & (zero_crossings < 0.8)  # 非常寬鬆的範圍
-                    if np.sum(zcr_active) > len(zcr_active) * 0.05:  # 如果至少5%的幀有合理過零率
-                        combined_active = energy_active[:len(zcr_active)] & zcr_active
-                        if np.sum(combined_active) > np.sum(energy_active) * 0.3:  # 如果結合檢測結果不會過度降低
-                            vad_frames = np.zeros_like(energy_active, dtype=bool)
-                            vad_frames[:len(combined_active)] = combined_active
-                        else:
-                            vad_frames = energy_active
-                    else:
-                        vad_frames = energy_active
-                else:
-                    vad_frames = energy_active
-            except Exception as e:
-                logger.debug(f"過零率檢測失敗，使用純能量檢測: {e}")
-                vad_frames = energy_active
-            
-            logger.info(f"VAD結果 - 總幀數: {len(vad_frames)}, 活動幀數: {np.sum(vad_frames)}, 比例: {np.sum(vad_frames)/len(vad_frames):.3f}")
-            
-            # 2. 更寬鬆的語音區段檢查
-            if np.any(vad_frames):
-                total_speech_ratio = np.sum(vad_frames) / len(vad_frames)
-                
-                # 大幅降低語音活動比例要求
-                if total_speech_ratio < 0.02:  # 只要2%的幀有活動就可能是語音
-                    logger.info(f"語音活動比例太低: {total_speech_ratio:.3f}")
-                    return 0
-                
-                # 檢查連續區段（但要求更寬鬆）
-                diff = np.diff(np.concatenate(([False], vad_frames, [False])).astype(int))
-                starts = np.where(diff == 1)[0]
-                ends = np.where(diff == -1)[0]
-                
-                if len(starts) > 0 and len(ends) > 0:
-                    speech_durations = (ends - starts) * hop_length / TARGET_RATE
-                    max_duration = np.max(speech_durations) if len(speech_durations) > 0 else 0
-                    
-                    logger.info(f"語音區段分析 - 區段數: {len(starts)}, 最長持續時間: {max_duration:.2f}秒, 最小要求: {self.min_speech_duration:.2f}秒")
-                    
-                    # 如果有任何區段超過最小要求，或者總活動比例足夠
-                    if max_duration >= self.min_speech_duration or total_speech_ratio > 0.05:
-                        logger.info("通過語音區段檢查")
-                    else:
-                        logger.info(f"語音區段太短且活動比例不足")
-                        return 0
-                else:
-                    # 如果無法計算區段，檢查總體活動
-                    if total_speech_ratio < 0.03:
-                        logger.info(f"無法計算區段且活動比例不足: {total_speech_ratio:.3f}")
-                        return 0
-            else:
-                logger.info("未檢測到任何語音活動")
-                return 0
-            
-            # 3. 如果通過了所有檢查，嘗試進行說話者數量估計
-            try:
-                # 簡化的MFCC分析
-                mfccs = librosa.feature.mfcc(
-                    y=audio_data, 
-                    sr=TARGET_RATE,
-                    n_mfcc=13,
-                    hop_length=hop_length,
-                    n_fft=frame_length*2
-                )
-                
-                # 確保維度匹配
-                min_frames = min(mfccs.shape[1], len(vad_frames))
-                mfccs = mfccs[:, :min_frames]
-                vad_frames = vad_frames[:min_frames]
-                
-                if np.any(vad_frames):
-                    active_mfccs = mfccs[:, vad_frames]
-                    
-                    if active_mfccs.shape[1] < 5:  # 進一步降低要求
-                        logger.info(f"有效語音幀數很少 ({active_mfccs.shape[1]})，直接判定為單一語者")
-                        return 1
-                    
-                    # 簡化的說話者數量估計
-                    features = active_mfccs.T
-                    audio_duration = len(audio_data) / TARGET_RATE
-                    
-                    # 對於短音訊，直接判定為單一語者
-                    if audio_duration < 3.0 or features.shape[0] < 20:
-                        logger.info(f"短音訊 ({audio_duration:.2f}秒) 或特徵少 ({features.shape[0]})，判定為單一語者")
-                        return 1
-                    
-                    # 嘗試聚類分析（但如果失敗就回傳1）
-                    try:
-                        clustering = DBSCAN(
-                            eps=1.2,  # 更大的聚類半徑
-                            min_samples=max(3, int(features.shape[0] * 0.1))
-                        ).fit(features)
-                        
-                        unique_labels = set(clustering.labels_)
-                        if -1 in unique_labels:
-                            unique_labels.remove(-1)
-                        
-                        detected_speakers = len(unique_labels)
-                        
-                        if detected_speakers == 0:
-                            detected_speakers = 1  # 後備方案
-                        
-                        logger.info(f"聚類分析結果: {detected_speakers} 位說話者")
-                        
-                    except Exception as e:
-                        logger.info(f"聚類分析失敗，預設為單一語者: {e}")
-                        detected_speakers = 1
-                    
-                else:
-                    detected_speakers = 1
-                    
-            except Exception as e:
-                logger.info(f"MFCC分析失敗，預設為單一語者: {e}")
-                detected_speakers = 1
-            
-            # 4. 最終限制和驗證
-            detected_speakers = min(detected_speakers, self.num_speakers)
-            detected_speakers = max(detected_speakers, 1)  # 既然通過了語音檢測，至少是1個說話者
-            
-            logger.info(f"最終偵測結果: {detected_speakers} 位說話者")
-            return detected_speakers
-            
-        except Exception as e:
-            logger.warning(f"語者數量偵測失敗，使用後備方案: {e}")
-            return self._fallback_speaker_detection(audio_data if 'audio_data' in locals() else audio_tensor.cpu().numpy())
+        ***音檔的人數能精準判斷，但錄音方面的判斷還需優化***
+        """ 
+        token = HF_ACCESS_TOKEN or hf_token
+        if not token:
+            raise RuntimeError("請提供 Hugging Face 存取權杖 (--hf_token 或環境變數 HF_TOKEN)。")
+        if sample_rate is None:
+            raise ValueError("傳入 Tensor 時，必須提供 sample_rate。")
 
-    def _fallback_speaker_detection(self, audio_data: np.ndarray) -> int:
-        """
-        後備的語者數量偵測方法，基於簡化的能量分析
-        
-        Args:
-            audio_data: 音訊數據
-            
-        Returns:
-            int: 估計的說話者數量
-        """
         try:
-            # 非常寬鬆的靜音檢測
-            audio_rms = np.sqrt(np.mean(audio_data ** 2))
-            audio_max = np.max(np.abs(audio_data))
+            # ---- 確保 waveform 在 CPU、float32 ----
+            wav = audio.detach().to(dtype=torch.float32)
+            if wav.is_cuda:
+                wav = wav.cpu()
+
+            # ---- 轉單聲道 & [T] ----
+            if wav.ndim == 2 and wav.shape[0] > 1:
+                wav = wav.mean(dim=0, keepdim=True)
+            wav = wav.squeeze(0)  # [T]
+
+            # ---- 輕度 padding（在同一個裝置上）----
+            min_len = 8 * sample_rate
+            if wav.numel() < min_len:
+                pad = torch.zeros(min_len - wav.numel(), device=wav.device, dtype=wav.dtype)
+                wav = torch.cat([wav, pad], dim=0)
+
+            # ---- 載入管線 ----
+            pipe = Pipeline.from_pretrained(
+                "pyannote/speech-separation-ami-1.0", use_auth_token=token
+            )
+            run_device = device or getattr(self, "device", None)
+            if run_device:
+                pipe.to(torch.device(run_device))
+
+            # 執行語者偵測並安全處理結果
+            result = pipe(
+                {"waveform": wav.unsqueeze(0), "sample_rate": int(sample_rate)},
+                min_speakers=min_speakers,
+                max_speakers=max_speakers
+            )
             
-            logger.info(f"後備檢測 - RMS: {audio_rms:.6f}, Max: {audio_max:.6f}")
-            
-            # 只要有一個指標超過很低的閾值就認為有語音
-            if audio_rms < self.silence_threshold * 0.3 and audio_max < self.silence_threshold:
-                logger.info("後備檢測：判定為靜音")
+            # 安全地處理管線結果
+            if isinstance(result, tuple) and len(result) >= 2:
+                diar, sources = result
+            else:
+                # 如果結果格式不符合預期，返回0
+                logger.debug("語者偵測結果格式異常")
                 return 0
             
-            # 如果通過靜音檢測，至少回傳1個說話者
-            logger.info("後備檢測：判定為有語音活動")
-            return 1
-            
-        except Exception as e:
-            logger.warning(f"後備語者偵測也失敗: {e}")
-            # 終極後備方案：只要音訊不是完全靜音就認為有1個說話者
+            # 安全地統計語者數量
             try:
-                if np.any(np.abs(audio_data) > 0.0001):  # 極低的閾值
-                    logger.info("終極後備：偵測到非零音訊")
-                    return 1
+                if hasattr(diar, 'labels'):
+                    labels = list(diar.labels())
+                    if len(labels) == 0:
+                        n_speakers = 0
+                    else:
+                        n_speakers = len(set(labels))
                 else:
-                    logger.info("終極後備：音訊完全靜音")
+                    # 如果沒有labels屬性，返回0
+                    logger.debug("語者偵測結果沒有labels屬性")
                     return 0
-            except:
-                logger.info("所有檢測都失敗，預設回傳1")
-                return 1  # 最保險的選擇
+            except (IndexError, ValueError, AttributeError) as e:
+                logger.debug(f"處理語者標籤時發生錯誤: {e}")
+                return 0
+            
+            # 限制結果範圍
+            if max_speakers is not None:
+                n_speakers = min(n_speakers, int(max_speakers))
+
+            if n_speakers == 0:
+                logger.debug("偵測到 0 位說話者，可能是音訊過短或無語音。")
+                return 0
+            
+            logger.info(f"偵測到 {n_speakers} 位說話者")
+            return n_speakers
+
+        except Exception as e:
+            logger.error(f"語者偵測失敗: {e}")
+            logger.debug(f"語者偵測失敗詳細資訊: {type(e).__name__}: {e}")
+            return 0
+
 
     def separate_and_save(self, audio_tensor, output_dir, segment_index, absolute_start_time=None):
         """
@@ -1145,14 +928,25 @@ class AudioSeparator:
             absolute_start_time: 音訊的絕對開始時間（datetime 物件）
         """
         try:
-            # # 新增：在分離前先偵測說話者數量
-            # detected_speakers = self.detect_speaker_count(audio_tensor)
-            # logger.info(f"片段 {segment_index} - 偵測到 {detected_speakers} 位說話者")
+            # 新增：在分離前先偵測說話者數量
+            detected_speakers = self.count_speakers(
+                audio_tensor, 
+                min_speakers=0, 
+                max_speakers=self.num_speakers
+            )
+            logger.info(f"片段 {segment_index} - 偵測到 {detected_speakers} 位說話者")
             
-            # # 如果沒有偵測到說話者，跳過處理
-            # if detected_speakers == 0:
-            #     logger.info(f"片段 {segment_index} - 未偵測到說話者，跳過處理")
-            #     return []
+            # 如果語者偵測失敗但音訊有能量，使用備用策略
+            if detected_speakers == 0:
+                # 檢查音訊是否確實有內容
+                audio_rms = torch.sqrt(torch.mean(audio_tensor ** 2))
+                if audio_rms > 0.015:  # 閾值，正常說話通常在 0.01-0.1 之間
+                    logger.warning(f"片段 {segment_index} - 語者偵測失敗但音訊有內容 (RMS={audio_rms:.4f})，使用備用策略")
+                    # 使用備用策略：假設只有一位說話者
+                    detected_speakers = 1
+                else:
+                    logger.info(f"片段 {segment_index} - 未偵測到語者, RMS={audio_rms:.4f}，跳過處理")
+                    return []
             
             # 記錄絕對時間戳
             if absolute_start_time is None:
@@ -1167,20 +961,15 @@ class AudioSeparator:
             
             with torch.no_grad():
                 
-                # 根據模型類型選擇不同的分離方法
-                # 在分離方法中，確保 SpeechBrain 模型得到正確格式
-                if self.model_config["use_speechbrain"]:
-                    # 確保輸入是 [batch, samples] 格式
-                    if len(audio_tensor.shape) == 3:
-                        # 如果是 [batch, channels, samples]，需要去掉 channels 維度
-                        if audio_tensor.shape[1] == 1:
-                            audio_tensor = audio_tensor.squeeze(1)  # 變成 [batch, samples]
-                    separated = self.model.separate_batch(audio_tensor)
-                else:
-                    # ConvTasNet 需要 [batch, channels, samples] 格式
-                    if len(audio_tensor.shape) == 2:
-                        audio_tensor = audio_tensor.unsqueeze(0)  # 加上 batch 維度
-                    separated = self.model(audio_tensor)
+                # 確保輸入是 [batch, samples] 格式
+                if len(audio_tensor.shape) == 3:
+                    # 如果是 [batch, channels, samples]，需要去掉 channels 維度
+                    if audio_tensor.shape[1] == 1:
+                        audio_tensor = audio_tensor.squeeze(1)  # 變成 [batch, samples]
+                separated = self.model.separate_batch(audio_tensor)
+                
+                # 添加與 separate_file 相同的正規化處理
+                separated = separated / separated.abs().max(dim=1, keepdim=True)[0]
                 
                 if self.enable_noise_reduction:
                     enhanced_separated = self.enhance_separation(separated)
@@ -1193,52 +982,44 @@ class AudioSeparator:
                 
                 timestamp = datetime.now().strftime('%Y%m%d-%H_%M_%S')
                 
-                # 處理輸出格式
-                if self.model_config["use_speechbrain"]:
-                    # SpeechBrain 模型輸出處理
-                    if len(enhanced_separated.shape) == 3:
-                        num_speakers = enhanced_separated.shape[2]
-                        speaker_dim = 2
-                    else:
-                        num_speakers = 1
-                        speaker_dim = 0
+                # SpeechBrain 模型輸出處理
+                if len(enhanced_separated.shape) == 3:
+                    num_speakers = enhanced_separated.shape[2]
+                    speaker_dim = 2
                 else:
-                    # ConvTasNet 模型輸出處理（原有邏輯）
-                    if len(enhanced_separated.shape) == 3:
-                        if enhanced_separated.shape[1] == self.num_speakers:
-                            num_speakers = enhanced_separated.shape[1]
-                            speaker_dim = 1
-                        else:
-                            num_speakers = enhanced_separated.shape[2]
-                            speaker_dim = 2
-                    else:
-                        num_speakers = 1
-                        speaker_dim = 0
+                    num_speakers = 1
+                    speaker_dim = 0
                 
                 saved_count = 0
                 start_time = current_t0
-                for i in range(min(num_speakers, self.num_speakers)):
+                
+                # 根據實際情況決定要分離多少個語者
+                # 策略：使用偵測到的語者數量，但不超過模型輸出的通道數
+                effective_speakers = min(detected_speakers, num_speakers, self.num_speakers)
+                
+                logger.debug(f"分離參數 - 偵測: {detected_speakers}, 模型輸出: {num_speakers}, 有效: {effective_speakers}")
+                
+                for i in range(effective_speakers):
                     try:
-                        if speaker_dim == 1:
-                            speaker_audio = enhanced_separated[0, i, :].cpu()
-                        elif speaker_dim == 2:
+                        if speaker_dim == 2:
                             speaker_audio = enhanced_separated[0, :, i].cpu()
                         else:
                             speaker_audio = enhanced_separated.cpu().squeeze()
                         
-                        # 改善的正規化處理
+                        # 確保正確的維度
                         if len(speaker_audio.shape) > 1:
                             speaker_audio = speaker_audio.squeeze()
                         
-                        # 檢查音訊品質
+                        # 檢查音訊有效性 - 使用更低的閾值保留更多音訊
                         rms = torch.sqrt(torch.mean(speaker_audio ** 2))
-                        if rms > 0.01:  # 只保存有意義的音訊
-                            # 溫和的正規化
+                        if rms > 0.005:  # 降低閾值以保留更多音訊
+                            
+                            # 最小化正規化處理，保持原始動態範圍
                             max_val = torch.max(torch.abs(speaker_audio))
-                            if max_val > 0:
-                                # 使用軟限制器
-                                normalized = speaker_audio / max_val
-                                speaker_audio = torch.tanh(normalized * 0.9) * 0.85
+                            if max_val > 0.95:  # 只在真正需要時進行正規化
+                                # 使用溫和的縮放，避免改變音質特徵
+                                scale_factor = 0.9 / max_val
+                                speaker_audio = speaker_audio * scale_factor
                         
                             final_tensor = speaker_audio.unsqueeze(0)
                             
@@ -1248,10 +1029,12 @@ class AudioSeparator:
                                 # f"speaker{i+1}_{timestamp}_{segment_index}.wav"
                             )
                             
+                            # 保存音訊時使用較高的品質設定
                             torchaudio.save(
                                 output_file,
                                 final_tensor,
-                                TARGET_RATE
+                                TARGET_RATE,
+                                bits_per_sample=16  # 指定16位元確保音質
                             )
 
                             # 計算絕對時間戳
@@ -1268,7 +1051,7 @@ class AudioSeparator:
                         logger.warning(f"儲存語者 {i+1} 失敗: {e}")
                 
                 if saved_count > 0:
-                    logger.info(f"片段 {segment_index} 完成，儲存 {saved_count} 個檔案")
+                    logger.info(f"片段 {segment_index} 完成，儲存 {saved_count}/{effective_speakers} 個檔案")
                 
             # 更新累計時間到下一段
             current_t0 += seg_duration
@@ -1300,11 +1083,8 @@ class AudioSeparator:
                 if len(audio_tensor.shape) == 2:
                     audio_tensor = audio_tensor.unsqueeze(0)
                 
-                # 步驟1: 語者分離 - 根據模型類型選擇不同方法
-                if self.model_config["use_speechbrain"]:
-                    separated = self.model.separate_batch(audio_tensor)
-                else:
-                    separated = self.model(audio_tensor)
+                # 語者分離
+                separated = self.model.separate_batch(audio_tensor)
                 
                 if self.enable_noise_reduction:
                     enhanced_separated = self.enhance_separation(separated)
@@ -1315,34 +1095,18 @@ class AudioSeparator:
                 if torch.cuda.is_available():
                     torch.cuda.empty_cache()
                 
-                # 處理輸出格式
-                if self.model_config["use_speechbrain"]:
-                    # SpeechBrain 模型輸出處理
-                    if len(enhanced_separated.shape) == 3:
-                        num_speakers = enhanced_separated.shape[2]
-                        speaker_dim = 2
-                    else:
-                        num_speakers = 1
-                        speaker_dim = 0
+                # SpeechBrain 模型輸出處理
+                if len(enhanced_separated.shape) == 3:
+                    num_speakers = enhanced_separated.shape[2]
+                    speaker_dim = 2
                 else:
-                    # ConvTasNet 模型輸出處理（原有邏輯）
-                    if len(enhanced_separated.shape) == 3:
-                        if enhanced_separated.shape[1] == self.num_speakers:
-                            num_speakers = enhanced_separated.shape[1]
-                            speaker_dim = 1
-                        else:
-                            num_speakers = enhanced_separated.shape[2]
-                            speaker_dim = 2
-                    else:
-                        num_speakers = 1
-                        speaker_dim = 0
+                    num_speakers = 1
+                    speaker_dim = 0
                 
                 saved_count = 0
                 for i in range(min(num_speakers, self.num_speakers)):
                     try:
-                        if speaker_dim == 1:
-                            speaker_audio = enhanced_separated[0, i, :].cpu()
-                        elif speaker_dim == 2:
+                        if speaker_dim == 2:
                             speaker_audio = enhanced_separated[0, :, i].cpu()
                         else:
                             speaker_audio = enhanced_separated.cpu().squeeze()

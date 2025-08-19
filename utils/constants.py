@@ -17,7 +17,7 @@ WHISPER_MODEL_CACHE_DIR = "models/faster-whisper"
 # 預設模型配置 (經過測試的穩定版本)
 DEFAULT_WHISPER_MODEL = "medium"
 DEFAULT_WHISPER_BEAM_SIZE = 5
-DEFAULT_SEPARATION_MODEL = "sepformer_2speaker"
+DEFAULT_SEPARATION_MODEL = "sepformer_3speaker"
 
 # 模型名稱常數 (固定的 HuggingFace 模型ID)
 # 如想更改語者辨識模型，要去 modules/identification/VID_identify_v5.py 改設置
@@ -56,10 +56,6 @@ SNR_THRESHOLD = 8
 WIENER_FILTER_STRENGTH = 0.01
 HIGH_FREQ_CUTOFF = 7500
 DYNAMIC_RANGE_COMPRESSION = 0.7
-
-# ConvTasNet 模型參數
-CONVTASNET_MODEL_NAME = "JorisCos/ConvTasNet_Libri3Mix_sepnoisy_16k"
-NUM_SPEAKERS_SEPARATION = 3
 
 # API 預設值
 API_DEFAULT_VERIFICATION_THRESHOLD = 0.4
