@@ -22,6 +22,7 @@ pretrained_models/
 models
 R3SI
 pipeline_stages.csv
+eval_outputs/
 
 # 測試檔案
 *test_report.json

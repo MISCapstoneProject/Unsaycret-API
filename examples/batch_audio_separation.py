@@ -268,18 +268,13 @@ def force_two_speaker_separation(separator: AudioSeparator, audio_tensor: torch.
     try:
         with torch.no_grad():
             # 直接執行分離模型，不進行說話者數量檢測
-            if separator.model_config["use_speechbrain"]:
-                # 確保輸入是 [batch, samples] 格式
-                if len(audio_tensor.shape) == 3:
-                    if audio_tensor.shape[1] == 1:
-                        audio_tensor = audio_tensor.squeeze(1)
-                separated = separator.model.separate_batch(audio_tensor)
-            else:
-                # ConvTasNet 需要 [batch, channels, samples] 格式
-                if len(audio_tensor.shape) == 2:
-                    audio_tensor = audio_tensor.unsqueeze(0)
-                separated = separator.model(audio_tensor)
-            
+
+            # 確保輸入是 [batch, samples] 格式
+            if len(audio_tensor.shape) == 3:
+                if audio_tensor.shape[1] == 1:
+                    audio_tensor = audio_tensor.squeeze(1)
+            separated = separator.model.separate_batch(audio_tensor)
+
             # 應用降噪（如果啟用）
             if separator.enable_noise_reduction:
                 enhanced_separated = separator.enhance_separation(separated)
@@ -292,26 +287,15 @@ def force_two_speaker_separation(separator: AudioSeparator, audio_tensor: torch.
                 torch.cuda.empty_cache()
             
             # 處理輸出格式並強制產生兩個檔案
-            if separator.model_config["use_speechbrain"]:
-                # SpeechBrain 模型輸出處理
-                if len(enhanced_separated.shape) == 3:
-                    num_speakers = min(enhanced_separated.shape[2], 2)  # 強制限制為2
-                    speaker_dim = 2
-                else:
-                    num_speakers = 1
-                    speaker_dim = 0
+
+            # SpeechBrain 模型輸出處理
+            if len(enhanced_separated.shape) == 3:
+                num_speakers = min(enhanced_separated.shape[2], 2)  # 強制限制為2
+                speaker_dim = 2
             else:
-                # ConvTasNet 模型輸出處理
-                if len(enhanced_separated.shape) == 3:
-                    if enhanced_separated.shape[1] >= 2:
-                        num_speakers = 2  # 強制設定為2
-                        speaker_dim = 1
-                    else:
-                        num_speakers = enhanced_separated.shape[2]
-                        speaker_dim = 2
-                else:
-                    num_speakers = 1
-                    speaker_dim = 0
+                num_speakers = 1
+                speaker_dim = 0
+
             
             # 強制產生兩個音檔
             target_speakers = 2
@@ -454,7 +438,7 @@ def separate_single_audio_file(separator: AudioSeparator,
             str(output_base.parent), 
             segment_index=0
         )
-        
+    
         # 處理分離結果
         separated_files = []
         if separated_results:

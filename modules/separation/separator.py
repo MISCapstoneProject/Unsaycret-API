@@ -162,13 +162,12 @@ from utils.logger import get_logger
 
 # 導入配置 (環境變數)
 from utils.env_config import (
-    AUDIO_RATE, MODELS_BASE_DIR, FORCE_CPU, CUDA_DEVICE_INDEX, HF_ACCESS_TOKEN
+    AUDIO_RATE, FORCE_CPU, CUDA_DEVICE_INDEX, HF_ACCESS_TOKEN
 )
 
 # 導入常數 (應用程式參數)  
 from utils.constants import (
-    THRESHOLD_LOW, THRESHOLD_UPDATE, THRESHOLD_NEW,
-    DEFAULT_SEPARATION_MODEL, SPEECHBRAIN_SEPARATOR_MODEL,
+    DEFAULT_SEPARATION_MODEL,
     AUDIO_SAMPLE_RATE, AUDIO_CHUNK_SIZE, AUDIO_CHANNELS, 
     AUDIO_WINDOW_SIZE, AUDIO_OVERLAP, AUDIO_MIN_ENERGY_THRESHOLD, 
     AUDIO_MAX_BUFFER_MINUTES, API_MAX_WORKERS, AUDIO_TARGET_RATE
@@ -181,6 +180,13 @@ from .dynamic_model_manager import (
     create_dynamic_model_manager,
     get_available_models
 )
+
+# 導入語者計數器
+from .speaker_counter import SpeakerCounter
+
+# 導入單人選路器
+from .best_speaker_selector import SingleSpeakerSelector
+
 
 # 基本錄音參數（從配置讀取）
 CHUNK = AUDIO_CHUNK_SIZE
@@ -261,6 +267,15 @@ IDENTIFIED_DIR = "R3SI/Identified-Speakers"
 # 初始化日誌系統
 logger = get_logger(__name__)
 
+# 確保整個模組的 DEBUG 訊息會印出（含所有 handler）
+# import logging
+# logger.setLevel(logging.DEBUG)
+# for h in logger.handlers:
+#     try:
+#         h.setLevel(logging.DEBUG)
+#     except Exception:
+#         pass
+
 # 在檔案頂部添加全域快取
 _GLOBAL_SEPARATOR_CACHE = {}
 _GLOBAL_SPEAKER_PIPELINE_CACHE = None
@@ -268,7 +283,7 @@ _GLOBAL_SPEAKER_PIPELINE_CACHE = None
 # ================== 語者分離類別 ======================
 
 class AudioSeparator:
-    def __init__(self, model_type: SeparationModel = DEFAULT_MODEL, enable_noise_reduction=False, snr_threshold=SNR_THRESHOLD, enable_dynamic_model=True):
+    def __init__(self, model_type: SeparationModel = DEFAULT_MODEL, enable_noise_reduction=True, snr_threshold=SNR_THRESHOLD, enable_dynamic_model=True):
         # 設備選擇邏輯：優先考慮 FORCE_CPU 設定
         if FORCE_CPU:
             self.device = "cpu"
@@ -332,6 +347,23 @@ class AudioSeparator:
                 logger.error(f"模型載入失敗: {e}")
                 raise
         
+        # 單人情境：自動選聲道器（V2 參數）
+        self.single_selector = SingleSpeakerSelector(
+            sr=TARGET_RATE,          # 例如 16000，請確保跟你處理音檔的實際採樣率一致
+            frame_ms=20,
+            hop_ms=10,
+            alpha=1.5,               # 能量式 VAD 門檻（僅用於統計/特徵的 gating）
+            min_rms=1e-6,
+
+            # 這四個是新版的權重名稱
+            w_sisdr=0.60,            # 主特徵：對 mix 的 SI-SDR（投影分數）
+            w_band=0.25,             # 300–3400 Hz 人聲頻帶能量佔比
+            w_tonality=0.15,         # 1 - spectral flatness
+            w_zcr_penalty=0.10,      # 零交越率懲罰（越高越懲罰）
+
+            tie_tol=0.02,
+        )
+        
         try:
             self.resampler = torchaudio.transforms.Resample(
                 orig_freq=RATE,
@@ -359,10 +391,17 @@ class AudioSeparator:
         }
         
         self.max_buffer_size = int(RATE * MAX_BUFFER_MINUTES * 60 / CHUNK)
-        
-        # 新增語者計數管線初始化
-        self.speaker_count_pipeline = None
+
+        # 初始化語者計數管線
         self._init_speaker_count_pipeline()
+
+        # 改用獨立類別集中管理語者數量偵測，並傳入快取的管線
+        self.spk_counter = SpeakerCounter(
+            hf_token=HF_ACCESS_TOKEN, 
+            device=self.device, 
+            pipeline=getattr(self, 'speaker_count_pipeline', None)
+        )
+        logger.info("語者計數器初始化完成")
         
         logger.info("AudioSeparator 初始化完成")
 
@@ -379,7 +418,7 @@ class AudioSeparator:
             
             if HF_ACCESS_TOKEN:
                 pipeline = Pipeline.from_pretrained(
-                    "pyannote/speech-separation-ami-1.0", 
+                    "pyannote/speaker-diarization-3.1", 
                     use_auth_token=HF_ACCESS_TOKEN
                 )
                 # 將管線移到相同設備
@@ -920,108 +959,6 @@ class AudioSeparator:
                        f"跳過: {stats['segments_skipped']}, "
                        f"錯誤: {stats['errors']}")
 
-    def count_speakers(
-        self,
-        audio: torch.Tensor,
-        sample_rate: int = TARGET_RATE,
-        hf_token: str | None = None,
-        num_speakers: int | None = None,
-        min_speakers: int | None = None,
-        max_speakers: int | None = None,
-        device: str | None = None,
-    ):
-        """
-        ***音檔的人數能精準判斷，但錄音方面的判斷還需優化***
-        """ 
-        # 優先使用預載入的管線
-        if self.speaker_count_pipeline is not None:
-            pipe = self.speaker_count_pipeline
-        else:
-            # 備用方案：臨時載入（如果預載入失敗）
-            token = HF_ACCESS_TOKEN or hf_token
-            if not token:
-                raise RuntimeError("請提供 Hugging Face 存取權杖 (--hf_token 或環境變數 HF_TOKEN)。")
-            
-            try:
-                from pyannote.audio import Pipeline
-                pipe = Pipeline.from_pretrained(
-                    "pyannote/speech-separation-ami-1.0", use_auth_token=token
-                )
-                run_device = device or getattr(self, "device", None)
-                if run_device:
-                    pipe.to(torch.device(run_device))
-            except Exception as e:
-                logger.error(f"臨時載入語者計數管線失敗: {e}")
-                return 0
-
-        if sample_rate is None:
-            raise ValueError("傳入 Tensor 時，必須提供 sample_rate。")
-
-        try:
-            # ---- 確保 waveform 在 CPU、float32 ----
-            wav = audio.detach().to(dtype=torch.float32)
-            if wav.is_cuda:
-                wav = wav.cpu()
-
-            # ---- 轉單聲道 & [T] ----
-            if wav.ndim == 2 and wav.shape[0] > 1:
-                wav = wav.mean(dim=0, keepdim=True)
-            wav = wav.squeeze(0)  # [T]
-
-            # ---- 輕度 padding（在同一個裝置上）----
-            min_len = 8 * sample_rate
-            if wav.numel() < min_len:
-                pad = torch.zeros(min_len - wav.numel(), device=wav.device, dtype=wav.dtype)
-                wav = torch.cat([wav, pad], dim=0)
-
-            # 執行語者偵測並安全處理結果
-            result = pipe(
-                {"waveform": wav.unsqueeze(0), "sample_rate": int(sample_rate)},
-                min_speakers=min_speakers,
-                max_speakers=max_speakers
-            )
-            
-            # 安全地處理管線結果
-            if isinstance(result, tuple) and len(result) >= 2:
-                diar, sources = result
-            else:
-                # 如果結果格式不符合預期，返回0
-                logger.debug("語者偵測結果格式異常")
-                return 0
-            
-            # 安全地統計語者數量
-            try:
-                if hasattr(diar, 'labels'):
-                    labels = list(diar.labels())
-                    if len(labels) == 0:
-                        n_speakers = 0
-                    else:
-                        n_speakers = len(set(labels))
-                else:
-                    # 如果沒有labels屬性，返回0
-                    logger.debug("語者偵測結果沒有labels屬性")
-                    return 0
-            except (IndexError, ValueError, AttributeError) as e:
-                logger.debug(f"處理語者標籤時發生錯誤: {e}")
-                return 0
-            
-            # 限制結果範圍
-            if max_speakers is not None:
-                n_speakers = min(n_speakers, int(max_speakers))
-
-            if n_speakers == 0:
-                logger.debug("偵測到 0 位說話者，可能是音訊過短或無語音。")
-                return 0
-            
-            logger.info(f"偵測到 {n_speakers} 位說話者")
-            return n_speakers
-
-        except Exception as e:
-            logger.error(f"語者偵測失敗: {e}")
-            logger.debug(f"語者偵測失敗詳細資訊: {type(e).__name__}: {e}")
-            return 0
-
-
     def separate_and_save(self, audio_tensor, output_dir, segment_index, absolute_start_time=None):
         """
         分離並儲存音訊，並回傳 (path, start, end) 列表。
@@ -1033,25 +970,47 @@ class AudioSeparator:
             absolute_start_time: 音訊的絕對開始時間（datetime 物件）
         """
         try:
-            # 在分離前先偵測說話者數量
-            detected_speakers = self.count_speakers(
-                audio_tensor, 
-                min_speakers=0, 
-                max_speakers=3  # 支援最多3人偵測
+            # 先以寬鬆範圍跑一次，並套用重疊感知後處理；若你的批次確定雙人，可設 expected_min/max=2
+            detected_speakers = self.spk_counter.count_with_refine(
+                audio=audio_tensor,
+                sample_rate=TARGET_RATE,
+                expected_min=2,
+                expected_max=2,
+                first_pass_range=(1, 3),
+                allow_zero=False,         # <== 允許回傳 0（無語音）
+                debug=False
             )
+
             logger.info(f"片段 {segment_index} - 偵測到 {detected_speakers} 位說話者")
             
-            # 如果語者偵測失敗但音訊有能量，使用備用策略
+            # 備援：第一次回 0 但疑似有人聲 → 限定 1–2 再試
             if detected_speakers == 0:
-                # 檢查音訊是否確實有內容
-                audio_rms = torch.sqrt(torch.mean(audio_tensor ** 2))
-                if audio_rms > 0.018:  # 閾值，正常說話通常在 0.01-0.1 之間
-                    logger.warning(f"片段 {segment_index} - 語者偵測失敗但音訊有內容 (RMS={audio_rms:.4f})，使用備用策略")
-                    # 使用備用策略：假設只有一位說話者
-                    detected_speakers = 1
-                else:
-                    logger.info(f"片段 {segment_index} - 未偵測到語者, RMS={audio_rms:.4f}，跳過處理")
+                
+                has_speech = self.spk_counter._has_voice(audio_tensor, TARGET_RATE)
+
+                if not has_speech:
+                    logger.info(f"片段 {segment_index} - 無語音。跳過")
                     return []
+
+                logger.warning(f"片段 {segment_index} - 第一次偵測失敗，但疑似有人聲。改用 1–2 人重試")
+                try:
+                    # 2) 限制 1–2 人再跑一次
+                    retry = self.spk_counter.count_with_refine(
+                        audio=audio_tensor,
+                        sample_rate=TARGET_RATE,
+                        expected_min=1,
+                        expected_max=2,
+                        first_pass_range=(1, 2)
+                    )
+                    if retry > 0:
+                        detected_speakers = retry
+                    else:
+                        # 3) 仍失敗才保守回 1
+                        detected_speakers = 1
+                        logger.warning(f"片段 {segment_index} - 重試仍失敗，保守假定單人")
+                except Exception as e:
+                    logger.error(f"片段 {segment_index} - 備援重試例外: {e}")
+                    detected_speakers = 1
             
             # 動態選擇模型
             current_model, current_model_type = self._get_appropriate_model(detected_speakers)
@@ -1107,6 +1066,41 @@ class AudioSeparator:
                 else:
                     model_output_speakers = 1
                     speaker_dim = 0
+                
+                # 取得混音（原始輸入）一維波形
+                mix_wave = audio_tensor[0].detach().cpu()
+
+                # —— 單人情境：自動選出正確的那一路 —— 
+                if detected_speakers == 1 and model_output_speakers >= 2:
+                    # 收集候選聲道
+                    if speaker_dim == 2:
+                        candidates = [enhanced_separated[0, :, j].detach().cpu() for j in range(model_output_speakers)]
+                    else:
+                        # 保險分支：若是非典型 shape
+                        cand = enhanced_separated.detach().cpu().squeeze()
+                        candidates = [cand]
+                    
+                    try:
+                        # 使用選路器挑選最佳者
+                        best_idx, best_tensor, stats_list = self.single_selector.select(
+                            candidates, mix_wave, return_stats=True
+                        )
+                        if stats_list is not None:
+                            s = stats_list[best_idx]
+                            logger.info(
+                            f"1-spk 選路：speaker{best_idx+1} | "
+                            f"SI-SDR={s['si_sdr_db']:.2f} dB, band={s['band_ratio']:.2f}, "
+                            f"tonality={s['tonality']:.2f}, zcr_penalty={s['zcr_penalty']:.2f}, rms={s['rms']:.4f}"
+                        )
+
+                    except Exception:
+                        logger.exception("單人選路失敗，改用 speaker1 作為保守輸出")
+                        best_idx, best_tensor, stats_list = 0, candidates[0], None
+
+                    # 覆寫為單一路結構 [batch=1, time, speakers=1]，讓後續存檔流程不需大改
+                    enhanced_separated = best_tensor.unsqueeze(0).unsqueeze(-1).to(self.device)
+                    speaker_dim = 2
+                    model_output_speakers = 1
                 
                 saved_count = 0
                 start_time = current_t0
