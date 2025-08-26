@@ -268,17 +268,24 @@ def force_two_speaker_separation(separator: AudioSeparator, audio_tensor: torch.
     try:
         with torch.no_grad():
             # 直接執行分離模型，不進行說話者數量檢測
-            if separator.model_config["use_speechbrain"]:
-                # 確保輸入是 [batch, samples] 格式
+            # 從日誌輸出可知使用的是 SpeechBrain SepFormer 模型
+            model_name = separator.model_config.get("model_name", "")
+            is_speechbrain = "speechbrain" in model_name.lower() or "sepformer" in model_name.lower()
+            
+            if is_speechbrain:
+                # SpeechBrain 模型：確保輸入是 [batch, samples] 格式
                 if len(audio_tensor.shape) == 3:
                     if audio_tensor.shape[1] == 1:
                         audio_tensor = audio_tensor.squeeze(1)
                 separated = separator.model.separate_batch(audio_tensor)
             else:
-                # ConvTasNet 需要 [batch, channels, samples] 格式
+                # ConvTasNet 模型：需要 [batch, channels, samples] 格式
                 if len(audio_tensor.shape) == 2:
                     audio_tensor = audio_tensor.unsqueeze(0)
                 separated = separator.model(audio_tensor)
+            
+            # 🔥 添加與系統主分離模組相同的正規化處理
+            separated = separated / separated.abs().max(dim=1, keepdim=True)[0]
             
             # 應用降噪（如果啟用）
             if separator.enable_noise_reduction:
@@ -292,7 +299,7 @@ def force_two_speaker_separation(separator: AudioSeparator, audio_tensor: torch.
                 torch.cuda.empty_cache()
             
             # 處理輸出格式並強制產生兩個檔案
-            if separator.model_config["use_speechbrain"]:
+            if is_speechbrain:
                 # SpeechBrain 模型輸出處理
                 if len(enhanced_separated.shape) == 3:
                     num_speakers = min(enhanced_separated.shape[2], 2)  # 強制限制為2
@@ -341,27 +348,39 @@ def force_two_speaker_separation(separator: AudioSeparator, audio_tensor: torch.
                         else:
                             speaker_audio = enhanced_separated.cpu().squeeze() * 0.2
                     
-                    # 音頻處理
+                    # 音頻處理 - 採用與系統主分離模組相同的策略
                     if len(speaker_audio.shape) > 1:
                         speaker_audio = speaker_audio.squeeze()
                     
-                    # 正規化處理
-                    max_val = torch.max(torch.abs(speaker_audio))
-                    if max_val > 0:
-                        normalized = speaker_audio / max_val
-                        speaker_audio = torch.tanh(normalized * 0.9) * 0.85
+                    # 檢查音訊有效性 - 使用與主系統相同的閾值
+                    rms = torch.sqrt(torch.mean(speaker_audio ** 2))
+                    min_rms_threshold = 0.005
+                    
+                    if rms > min_rms_threshold:
+                        # 採用溫和的正規化處理，與主系統一致
+                        max_val = torch.max(torch.abs(speaker_audio))
+                        if max_val > 0.95:  # 只在真正需要時進行正規化
+                            # 使用溫和的縮放，避免改變音質特徵
+                            scale_factor = 0.9 / max_val
+                            speaker_audio = speaker_audio * scale_factor
+                    else:
+                        print(f"   - 警告：語者 {i+1} 能量太低 (RMS={rms:.6f})，可能是無效音檔")
+                        # 對於強制產生的無效音檔，繼續處理但標記為低品質
+                        if i >= num_speakers:
+                            speaker_audio = speaker_audio * 0.1  # 進一步降低音量
                     
                     final_tensor = speaker_audio.unsqueeze(0)
                     
                     # 生成輸出檔案名稱
                     output_file = output_base.parent / f"{output_base.name}_{SPEAKER_PREFIX}{i+1}.{OUTPUT_FORMAT}"
                     
-                    # 保存音檔
+                    # 保存音檔 - 使用與系統主分離模組相同的品質設定
                     import torchaudio
                     torchaudio.save(
                         str(output_file),
                         final_tensor,
-                        OUTPUT_SAMPLE_RATE
+                        OUTPUT_SAMPLE_RATE,
+                        bits_per_sample=16  # 指定16位元確保音質，與主系統一致
                     )
                     
                     separated_files.append({

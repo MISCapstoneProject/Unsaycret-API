@@ -65,9 +65,9 @@
 
 閾值參數設定：
 -----------
- - THRESHOLD_LOW = 0.26: 過於相似，不更新向量
- - THRESHOLD_UPDATE = 0.34: 下:更新聲紋向量，上:新增一筆聲紋到語者
- - THRESHOLD_NEW = 0.385: 超過此值視為新語者
+ - THRESHOLD_LOW = 0.09: 過於相似，不更新向量
+ - THRESHOLD_UPDATE = 0.27: 下:更新聲紋向量，上:新增一筆聲紋到語者
+ - THRESHOLD_NEW = 0.38: 超過此值視為新語者
 
 前置需求：
 -----------
@@ -103,7 +103,7 @@ import logging
 from datetime import datetime, timedelta, timezone
 from typing import Tuple, List, Dict, Optional, Union, Any
 import weaviate  # type: ignore
-from weaviate.classes.query import MetadataQuery # type: ignore
+from weaviate.classes.query import MetadataQuery, Filter # type: ignore
 from weaviate.classes.query import QueryReference # type: ignore
 from contextvars import ContextVar
 from itertools import count
@@ -194,13 +194,21 @@ logging.getLogger("speechbrain").setLevel(logging.ERROR)
 # 導入日誌模組
 from utils.logger import get_logger
 from utils.env_config import WEAVIATE_HOST, WEAVIATE_PORT, get_model_save_dir, HF_ACCESS_TOKEN
-from utils.constants import THRESHOLD_LOW, THRESHOLD_UPDATE, THRESHOLD_NEW, SPEECHBRAIN_SPEAKER_MODEL,PYANNOTE_SPEAKER_MODEL, AUDIO_TARGET_RATE
+from utils.constants import (
+    THRESHOLD_LOW, THRESHOLD_UPDATE, THRESHOLD_NEW, 
+    SPEECHBRAIN_SPEAKER_MODEL, PYANNOTE_SPEAKER_MODEL, AUDIO_TARGET_RATE,
+    ENABLE_AS_NORM, AS_NORM_COHORT_SIZE, AS_NORM_TOP_K, AS_NORM_ALPHA,
+    ENABLE_T_NORM, ENABLE_Z_NORM, ENABLE_S_NORM
+)
 
 # 創建模組專屬日誌器
 logger = get_logger(__name__)
 
 # 載入 SpeechBrain 語音辨識模型
 from speechbrain.inference import SpeakerRecognition
+
+# 導入 AS-Norm 處理器
+from modules.database.cohort_manager import ASNormProcessor
 
 # 全域參數設定（從環境配置載入）
 DEFAULT_SPEAKER_NAME = "未命名語者"  # 預設的語者名稱
@@ -389,6 +397,65 @@ class AudioProcessor:
             raise
 
 
+# ==================== AS-Norm 工具函數 ====================
+
+def apply_as_norm_to_distances(test_embedding: np.ndarray, 
+                              distance_results: List[Tuple[str, str, float, int]],
+                              as_norm_processor) -> List[Tuple[str, str, float, int]]:
+    """
+    對距離結果應用 AS-Norm 正規化
+    
+    這是一個便利函數，用於批量處理多個語者的距離計算
+    
+    Args:
+        test_embedding: 測試音訊的嵌入向量
+        distance_results: 原始距離結果列表 [(voice_print_id, speaker_name, distance, update_count)]
+        as_norm_processor: AS-Norm 處理器實例
+        
+    Returns:
+        List[Tuple[str, str, float, int]]: 正規化後的距離結果
+    """
+    if not ENABLE_AS_NORM or not distance_results:
+        return distance_results
+        
+    normalized_results = []
+    
+    for voice_print_id, speaker_name, original_distance, update_count in distance_results:
+        try:
+            # 獲取目標語者的嵌入向量
+            voice_print_collection = as_norm_processor.client.collections.get("VoicePrint")
+            target_obj = voice_print_collection.query.fetch_object_by_id(
+                uuid=voice_print_id,
+                include_vector=True
+            )
+            
+            if target_obj and target_obj.vector:
+                # 處理 named vector
+                vec_dict = target_obj.vector
+                raw_vec = vec_dict["default"] if isinstance(vec_dict, dict) else vec_dict
+                target_embedding = np.array(raw_vec, dtype=float)
+                
+                # 應用 AS-Norm
+                normalized_distance = as_norm_processor.apply_as_norm(
+                    test_embedding, target_embedding, speaker_name
+                )
+                
+                normalized_results.append((voice_print_id, speaker_name, normalized_distance, update_count))
+            else:
+                # 無法獲取嵌入向量時，保持原始距離
+                normalized_results.append((voice_print_id, speaker_name, original_distance, update_count))
+                
+        except Exception as e:
+            logger.warning(f"對語者 {speaker_name} 應用 AS-Norm 時發生錯誤: {e}")
+            # 發生錯誤時保持原始距離
+            normalized_results.append((voice_print_id, speaker_name, original_distance, update_count))
+            
+    return normalized_results
+
+
+# ==================== AS-Norm 功能結束 ====================
+
+
 class WeaviateRepository:
     """Weaviate 資料存取庫類別，負責與 Weaviate V2 資料庫的交互"""
     
@@ -426,12 +493,13 @@ class WeaviateRepository:
             logger.info("使用命令 'docker-compose -f weaviate_study/docker-compose.yml up -d' 啟動 Weaviate")
             raise
     
-    def compare_embedding(self, new_embedding: np.ndarray) -> Tuple[Optional[str], Optional[str], float, List[Tuple[str, str, float, int]]]:
+    def compare_embedding(self, new_embedding: np.ndarray, as_norm_processor=None) -> Tuple[Optional[str], Optional[str], float, List[Tuple[str, str, float, int]]]:
         """
         比較新的嵌入向量與資料庫中所有現有嵌入向量的相似度
         
         Args:
             new_embedding: 新的嵌入向量
+            as_norm_processor: AS-Norm 處理器，可選
             
         Returns:
             tuple: (最佳匹配ID, 最佳匹配語者名稱, 最小距離, 所有距離列表)
@@ -477,6 +545,12 @@ class WeaviateRepository:
                 
                 # 保存距離資訊（使用update_count作為第4個參數）
                 distances.append((object_id, speaker_name, distance, update_count))
+            
+            # 應用 AS-Norm (如果啟用)
+            if as_norm_processor and ENABLE_AS_NORM:
+                print("🔧 應用 AS-Norm 正規化...")
+                distances = apply_as_norm_to_distances(new_embedding, distances, as_norm_processor)
+                print("✅ AS-Norm 正規化完成")
             
             # 找出最小距離
             if distances:
@@ -838,14 +912,106 @@ class SpeakerIdentifier:
         self.threshold_update = THRESHOLD_UPDATE
         self.threshold_new = THRESHOLD_NEW
         
+        # 只有在啟用 AS-Norm 時才初始化處理器
+        if ENABLE_AS_NORM:
+            self.as_norm_processor = ASNormProcessor(self.database.client)
+        else:
+            self.as_norm_processor = None
+        
         # 設置日誌格式
         self.verbose = True  # 控制詳細輸出
+        
+        # 輸出 AS-Norm 初始化狀態
+        if ENABLE_AS_NORM:
+            logger.info("🔧 AS-Norm 正規化功能已啟用")
+        else:
+            logger.info("⚪ AS-Norm 正規化功能已停用")
         
         SpeakerIdentifier._initialized = True
     
     def set_verbose(self, verbose: bool) -> None:
         """設置是否顯示詳細輸出"""
         self.verbose = verbose
+    
+    def set_as_norm_enabled(self, enabled: bool) -> None:
+        """
+        設置是否啟用 AS-Norm 功能
+        
+        Args:
+            enabled: True 啟用 AS-Norm，False 停用
+        """
+        global ENABLE_AS_NORM
+        old_value = ENABLE_AS_NORM
+        ENABLE_AS_NORM = enabled
+        
+        # 動態創建或銷毀 AS-Norm 處理器
+        if enabled and self.as_norm_processor is None:
+            # 啟用時創建處理器
+            self.as_norm_processor = ASNormProcessor(self.database.client)
+        elif not enabled and self.as_norm_processor is not None:
+            # 停用時銷毀處理器
+            self.as_norm_processor = None
+        
+        if self.verbose:
+            if enabled and not old_value:
+                print("✅ AS-Norm 正規化已啟用")
+            elif not enabled and old_value:
+                print("❌ AS-Norm 正規化已停用")
+    
+    def configure_as_norm(self, t_norm: bool = True, z_norm: bool = True, s_norm: bool = True,
+                         cohort_size: int = 100, top_k: int = 10, alpha: float = 0.9) -> None:
+        """
+        配置 AS-Norm 參數
+        
+        Args:
+            t_norm: 是否啟用 T-Norm
+            z_norm: 是否啟用 Z-Norm
+            s_norm: 是否啟用 S-Norm
+            cohort_size: cohort 大小
+            top_k: Top-K impostor 分數
+            alpha: S-Norm 權重參數
+        """
+        global ENABLE_T_NORM, ENABLE_Z_NORM, ENABLE_S_NORM
+        global AS_NORM_COHORT_SIZE, AS_NORM_TOP_K, AS_NORM_ALPHA
+        
+        ENABLE_T_NORM = t_norm
+        ENABLE_Z_NORM = z_norm
+        ENABLE_S_NORM = s_norm
+        AS_NORM_COHORT_SIZE = cohort_size
+        AS_NORM_TOP_K = top_k
+        AS_NORM_ALPHA = alpha
+        
+        # 更新 AS-Norm 處理器的參數（只有在處理器存在時）
+        if self.as_norm_processor is not None:
+            self.as_norm_processor.cohort_size = cohort_size
+            self.as_norm_processor.top_k = top_k
+            self.as_norm_processor.alpha = alpha
+        
+        if self.verbose:
+            if self.as_norm_processor is not None:
+                print(f"🔧 AS-Norm 配置已更新:")
+                print(f"   T-Norm: {t_norm}, Z-Norm: {z_norm}, S-Norm: {s_norm}")
+                print(f"   Cohort Size: {cohort_size}, Top-K: {top_k}, Alpha: {alpha}")
+            else:
+                print("⚠️ AS-Norm 處理器未啟用，配置已保存但未生效")
+    
+    def get_as_norm_status(self) -> Dict[str, Any]:
+        """
+        獲取 AS-Norm 當前狀態
+        
+        Returns:
+            Dict[str, Any]: AS-Norm 狀態資訊
+        """
+        return {
+            "enabled": ENABLE_AS_NORM,
+            "processor_initialized": self.as_norm_processor is not None,
+            "t_norm": ENABLE_T_NORM,
+            "z_norm": ENABLE_Z_NORM,
+            "s_norm": ENABLE_S_NORM,
+            "cohort_size": AS_NORM_COHORT_SIZE,
+            "top_k": AS_NORM_TOP_K,
+            "alpha": AS_NORM_ALPHA
+        }
     
     def _handle_very_similar(self, best_id: str, best_name: str, best_distance: float) -> Tuple[str, str, float]:
         """
@@ -1129,8 +1295,11 @@ class SpeakerIdentifier:
             # 提取嵌入向量
             new_embedding = self.audio_processor.extract_embedding_from_stream(signal, sr)
 
-            # 與 Weaviate 中的嵌入向量比對
-            best_id, best_name, best_distance, all_distances = self.database.compare_embedding(new_embedding)
+            # 與 Weaviate 中的嵌入向量比對，傳遞 AS-Norm 處理器
+            best_id, best_name, best_distance, all_distances = self.database.compare_embedding(
+                new_embedding, 
+                as_norm_processor=self.as_norm_processor if ENABLE_AS_NORM else None
+            )
 
             # 輸出比對結果
             if self.verbose and all_distances:
@@ -1295,6 +1464,43 @@ if __name__ == "__main__":
     # 創建語者識別器
     identifier = SpeakerIdentifier()
     
+    # ==================== AS-Norm 使用示例 ====================
+    # 啟用 AS-Norm 功能
+    # identifier.set_as_norm_enabled(True)
+    
+    # 自訂 AS-Norm 配置
+    # identifier.configure_as_norm(
+    #     t_norm=True,      # 啟用 T-Norm
+    #     z_norm=True,      # 啟用 Z-Norm  
+    #     s_norm=True,      # 啟用 S-Norm (結合 T-Norm 和 Z-Norm)
+    #     cohort_size=50,   # 使用 50 個 impostor 語者
+    #     top_k=10,         # 使用前 10 個最相似的 impostor
+    #     alpha=0.8         # S-Norm 權重參數
+    # )
+    
+    # 查看 AS-Norm 狀態
+    # as_norm_status = identifier.get_as_norm_status()
+    # print("🔍 AS-Norm 狀態:", as_norm_status)
+    
+    # 測試不同的 AS-Norm 組合
+    # print("\n📊 測試各種 AS-Norm 設定...")
+    
+    # 僅使用 T-Norm
+    # identifier.configure_as_norm(t_norm=True, z_norm=False, s_norm=False)
+    # print("🔧 當前設定: 僅 T-Norm")
+    # identifier.process_audio_file("16K-model/Audios-16K-IDTF/speaker1_20250501-22_49_13_1.wav")
+    
+    # 僅使用 Z-Norm
+    # identifier.configure_as_norm(t_norm=False, z_norm=True, s_norm=False)  
+    # print("🔧 當前設定: 僅 Z-Norm")
+    # identifier.process_audio_file("16K-model/Audios-16K-IDTF/speaker1_20250501-22_49_13_1.wav")
+    
+    # 使用完整 S-Norm
+    # identifier.configure_as_norm(t_norm=True, z_norm=True, s_norm=True)
+    # print("🔧 當前設定: 完整 S-Norm")
+    # identifier.process_audio_file("16K-model/Audios-16K-IDTF/speaker1_20250501-22_49_13_1.wav")
+    
+    # ==================== 一般識別測試 ====================
     # 主程式執行: 若要處理單一檔案或資料夾，可解除下列註解
 
     # 範例：處理單一檔案 (現在會透過 process_audio_stream)
