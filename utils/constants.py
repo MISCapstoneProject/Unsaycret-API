@@ -4,8 +4,8 @@
 """
 
 # 語者識別閾值 (演算法核心參數，經過實驗調校)
-THRESHOLD_LOW = 0.1      # 低於此閾值表示過於相似，不更新向量
-THRESHOLD_UPDATE = 0.28   # 低於此閾值更新向量，進行加權平均，高於此閾值則新增一筆聲紋至同一語者
+THRESHOLD_LOW = 0.09      # 低於此閾值表示過於相似，不更新向量
+THRESHOLD_UPDATE = 0.27   # 低於此閾值更新向量，進行加權平均，高於此閾值則新增一筆聲紋至同一語者
 THRESHOLD_NEW = 0.38     # 超過此值視為新語者
 
 # 音訊處理固定參數 (技術規格要求)
@@ -61,3 +61,18 @@ DYNAMIC_RANGE_COMPRESSION = 0.7
 API_DEFAULT_VERIFICATION_THRESHOLD = 0.4
 API_DEFAULT_MAX_RESULTS = 3
 API_MAX_WORKERS = 2
+
+# AS-Norm (Adaptive Score Normalization) 配置
+ENABLE_AS_NORM = False  # AS-Norm 開關，測試用
+AS_NORM_COHORT_SIZE = 50   # Z-Norm 用的 cohort 大小（用於統計計算）
+AS_NORM_TOP_K = 10         # T-Norm 用的 Top-K impostor scores（直接影響計算量）
+AS_NORM_ALPHA = 0.5        # S-Norm 的權重參數（平衡 T-Norm 和 Z-Norm）
+
+# AS-Norm 種類開關 (可分別控制)
+ENABLE_T_NORM = True   # Test normalization
+ENABLE_Z_NORM = True   # Zero normalization  
+ENABLE_S_NORM = True   # Symmetric normalization
+
+# AS-Norm Cohort 資料庫配置
+AS_NORM_COHORT_COLLECTION = "CohortVoicePrint"  # 專用的背景模型資料庫
+AS_NORM_USE_DEDICATED_COHORT = True  # 是否使用專門的cohort資料庫

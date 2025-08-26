@@ -325,27 +325,39 @@ def force_two_speaker_separation(separator: AudioSeparator, audio_tensor: torch.
                         else:
                             speaker_audio = enhanced_separated.cpu().squeeze() * 0.2
                     
-                    # 音頻處理
+                    # 音頻處理 - 採用與系統主分離模組相同的策略
                     if len(speaker_audio.shape) > 1:
                         speaker_audio = speaker_audio.squeeze()
                     
-                    # 正規化處理
-                    max_val = torch.max(torch.abs(speaker_audio))
-                    if max_val > 0:
-                        normalized = speaker_audio / max_val
-                        speaker_audio = torch.tanh(normalized * 0.9) * 0.85
+                    # 檢查音訊有效性 - 使用與主系統相同的閾值
+                    rms = torch.sqrt(torch.mean(speaker_audio ** 2))
+                    min_rms_threshold = 0.005
+                    
+                    if rms > min_rms_threshold:
+                        # 採用溫和的正規化處理，與主系統一致
+                        max_val = torch.max(torch.abs(speaker_audio))
+                        if max_val > 0.95:  # 只在真正需要時進行正規化
+                            # 使用溫和的縮放，避免改變音質特徵
+                            scale_factor = 0.9 / max_val
+                            speaker_audio = speaker_audio * scale_factor
+                    else:
+                        print(f"   - 警告：語者 {i+1} 能量太低 (RMS={rms:.6f})，可能是無效音檔")
+                        # 對於強制產生的無效音檔，繼續處理但標記為低品質
+                        if i >= num_speakers:
+                            speaker_audio = speaker_audio * 0.1  # 進一步降低音量
                     
                     final_tensor = speaker_audio.unsqueeze(0)
                     
                     # 生成輸出檔案名稱
                     output_file = output_base.parent / f"{output_base.name}_{SPEAKER_PREFIX}{i+1}.{OUTPUT_FORMAT}"
                     
-                    # 保存音檔
+                    # 保存音檔 - 使用與系統主分離模組相同的品質設定
                     import torchaudio
                     torchaudio.save(
                         str(output_file),
                         final_tensor,
-                        OUTPUT_SAMPLE_RATE
+                        OUTPUT_SAMPLE_RATE,
+                        bits_per_sample=16  # 指定16位元確保音質，與主系統一致
                     )
                     
                     separated_files.append({

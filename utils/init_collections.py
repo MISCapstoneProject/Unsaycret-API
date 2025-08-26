@@ -173,6 +173,46 @@ class WeaviateCollectionManager:
             logger.error(f"建立 VoicePrint 集合時發生錯誤: {str(e)}")
             return False
     
+    def create_cohort_voiceprint_collection(self) -> bool:
+        """
+        建立 AS-Norm 專用的 Cohort VoicePrint 集合
+        這個集合存放不會在實際辨識中出現的背景語音資料
+        
+        Returns:
+            bool: 是否成功建立 CohortVoicePrint 集合
+        """
+        if not self.client:
+            raise RuntimeError("客戶端未連接，請先調用 connect() 方法")
+        
+        try:
+            # 如果已存在則先刪除
+            if self.collection_exists("CohortVoicePrint"):
+                self.client.collections.delete("CohortVoicePrint")
+                logger.info("已刪除現有的 CohortVoicePrint 集合")
+            
+            # 建立 CohortVoicePrint 集合
+            cohort_collection = self.client.collections.create(
+                name="CohortVoicePrint",
+                properties=[
+                    wc.Property(name="create_time", data_type=wc.DataType.DATE),
+                    wc.Property(name="cohort_id", data_type=wc.DataType.TEXT),  # 背景模型識別碼
+                    wc.Property(name="source_dataset", data_type=wc.DataType.TEXT),  # 來源資料集
+                    wc.Property(name="gender", data_type=wc.DataType.TEXT),  # 性別（可選）
+                    wc.Property(name="language", data_type=wc.DataType.TEXT),  # 語言（可選）
+                    wc.Property(name="description", data_type=wc.DataType.TEXT),  # 描述
+                ],
+                vectorizer_config=wc.Configure.Vectorizer.none(),
+                vector_index_config=wc.Configure.VectorIndex.hnsw(
+                    distance_metric=wc.VectorDistances.COSINE
+                )
+            )
+            logger.info("成功建立 CohortVoicePrint 集合")
+            return True
+            
+        except Exception as e:
+            logger.error(f"建立 CohortVoicePrint 集合時發生錯誤: {str(e)}")
+            return False
+    
     def create_all_collections(self) -> bool:
         """
         建立所有必要的集合
@@ -189,6 +229,10 @@ class WeaviateCollectionManager:
             if not self.create_voiceprint_collection():
                 return False
             
+            # 建立 AS-Norm 專用的 CohortVoicePrint 集合
+            if not self.create_cohort_voiceprint_collection():
+                return False
+            
             logger.info("成功建立所有 Weaviate 集合")
             return True
             
@@ -203,7 +247,7 @@ class WeaviateCollectionManager:
         Returns:
             Dict[str, bool]: 集合名稱與存在狀態的對應
         """
-        collections = ["Speaker", "VoicePrint"]
+        collections = ["Speaker", "VoicePrint", "CohortVoicePrint"]
         results = {}
         
         for collection_name in collections:
