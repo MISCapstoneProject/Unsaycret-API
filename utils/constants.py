@@ -4,8 +4,8 @@
 """
 
 # 語者識別閾值 (演算法核心參數，經過實驗調校)
-THRESHOLD_LOW = 0.2      # 過於相似，不更新向量
-THRESHOLD_UPDATE = 0.33   # 相似度足夠，更新向量
+THRESHOLD_LOW = 0.09      # 過於相似，不更新向量
+THRESHOLD_UPDATE = 0.27   # 相似度足夠，更新向量
 THRESHOLD_NEW = 0.37     # 超過此值視為新語者
 
 # 音訊處理固定參數 (技術規格要求)
