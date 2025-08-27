@@ -37,16 +37,22 @@ AS-Norm Cohort 資料庫管理模組
    manager.initialize_cohort_collection()
    ```
 
-2. 從音頻資料夾導入 cohort：
+2. 導入單個音頻檔案：
    ```python
-   manager.import_audio_folder("/path/to/cohort/audio", 
-                              chunk_length=3.0, overlap=0.5)
+   manager.import_audio_file("/path/to/audio.wav")  # 自動使用檔名作為 source_dataset
    ```
 
-3. 重置 cohort 資料庫：
+3. 從音頻資料夾批量導入 cohort：
+   ```python
+   manager.import_audio_folder("/path/to/cohort/audio")  # 每個檔案使用檔名作為 source_dataset
+   ```
+
+4. 重置 cohort 資料庫：
    ```python
    manager.reset_cohort_collection()
    ```
+
+注意：現在直接處理整個音檔（6秒），不再進行切片處理。
 """
 
 import os
@@ -68,6 +74,7 @@ import weaviate
 import torch
 from speechbrain.inference import SpeakerRecognition
 from scipy.spatial.distance import cosine
+from scipy.signal import resample_poly  # 新增：與 VID_identify_v5.py 一致的重新採樣
 import weaviate.classes as wc
 from weaviate.classes.query import Filter
 
@@ -80,7 +87,6 @@ from utils.constants import (
     ENABLE_AS_NORM, AS_NORM_COHORT_SIZE, AS_NORM_TOP_K, AS_NORM_ALPHA,
     ENABLE_T_NORM, ENABLE_Z_NORM, ENABLE_S_NORM, AS_NORM_USE_DEDICATED_COHORT
 )
-from utils.init_collections import WeaviateCollectionManager
 
 # 創建模組專屬日誌器
 logger = get_logger(__name__)
@@ -243,29 +249,46 @@ class ASNormProcessor:
         """
         if not ENABLE_AS_NORM:
             # AS-Norm 關閉時，返回原始餘弦距離
-            return cosine(test_embedding, target_embedding)
+            original_score = cosine(test_embedding, target_embedding)
+            logger.debug(f"⚪ AS-Norm 已停用，返回原始餘弦距離: {original_score:.4f}")
+            return original_score
             
+        # 計算原始餘弦距離作為對比
+        original_score = cosine(test_embedding, target_embedding)
+        logger.debug(f"📏 原始餘弦距離: {original_score:.4f}")
+        
         # 獲取 impostor 嵌入向量
         impostor_embeddings = self._get_impostor_embeddings(target_id)
         
         # 根據配置選擇正規化方法
         if ENABLE_S_NORM and ENABLE_T_NORM and ENABLE_Z_NORM:
             # 完整 S-Norm
-            return self.compute_s_norm_score(test_embedding, target_embedding, impostor_embeddings)
+            logger.debug("🔧 使用完整 S-Norm (T-Norm + Z-Norm 組合)")
+            normalized_score = self.compute_s_norm_score(test_embedding, target_embedding, impostor_embeddings)
         elif ENABLE_T_NORM and ENABLE_Z_NORM:
             # T-Norm + Z-Norm 組合
+            logger.debug("🔧 使用 T-Norm + Z-Norm 組合")
             t_score = self.compute_t_norm_score(test_embedding, target_embedding, impostor_embeddings)
             z_score = self.compute_z_norm_score(test_embedding, target_embedding)
-            return 0.5 * t_score + 0.5 * z_score
+            normalized_score = 0.5 * t_score + 0.5 * z_score
         elif ENABLE_T_NORM:
             # 僅 T-Norm
-            return self.compute_t_norm_score(test_embedding, target_embedding, impostor_embeddings)
+            logger.debug("🔧 使用 T-Norm 正規化")
+            normalized_score = self.compute_t_norm_score(test_embedding, target_embedding, impostor_embeddings)
         elif ENABLE_Z_NORM:
             # 僅 Z-Norm
-            return self.compute_z_norm_score(test_embedding, target_embedding)
+            logger.debug("🔧 使用 Z-Norm 正規化")
+            normalized_score = self.compute_z_norm_score(test_embedding, target_embedding)
         else:
             # 所有正規化都關閉，返回原始分數
-            return cosine(test_embedding, target_embedding)
+            logger.debug("⚪ 所有正規化方法都已停用，返回原始分數")
+            normalized_score = original_score
+        
+        # 記錄正規化效果
+        improvement = original_score - normalized_score
+        logger.debug(f"📊 正規化結果: {original_score:.4f} → {normalized_score:.4f} (改善: {improvement:+.4f})")
+        
+        return normalized_score
     
     def _get_impostor_embeddings(self, target_id: str) -> List[np.ndarray]:
         """
@@ -415,6 +438,10 @@ class CohortDatabaseManager:
             model_save_dir = get_model_save_dir("speechbrain_recognition")
             os.makedirs(model_save_dir, exist_ok=True)
             
+            # 設定設備
+            self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+            logger.info(f"🔧 使用設備: {self.device}")
+            
             # 載入 SpeechBrain 語者辨識模型
             self.speaker_model = SpeakerRecognition.from_hparams(
                 source=self.model_name,
@@ -434,25 +461,37 @@ class CohortDatabaseManager:
         Returns:
             bool: 是否成功建立或確認 collection 存在
         """
+        if not self.client:
+            logger.error("❌ 資料庫客戶端未連接")
+            return False
+        
         try:
             logger.info(f"🏗️  正在初始化 cohort collection: {AS_NORM_COHORT_COLLECTION}")
             
-            manager = WeaviateCollectionManager()
-            manager.connect()
-            
             # 檢查是否已存在
-            if manager.collection_exists(AS_NORM_COHORT_COLLECTION):
+            if self.client.collections.exists(AS_NORM_COHORT_COLLECTION):
                 logger.info(f"✅ Cohort collection '{AS_NORM_COHORT_COLLECTION}' 已存在")
                 return True
             
-            # 建立 cohort collection
-            success = manager.create_cohort_voiceprint_collection()
-            if success:
-                logger.info(f"✅ 成功建立 cohort collection '{AS_NORM_COHORT_COLLECTION}'")
-            else:
-                logger.error(f"❌ 建立 cohort collection '{AS_NORM_COHORT_COLLECTION}' 失敗")
-            
-            return success
+            # 建立 AS-Norm 專用的 Cohort VoicePrint 集合
+            # 這個集合存放不會在實際辨識中出現的背景語音資料
+            cohort_collection = self.client.collections.create(
+                name=AS_NORM_COHORT_COLLECTION,
+                properties=[
+                    wc.Property(name="create_time", data_type=wc.DataType.DATE),
+                    wc.Property(name="cohort_id", data_type=wc.DataType.TEXT),  # 背景模型識別碼
+                    wc.Property(name="source_dataset", data_type=wc.DataType.TEXT),  # 來源資料集
+                    wc.Property(name="gender", data_type=wc.DataType.TEXT),  # 性別（可選）
+                    wc.Property(name="language", data_type=wc.DataType.TEXT),  # 語言（可選）
+                    wc.Property(name="description", data_type=wc.DataType.TEXT),  # 描述
+                ],
+                vectorizer_config=wc.Configure.Vectorizer.none(),
+                vector_index_config=wc.Configure.VectorIndex.hnsw(
+                    distance_metric=wc.VectorDistances.COSINE
+                )
+            )
+            logger.info(f"✅ 成功建立 cohort collection '{AS_NORM_COHORT_COLLECTION}'")
+            return True
             
         except Exception as e:
             logger.error(f"❌ 初始化 cohort collection 時發生錯誤: {e}")
@@ -484,9 +523,24 @@ class CohortDatabaseManager:
             logger.error(f"❌ 重置 cohort collection 時發生錯誤: {e}")
             return False
     
+    def resample_audio(self, signal: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
+        """
+        使用 scipy 進行高品質重新採樣（與 VID_identify_v5.py 一致）
+        
+        Args:
+            signal: 音頻信號
+            orig_sr: 原始採樣率
+            target_sr: 目標採樣率
+            
+        Returns:
+            np.ndarray: 重新採樣後的音頻信號
+        """
+        return resample_poly(signal, target_sr, orig_sr)
+    
     def extract_embedding(self, audio_path: str) -> Optional[np.ndarray]:
         """
         從音頻檔案提取聲紋嵌入向量
+        與 VID_identify_v5.py 保持完全一致的實作
         
         Args:
             audio_path: 音頻檔案路徑
@@ -495,20 +549,29 @@ class CohortDatabaseManager:
             Optional[np.ndarray]: 聲紋嵌入向量，失敗時返回 None
         """
         try:
-            # 載入音頻檔案
-            waveform, sample_rate = librosa.load(audio_path, sr=AUDIO_TARGET_RATE)
+            # 載入音頻檔案（與 VID_identify_v5.py 一致的方式）
+            waveform, sample_rate = librosa.load(audio_path, sr=None)  # 保持原始採樣率
+            
+            # 處理立體聲轉單聲道（與 VID_identify_v5.py 一致）
+            if waveform.ndim > 1:
+                waveform = waveform.mean(axis=1)
+            
+            # 重新採樣到目標採樣率（與 VID_identify_v5.py 一致）
+            target_sr = AUDIO_TARGET_RATE
+            if sample_rate != target_sr:
+                waveform = self.resample_audio(waveform, sample_rate, target_sr)
             
             # 檢查音頻長度（至少需要 1 秒）
-            min_length = AUDIO_TARGET_RATE  # 1 秒
+            min_length = target_sr  # 1 秒
             if len(waveform) < min_length:
-                logger.warning(f"⚠️  音頻檔案太短，跳過: {audio_path} ({len(waveform)/sample_rate:.2f}s)")
+                logger.warning(f"⚠️  音頻檔案太短，跳過: {audio_path} ({len(waveform)/target_sr:.2f}s)")
                 return None
             
-            # 提取聲紋嵌入向量
-            waveform_tensor = torch.tensor(waveform).unsqueeze(0)
+            # 轉換為張量並設置正確的設備（與 VID_identify_v5.py 一致）
+            waveform_tensor = torch.tensor(waveform, dtype=torch.float32).unsqueeze(0).to(self.device)
             embedding = self.speaker_model.encode_batch(waveform_tensor)
             
-            # 轉換為 numpy array 並正規化
+            # 轉換為 numpy array 並正規化（與 VID_identify_v5.py 一致）
             embedding_np = embedding.squeeze().cpu().numpy()
             embedding_np = embedding_np / np.linalg.norm(embedding_np)  # L2 正規化
             
@@ -518,7 +581,7 @@ class CohortDatabaseManager:
             logger.warning(f"⚠️  提取聲紋失敗: {audio_path} - {e}")
             return None
     
-    def split_audio(self, audio_path: str, chunk_length: float = 3.0, 
+    def split_audio(self, audio_path: str, chunk_length: float = 6.0, 
                    overlap: float = 0.5) -> List[Tuple[np.ndarray, float, float]]:
         """
         將音頻檔案切片
@@ -534,8 +597,19 @@ class CohortDatabaseManager:
         chunks = []
         
         try:
-            # 載入音頻檔案
-            waveform, sample_rate = librosa.load(audio_path, sr=AUDIO_TARGET_RATE)
+            # 載入音頻檔案（與 VID_identify_v5.py 一致）
+            waveform, sample_rate = librosa.load(audio_path, sr=None)  # 保持原始採樣率
+            
+            # 處理立體聲轉單聲道（與 VID_identify_v5.py 一致）
+            if waveform.ndim > 1:
+                waveform = waveform.mean(axis=1)
+            
+            # 重新採樣到目標採樣率（與 VID_identify_v5.py 一致）
+            target_sr = AUDIO_TARGET_RATE
+            if sample_rate != target_sr:
+                waveform = self.resample_audio(waveform, sample_rate, target_sr)
+                sample_rate = target_sr  # 更新採樣率變數
+            
             audio_length = len(waveform) / sample_rate
             
             # 計算切片參數
@@ -570,94 +644,77 @@ class CohortDatabaseManager:
             logger.error(f"❌ 音頻切片失敗: {audio_path} - {e}")
             return []
     
-    def import_audio_file(self, audio_path: str, source_dataset: str = "cohort_import",
-                         chunk_length: float = 3.0, overlap: float = 0.5,
+    def import_audio_file(self, audio_path: str, source_dataset: str = None,
                          metadata: Dict[str, Any] = None) -> int:
         """
-        導入單個音頻檔案到 cohort 資料庫
+        導入單個音頻檔案到 cohort 資料庫（直接處理整個音檔，不切片）
         
         Args:
             audio_path: 音頻檔案路徑
-            source_dataset: 來源資料集名稱
-            chunk_length: 切片長度（秒）
-            overlap: 重疊比例（0-1）
+            source_dataset: 來源資料集名稱，若為 None 則使用檔名（不含副檔名）
             metadata: 額外的元數據
             
         Returns:
-            int: 成功導入的聲紋數量
+            int: 成功導入的聲紋數量（0 或 1）
         """
         if not self.client.collections.exists(AS_NORM_COHORT_COLLECTION):
             logger.error(f"❌ Cohort collection '{AS_NORM_COHORT_COLLECTION}' 不存在，請先初始化")
             return 0
         
-        success_count = 0
         file_name = Path(audio_path).stem
         
+        # 如果沒有指定 source_dataset，使用檔名
+        if source_dataset is None:
+            source_dataset = file_name
+        
         try:
-            # 切片音頻
-            chunks = self.split_audio(audio_path, chunk_length, overlap)
+            # 直接提取整個音檔的嵌入向量（不切片）
+            embedding_np = self.extract_embedding(audio_path)
             
-            if not chunks:
-                logger.warning(f"⚠️  無法切片音頻檔案: {audio_path}")
+            if embedding_np is None:
+                logger.warning(f"⚠️  無法提取嵌入向量: {audio_path}")
                 return 0
             
             collection = self.client.collections.get(AS_NORM_COHORT_COLLECTION)
             
-            # 處理每個音頻片段
-            for i, (chunk_audio, start_time, end_time) in enumerate(chunks):
-                try:
-                    # 提取聲紋嵌入向量
-                    chunk_tensor = torch.tensor(chunk_audio).unsqueeze(0)
-                    embedding = self.speaker_model.encode_batch(chunk_tensor)
-                    embedding_np = embedding.squeeze().cpu().numpy()
-                    embedding_np = embedding_np / np.linalg.norm(embedding_np)  # L2 正規化
-                    
-                    # 準備元數據
-                    properties = {
-                        "create_time": datetime.now(),
-                        "cohort_id": f"{file_name}_chunk_{i:04d}",
-                        "source_dataset": source_dataset,
-                        "gender": metadata.get("gender", "unknown") if metadata else "unknown",
-                        "language": metadata.get("language", "unknown") if metadata else "unknown",
-                        "description": f"{file_name} 片段 {i+1}/{len(chunks)} ({start_time:.2f}s-{end_time:.2f}s)"
-                    }
-                    
-                    # 如果有額外元數據，合併進去
-                    if metadata:
-                        for key, value in metadata.items():
-                            if key not in properties:
-                                properties[key] = value
-                    
-                    # 插入到資料庫
-                    collection.data.insert(
-                        properties=properties,
-                        vector=embedding_np.tolist()
-                    )
-                    success_count += 1
-                    
-                except Exception as e:
-                    logger.warning(f"⚠️  處理音頻片段失敗: {audio_path} 片段 {i} - {e}")
-                    continue
+            # 準備元數據
+            properties = {
+                "create_time": datetime.now(),
+                "cohort_id": file_name,  # 使用檔名作為 cohort_id
+                "source_dataset": source_dataset,  # 使用檔名或指定的 source_dataset
+                "gender": metadata.get("gender", "unknown") if metadata else "unknown",
+                "language": metadata.get("language", "zh") if metadata else "zh",
+                "description": f"完整音檔: {file_name}"
+            }
             
-            logger.info(f"✅ 成功導入 {success_count}/{len(chunks)} 個聲紋: {audio_path}")
-            return success_count
+            # 如果有額外元數據，合併進去
+            if metadata:
+                for key, value in metadata.items():
+                    if key not in properties:
+                        properties[key] = value
+            
+            # 插入到資料庫
+            collection.data.insert(
+                properties=properties,
+                vector=embedding_np.tolist()
+            )
+            
+            logger.info(f"✅ 成功導入聲紋: {audio_path} -> {source_dataset}")
+            return 1
             
         except Exception as e:
             logger.error(f"❌ 導入音頻檔案失敗: {audio_path} - {e}")
             return 0
     
-    def import_audio_folder(self, folder_path: str, source_dataset: str = "cohort_folder",
-                           chunk_length: float = 3.0, overlap: float = 0.5,
+    def import_audio_folder(self, folder_path: str, source_dataset_prefix: str = None,
                            audio_extensions: List[str] = None,
                            metadata: Dict[str, Any] = None) -> Dict[str, int]:
         """
-        從資料夾批量導入音頻檔案到 cohort 資料庫
+        從資料夾批量導入音頻檔案到 cohort 資料庫（直接處理整個音檔，不切片）
         
         Args:
             folder_path: 音頻資料夾路徑
-            source_dataset: 來源資料集名稱
-            chunk_length: 切片長度（秒）
-            overlap: 重疊比例（0-1）
+            source_dataset_prefix: 來源資料集前綴，若為 None 則直接使用檔名
             audio_extensions: 支援的音頻副檔名
             metadata: 全域元數據
             
@@ -702,9 +759,15 @@ class CohortDatabaseManager:
                 "file_path": str(audio_file.relative_to(folder_path))
             })
             
-            # 導入檔案
+            # 決定 source_dataset 名稱
+            if source_dataset_prefix:
+                source_dataset = f"{source_dataset_prefix}_{audio_file.stem}"
+            else:
+                source_dataset = audio_file.stem  # 直接使用檔名
+            
+            # 導入檔案（不切片）
             embeddings_count = self.import_audio_file(
-                str(audio_file), source_dataset, chunk_length, overlap, file_metadata
+                str(audio_file), source_dataset, file_metadata
             )
             
             if embeddings_count > 0:
@@ -716,8 +779,7 @@ class CohortDatabaseManager:
             "total_files": total_files,
             "success_files": success_files,
             "failed_files": total_files - success_files,
-            "total_embeddings": total_embeddings,
-            "source_dataset": source_dataset
+            "total_embeddings": total_embeddings
         }
         
         logger.info(f"📈 批量導入完成:")
@@ -855,14 +917,10 @@ def main():
     parser.add_argument("--action", choices=["init", "reset", "import", "stats", "export"], 
                        default="stats", help="執行的動作")
     parser.add_argument("--folder", type=str, help="要導入的音頻資料夾路徑")
-    parser.add_argument("--dataset", type=str, default="cohort_import", 
-                       help="來源資料集名稱")
-    parser.add_argument("--chunk-length", type=float, default=3.0, 
-                       help="音頻切片長度（秒）")
-    parser.add_argument("--overlap", type=float, default=0.5, 
-                       help="切片重疊比例（0-1）")
+    parser.add_argument("--dataset-prefix", type=str, 
+                       help="來源資料集前綴，若不指定則直接使用檔名")
     parser.add_argument("--gender", type=str, help="語者性別")
-    parser.add_argument("--language", type=str, default="zh-TW", help="語音語言")
+    parser.add_argument("--language", type=str, default="zh", help="語音語言")
     parser.add_argument("--output", type=str, help="匯出檔案路徑")
     
     args = parser.parse_args()
@@ -894,7 +952,7 @@ def main():
             
             print(f"📁 正在導入音頻資料夾: {args.folder}")
             results = manager.import_audio_folder(
-                args.folder, args.dataset, args.chunk_length, args.overlap, metadata=metadata
+                args.folder, args.dataset_prefix, metadata=metadata
             )
             
             print(f"📈 導入完成:")

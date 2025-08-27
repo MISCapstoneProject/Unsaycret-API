@@ -207,8 +207,11 @@ logger = get_logger(__name__)
 # 載入 SpeechBrain 語音辨識模型
 from speechbrain.inference import SpeakerRecognition
 
-# 導入 AS-Norm 處理器
-from modules.database.cohort_manager import ASNormProcessor
+# 條件性導入 AS-Norm 處理器（僅在啟用時）
+if ENABLE_AS_NORM:
+    from modules.database.cohort_manager import ASNormProcessor
+else:
+    ASNormProcessor = None
 
 # 全域參數設定（從環境配置載入）
 DEFAULT_SPEAKER_NAME = "未命名語者"  # 預設的語者名稱
@@ -418,10 +421,13 @@ def apply_as_norm_to_distances(test_embedding: np.ndarray,
     if not ENABLE_AS_NORM or not distance_results:
         return distance_results
         
+    logger.info(f"🔧 開始 AS-Norm 正規化處理 ({len(distance_results)} 個候選語者)")
     normalized_results = []
     
-    for voice_print_id, speaker_name, original_distance, update_count in distance_results:
+    for i, (voice_print_id, speaker_name, original_distance, update_count) in enumerate(distance_results, 1):
         try:
+            logger.debug(f"📊 處理第 {i} 個候選語者: {speaker_name} (原始距離: {original_distance:.4f})")
+            
             # 獲取目標語者的嵌入向量
             voice_print_collection = as_norm_processor.client.collections.get("VoicePrint")
             target_obj = voice_print_collection.query.fetch_object_by_id(
@@ -440,16 +446,33 @@ def apply_as_norm_to_distances(test_embedding: np.ndarray,
                     test_embedding, target_embedding, speaker_name
                 )
                 
+                # 詳細日誌輸出
+                improvement = original_distance - normalized_distance
+                improvement_pct = (improvement / original_distance * 100) if original_distance > 0 else 0
+                
+                logger.info(f"✅ {speaker_name}: {original_distance:.4f} → {normalized_distance:.4f} "
+                           f"(改善: {improvement:+.4f}, {improvement_pct:+.1f}%)")
+                
                 normalized_results.append((voice_print_id, speaker_name, normalized_distance, update_count))
             else:
                 # 無法獲取嵌入向量時，保持原始距離
+                logger.warning(f"⚠️  無法獲取 {speaker_name} 的嵌入向量，保持原始距離")
                 normalized_results.append((voice_print_id, speaker_name, original_distance, update_count))
                 
         except Exception as e:
-            logger.warning(f"對語者 {speaker_name} 應用 AS-Norm 時發生錯誤: {e}")
+            logger.warning(f"❌ 對語者 {speaker_name} 應用 AS-Norm 時發生錯誤: {e}")
             # 發生錯誤時保持原始距離
             normalized_results.append((voice_print_id, speaker_name, original_distance, update_count))
-            
+    
+    # 排序結果（按正規化後的距離）
+    normalized_results.sort(key=lambda x: x[2])
+    
+    # 總結日誌
+    if normalized_results:
+        best_speaker = normalized_results[0][1]
+        best_distance = normalized_results[0][2]
+        logger.info(f"🎯 AS-Norm 正規化完成，最佳匹配: {best_speaker} (正規化距離: {best_distance:.4f})")
+    
     return normalized_results
 
 
@@ -548,9 +571,10 @@ class WeaviateRepository:
             
             # 應用 AS-Norm (如果啟用)
             if as_norm_processor and ENABLE_AS_NORM:
-                print("🔧 應用 AS-Norm 正規化...")
+                logger.info("🔧 啟動 AS-Norm 分數正規化處理...")
                 distances = apply_as_norm_to_distances(new_embedding, distances, as_norm_processor)
-                print("✅ AS-Norm 正規化完成")
+                logger.info("✅ AS-Norm 分數正規化處理完成")
+            # AS-Norm 停用時完全靜默，不輸出任何相關日誌
             
             # 找出最小距離
             if distances:
@@ -913,7 +937,7 @@ class SpeakerIdentifier:
         self.threshold_new = THRESHOLD_NEW
         
         # 只有在啟用 AS-Norm 時才初始化處理器
-        if ENABLE_AS_NORM:
+        if ENABLE_AS_NORM and ASNormProcessor is not None:
             self.as_norm_processor = ASNormProcessor(self.database.client)
         else:
             self.as_norm_processor = None
@@ -945,7 +969,7 @@ class SpeakerIdentifier:
         ENABLE_AS_NORM = enabled
         
         # 動態創建或銷毀 AS-Norm 處理器
-        if enabled and self.as_norm_processor is None:
+        if enabled and self.as_norm_processor is None and ASNormProcessor is not None:
             # 啟用時創建處理器
             self.as_norm_processor = ASNormProcessor(self.database.client)
         elif not enabled and self.as_norm_processor is not None:

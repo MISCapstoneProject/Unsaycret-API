@@ -369,15 +369,13 @@ def force_two_speaker_separation(separator: AudioSeparator, audio_tensor: torch.
                     output_file = output_base.parent / f"{output_base.name}_{SPEAKER_PREFIX}{i+1}.{OUTPUT_FORMAT}"
                     
                     # 保存音檔 - 使用與系統主分離模組相同的品質設定
-                    # 保存音檔 - 使用與系統主分離模組相同的品質設定
                     import torchaudio
                     torchaudio.save(
                         str(output_file),
                         final_tensor,
                         OUTPUT_SAMPLE_RATE,
                         bits_per_sample=16  # 指定16位元確保音質，與主系統一致
-                        OUTPUT_SAMPLE_RATE,
-                        bits_per_sample=16  # 指定16位元確保音質，與主系統一致
+
                     )
                     
                     separated_files.append({
