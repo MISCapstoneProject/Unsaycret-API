@@ -35,9 +35,13 @@ class SpeakerCounter:
     REL_MIN_STRONG = 0.18         # 有效相對值的強重疊接受度
 
     # VAD 閾值
-    VAD_MIN_DBFS = -45.0          # 相對於峰值的 dBFS
-    VAD_MIN_ZCR = 0.005
+    VAD_MIN_DBFS = -46.0          # 相對於峰值的 dBFS
+    VAD_MIN_ZCR = 0.02
     VAD_MAX_ZCR = 0.25
+    
+    # 絕對 dBFS 門檻（對 full-scale 1.0）
+    VAD_ABS_DBFS_MIN = -46.0      # 幀/全段的最低聲能
+    VAD_LOUD_DBFS    = -40.0      # 至少若干幀須超過此能量，避免底噪誤判
 
     def __init__(
         self,
@@ -113,13 +117,56 @@ class SpeakerCounter:
         keep, stats = self._refine_labels_by_overlap(diar, debug=debug)
         self._dbg(debug, f"優化後: keep={keep} | labels={list(stats.keys())}")
 
+        # NEW: 如果第一次只看到兩個人，但形態很像「全程重疊的多人」
+        raw_distinct = len(set(list(diar.labels()))) if hasattr(diar, "labels") else None
+        def _eff(s):  # 有效時長
+            return s["non_overlap"] + self.OVERLAP_ALPHA * s["overlap"]
+
+        if (expected_max or 3) >= 3 and raw_distinct is not None and raw_distinct < 3 and len(keep) == 2:
+            # 兩人的有效佔比約各一半，且 non_overlap 幾乎為 0 → 疑似漏了第 3 人
+            eff_map = {k: _eff(v) for k, v in stats.items()}
+            eff_sum = sum(eff_map.values()) + 1e-8
+            top2 = sorted(keep, key=lambda k: eff_map[k], reverse=True)[:2]
+            rels = [eff_map[k] / eff_sum for k in top2]
+            nonovs = [stats[k]["non_overlap"] for k in top2]
+            suspicious_three = (0.35 <= min(rels) <= max(rels) <= 0.65) and (max(nonovs) <= 0.10)
+            self._dbg(debug, f"可能是 3語者? rels={rels}, nonov(top2)={nonovs} -> {suspicious_three}")
+
+            if suspicious_three:
+                accepted_retry = False
+                diar3 = self._run_diarization(audio, sample_rate, 3, 3, debug=debug)
+                if diar3 is not None:
+                    keep3, stats3 = self._refine_labels_by_overlap(diar3, debug=debug)
+                    if len(keep3) >= 3:
+                        keep, stats = keep3, stats3
+                        self._dbg(debug, "可能是 3語者? → retry(3,3) accepted: 3 labels kept")
+                        accepted_retry = True
+                    else:
+                        eff_items = sorted(stats3.items(), key=lambda kv: _eff(kv[1]), reverse=True)
+                        if len(eff_items) >= 3:
+                            eff_total3 = sum(_eff(s) for _, s in eff_items) + 1e-8
+                            third_eff_rel = _eff(eff_items[2][1]) / eff_total3
+                            if third_eff_rel >= self.REL_MIN_STRONG:  # 例如 0.18
+                                keep = [eff_items[0][0], eff_items[1][0], eff_items[2][0]]
+                                stats = {k: v for k, v in stats3.items()}
+                                self._dbg(debug, f"可能是 3語者? → retry(3,3) accepted by rel3={third_eff_rel:.3f}")
+                                accepted_retry = True
+
+                # ★ 就在這裡接 KMeans(3) 後備（等價於你問的那段 else 的位置）
+                if not accepted_retry:
+                    # (3,3) 仍只有 2 或 diar3 失敗 → 嘗試 KMeans(3) 後備
+                    k3 = self._kmeans_3_fallback(audio, sample_rate, debug=debug)
+                    if k3 == 3:
+                        self._dbg(debug, "fallback KMeans(3) → set n=3")
+                        return 3  # 直接回傳 3，結束流程
+
         # --- 有效分數和相對值的輔助函數
         def eff_of(k: str) -> float:
             s = stats[k]
             return s["non_overlap"] + self.OVERLAP_ALPHA * s["overlap"]
 
         total_union = sum((stats[k]["total"] for k in stats))  # 僅用於日誌；真正的聯集在優化內部使用
-
+        
         # 如果所有項目都被過濾但有語音 → 保留有效的前 2 名（加上基本總時長保護）
         if not keep and stats and self._has_voice(audio, sample_rate, debug=debug):
             ranked = sorted(stats.items(), key=lambda kv: (kv[1]["non_overlap"] + self.OVERLAP_ALPHA * kv[1]["overlap"]), reverse=True)
@@ -220,28 +267,28 @@ class SpeakerCounter:
             self._dbg(debug, "執行分離: diar 沒有 labels()")
         return diar
 
-    def _to_mono_1d(self, x: torch.Tensor, debug: bool = False) -> torch.Tensor:
+    def _to_mono_1d(self, x: torch.Tensor, debug: bool = False, for_vad: bool = False) -> torch.Tensor:
         x = x.detach().to(dtype=torch.float32, device="cpu")
         pre_peak = float(torch.max(torch.abs(x)).item()) if x.numel() > 0 else 0.0
         if x.ndim == 2:
-            if x.shape[0] <= x.shape[1]:
-                x = x.mean(dim=0)
-            else:
-                x = x.mean(dim=1)
+            x = x.mean(dim=0) if x.shape[0] <= x.shape[1] else x.mean(dim=1)
         elif x.ndim != 1:
-            raise ValueError(f"不支援的波形形狀：{tuple(x.shape)}")
+            raise ValueError(f"Unsupported waveform shape: {tuple(x.shape)}")
+
         max_abs = float(torch.max(torch.abs(x))) if x.numel() > 0 else 0.0
         scale = 1.0
-        if max_abs > 2.0:  # 可能是 int16 範圍
+        if max_abs > 2.0:  # int16 → float
             scale = 32768.0
             x = x / scale
-        elif 0.0 < max_abs < 0.01:
-            scale = max_abs if max_abs > 0 else 1.0
+        elif (0.0 < max_abs < 0.01) and (not for_vad):
+            # 只有在「非 VAD」路徑才會做極小訊號增益
+            scale = max_abs
             x = x / scale
-        x = x - x.mean()
+
+        x = x - x.mean()          # 去 DC
         x = torch.clamp(x, -1.0, 1.0)
         post_peak = float(torch.max(torch.abs(x)).item()) if x.numel() > 0 else 0.0
-        self._dbg(debug, f"轉單聲道: pre_peak={pre_peak:.4f}, norm_scale={scale:.4f}, post_peak={post_peak:.4f}")
+        self._dbg(debug, f"to_mono: pre_peak={pre_peak:.4f}, norm_scale={scale:.4f}, post_peak={post_peak:.4f}{' [VAD]' if for_vad else ''}")
         return x
 
     # ---------------------- 後處理 ------------------------
@@ -348,38 +395,216 @@ class SpeakerCounter:
             cnt += 1
         return total / max(1, cnt)
 
+    def _rms_dbfs_abs(self, x: torch.Tensor) -> float:
+        """相對 full-scale 的絕對 dBFS（x ∈ [-1,1]）。"""
+        x = x.detach().float()
+        if x.ndim > 1: x = x.mean(dim=-1)
+        if x.numel() == 0: return -120.0
+        rms = float(torch.sqrt(torch.mean(x ** 2)).item())
+        if rms <= 0.0: return -120.0
+        return 20.0 * math.log10(rms)  # full-scale 1.0
+
     def _has_voice(self, audio: torch.Tensor, sr: int, debug: bool = False, return_metrics: bool = False):
-        w = self._to_mono_1d(audio, debug=debug)
-        rms_db = self._rms_dbfs_peak(w)
+        # 重要：VAD 專用，不做小訊號增益
+        w = self._to_mono_1d(audio, debug=debug, for_vad=True)
+
+        # 全段特徵
+        rms_db_abs = self._rms_dbfs_abs(w)
         zcr = self._zcr(w, frame_len=int(0.025*sr), hop=int(0.010*sr))
 
-        # 估算「語音幀比例」與「語音聯集時長」
+        # 逐幀統計（30ms/15ms）
+        frame = int(0.030 * sr)
+        hop = int(0.015 * sr)
+        n = w.numel()
+        voiced_frames = 0
+        loud_frames = 0
+        for i in range(0, max(0, n - frame + 1), hop):
+            f = w[i:i+frame]
+            if f.numel() == 0: continue
+            # 絕對 dBFS（不再相對峰值）
+            frms = float(torch.sqrt(torch.mean(f**2)).item())
+            dbfs_abs = -120.0 if frms <= 1e-12 else 20.0 * math.log10(frms)
+            z = float((f[1:] * f[:-1] < 0).float().mean().item())
+            if (dbfs_abs > self.VAD_ABS_DBFS_MIN) and (self.VAD_MIN_ZCR <= z <= self.VAD_MAX_ZCR):
+                voiced_frames += 1
+            if dbfs_abs > self.VAD_LOUD_DBFS:
+                loud_frames += 1
+
+        total_frames = max(1, (n - frame) // hop + 1)
+        voiced_ratio = voiced_frames / total_frames
+        voiced_union = voiced_frames * (hop / sr)  # 近似語音聯集
+        loud_frac = loud_frames / total_frames
+
+        ratio_union_ok = (voiced_ratio >= 0.20) and (voiced_union >= 1.00)
+        
+        energy_ok = (rms_db_abs > self.VAD_ABS_DBFS_MIN) and (loud_frames >= 3)
+        ok = (self.VAD_MIN_ZCR <= zcr <= self.VAD_MAX_ZCR) and (energy_ok or ratio_union_ok)
+
+        self._dbg(debug, f"VAD(abs): {rms_db_abs:.1f} dBFS, ZCR={zcr:.3f}, voiced_ratio={voiced_ratio:.3f}, "
+                        f"voiced_union={voiced_union:.2f}s, loud_frac={loud_frac:.3f} -> {'VOICE' if ok else 'NOISE/SIL'}")
+
+        if return_metrics:
+            return ok, {"dbfs": rms_db_abs, "zcr": zcr, "voiced_ratio": voiced_ratio, "voiced_union": voiced_union, "loud_frac": loud_frac}
+        return ok
+
+    # ---------------------- KMeans(3) fallback ----------------------
+    def _frame_vad_mask(self, w: torch.Tensor, sr: int) -> torch.Tensor:
+        """逐幀 VAD：回傳 [T] 的 0/1 mask（True=有聲）。對齊 30ms/15ms，center=False。"""
         frame = int(0.030 * sr)  # 30ms
         hop = int(0.015 * sr)    # 15ms
         n = w.numel()
-        voiced_frames = 0
-        for i in range(0, max(0, n - frame), hop):
+        if n < frame:
+            return torch.zeros(0, dtype=torch.bool, device=w.device)
+
+        masks = []
+        for i in range(0, n - frame + 1, hop):  # ← 重點：+1，包含最後一窗
             f = w[i:i+frame]
             if f.numel() == 0:
-                continue
-            # 每幀 dBFS_peak 與 ZCR 門檻
+                masks.append(False); continue
             peak = float(torch.max(torch.abs(f)).item())
             dbfs = -120.0 if peak < 1e-8 else 20.0 * math.log10(float(torch.sqrt(torch.mean(f**2)).item()) / peak)
             z = float((f[1:] * f[:-1] < 0).float().mean().item())
-            if (dbfs > self.VAD_MIN_DBFS) and (self.VAD_MIN_ZCR <= z <= self.VAD_MAX_ZCR):
-                voiced_frames += 1
+            ok = (dbfs > self.VAD_MIN_DBFS) and (self.VAD_MIN_ZCR <= z <= self.VAD_MAX_ZCR)
+            masks.append(ok)
+        return torch.tensor(masks, dtype=torch.bool, device=w.device)
 
-        total_frames = max(1, (n - frame) // hop)
-        voiced_ratio = voiced_frames / total_frames
-        voiced_union = voiced_frames * (hop / sr)  # 近似語音聯集秒數
+    def _stft_logmel(self, w: torch.Tensor, sr: int, n_mels: int = 40) -> torch.Tensor:
+        """回傳 [T, n_mels] 的 log-mel 特徵（對齊 30ms/15ms 幀，center=False）。"""
+        win_length = int(0.030 * sr)   # 30ms
+        hop_length = int(0.015 * sr)   # 15ms
+        n_fft = 1
+        while n_fft < win_length:      # 取最近的 2 次冪
+            n_fft <<= 1
 
-        ok = (rms_db > self.VAD_MIN_DBFS) and (self.VAD_MIN_ZCR <= zcr <= self.VAD_MAX_ZCR)
-        self._dbg(debug, f"VAD: {rms_db:.1f} dBFS_peak, ZCR={zcr:.3f}, voiced_ratio={voiced_ratio:.3f}, voiced_union={voiced_union:.2f}s -> {'語音' if ok else '雜訊/靜音'}")
+        window = torch.hann_window(win_length, device=w.device, dtype=w.dtype)
+        spec = torch.stft(
+            w, n_fft=n_fft, hop_length=hop_length, win_length=win_length,
+            window=window, center=False, return_complex=True  # ← 重點：center=False
+        )
+        mag = (spec.real**2 + spec.imag**2)          # [freq, T]
+        mag = mag.transpose(0, 1).contiguous()       # [T, freq]
 
-        if return_metrics:
-            return ok, {"dbfs": rms_db, "zcr": zcr, "voiced_ratio": voiced_ratio, "voiced_union": voiced_union}
-        return ok
+        # --- 建 mel 濾波器（三角形），全程用相同 device/dtype ---
+        def hz_to_mel(f): return 2595.0 * math.log10(1.0 + f / 700.0)
+        def mel_to_hz(m): return 700.0 * (10.0**(m / 2595.0) - 1.0)
 
+        fmin, fmax = 20.0, sr / 2.0
+        mmin, mmax = hz_to_mel(fmin), hz_to_mel(fmax)
+        m_pts = torch.linspace(mmin, mmax, n_mels + 2, device=mag.device, dtype=torch.float32)
+        f_pts = torch.tensor([mel_to_hz(m) for m in m_pts.tolist()], device=mag.device, dtype=torch.float32)
+
+        bins = torch.floor(((n_fft // 2) * f_pts / fmax)).long().clamp(0, n_fft // 2).tolist()
+
+        fb = torch.zeros(n_mels, n_fft // 2 + 1, device=mag.device, dtype=mag.dtype)
+        for i in range(n_mels):
+            left  = int(bins[i])
+            center = int(bins[i + 1])
+            right = int(bins[i + 2])
+
+            if center <= left:
+                center = left + 1
+            if right <= center:
+                right = center + 1
+
+            rise_steps = center - left
+            fb[i, left:center] = torch.linspace(0.0, 1.0, steps=rise_steps, device=fb.device, dtype=fb.dtype)
+
+            fall_steps = right - center
+            fb[i, center:right] = torch.linspace(1.0, 0.0, steps=fall_steps, device=fb.device, dtype=fb.dtype)
+
+        mel = torch.matmul(mag[:, : n_fft // 2 + 1], fb.t())  # [T, n_mels]
+        mel = torch.clamp(mel, min=1e-10)
+        logmel = mel.log()
+        mean = logmel.mean(dim=0, keepdim=True)
+        std = logmel.std(dim=0, keepdim=True).clamp_min(1e-5)
+        logmel = (logmel - mean) / std
+        return logmel
+
+    def _kmeans_torch(self, X: torch.Tensor, k: int, iters: int = 20, seed: int = 0):
+        """簡易 KMeans：輸入 [N, D]，回傳 (centroids[k,D], labels[N])。"""
+        g = torch.Generator().manual_seed(seed)
+        N = X.size(0)
+        # 初始化：隨機挑 k 個樣本
+        idx = torch.randperm(N, generator=g)[:k]
+        C = X[idx].clone()  # [k, D]
+        for _ in range(iters):
+            # 指派
+            d2 = torch.cdist(X, C, p=2)  # [N, k]
+            lbl = torch.argmin(d2, dim=1)
+            # 更新
+            newC = []
+            for j in range(k):
+                sel = X[lbl == j]
+                if sel.numel() == 0:
+                    # 若空群，隨機重抽一個點
+                    ridx = torch.randint(0, N, (1,), generator=g).item()
+                    newC.append(X[ridx: ridx+1])
+                else:
+                    newC.append(sel.mean(dim=0, keepdim=True))
+            newC = torch.cat(newC, dim=0)
+            if torch.allclose(newC, C, atol=1e-4):
+                C = newC; break
+            C = newC
+        return C, lbl
+
+    def _kmeans_3_fallback(self, audio: torch.Tensor, sr: int, debug: bool = False) -> int:
+        """
+        在可疑三人時的最終備援：
+        - 取有聲幀的 log-mel 特徵 → KMeans(3)
+        - 若第三群佔比 >= 0.15 且分群品質達標，回傳 3，否則 0（不介入）
+        """
+        w = self._to_mono_1d(audio, debug=debug)
+
+        # 先算 log-mel（center=False），再算 VAD mask（同樣窗口/跳步）
+        logmel = self._stft_logmel(w, sr)       # [T, n_mels]
+        mask = self._frame_vad_mask(w, sr)      # [T]
+
+        T_logmel = logmel.size(0)
+        T_vad = mask.numel()
+        if T_logmel != T_vad:
+            L = min(T_logmel, T_vad)
+            self._dbg(debug, f"kmeans3: align frames logmel_T={T_logmel}, vad_T={T_vad} -> {L}")
+            logmel = logmel[:L, :]
+            mask = mask[:L]
+            T_logmel = L
+
+        if T_logmel < 30:
+            self._dbg(debug, "kmeans3: too few frames → skip")
+            return 0
+        if mask.float().mean().item() < 0.2:
+            self._dbg(debug, "kmeans3: too sparse voiced frames → skip")
+            return 0
+
+        X = logmel[mask]
+        if X.size(0) < 30:
+            self._dbg(debug, "kmeans3: too few voiced frames after mask → skip")
+            return 0
+
+        # 分 3 群
+        C, y = self._kmeans_torch(X, k=3, iters=25, seed=42)
+        counts = torch.stack([(y == j).sum() for j in range(3)]).float()
+        props = (counts / counts.sum()).tolist()
+
+        # 簡單品質：最小質心距離 / 平均群內標準差
+        with torch.no_grad():
+            dcc = torch.cdist(C, C, p=2) + torch.eye(3, device=C.device) * 1e9
+            min_centroid_dist = float(dcc.min().item())
+            intra = []
+            for j in range(3):
+                sel = X[y == j]
+                intra.append(float(sel.std(dim=0).norm().item()) + 1e-6 if sel.numel() else 1e-6)
+            avg_intra = sum(intra) / 3.0
+            quality = min_centroid_dist / avg_intra
+
+        self._dbg(debug, f"kmeans3: props={props}, quality={quality:.3f}")
+
+        third_prop = sorted(props, reverse=True)[2]
+        if third_prop >= 0.15 and quality >= 0.12:
+            self._dbg(debug, "kmeans3: accept → return 3")
+            return 3
+        self._dbg(debug, "kmeans3: reject")
+        return 0
+    
     # -------------------------- 日誌記錄 ----------------------------
     def _dbg(self, debug: bool, msg: str) -> None:
         if debug and self.logger:

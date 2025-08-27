@@ -399,7 +399,8 @@ class AudioSeparator:
         self.spk_counter = SpeakerCounter(
             hf_token=HF_ACCESS_TOKEN, 
             device=self.device, 
-            pipeline=getattr(self, 'speaker_count_pipeline', None)
+            pipeline=getattr(self, 'speaker_count_pipeline', None),
+            # logger=logger
         )
         logger.info("語者計數器初始化完成")
         
@@ -974,43 +975,33 @@ class AudioSeparator:
             detected_speakers = self.spk_counter.count_with_refine(
                 audio=audio_tensor,
                 sample_rate=TARGET_RATE,
-                expected_min=2,
-                expected_max=2,
+                expected_min=1,
+                expected_max=3,
                 first_pass_range=(1, 3),
-                allow_zero=False,         # <== 允許回傳 0（無語音）
+                allow_zero=True,         # <== 允許回傳 0（無語音）
                 debug=False
             )
 
             logger.info(f"片段 {segment_index} - 偵測到 {detected_speakers} 位說話者")
             
-            # 備援：第一次回 0 但疑似有人聲 → 限定 1–2 再試
+            # 備援：第一次回 0 → 只有在「強有聲」才重試 1–2 人
             if detected_speakers == 0:
-                
-                has_speech = self.spk_counter._has_voice(audio_tensor, TARGET_RATE)
-
-                if not has_speech:
-                    logger.info(f"片段 {segment_index} - 無語音。跳過")
+                ok, m = self.spk_counter._has_voice(audio_tensor, TARGET_RATE, return_metrics=True)
+                # 與 SpeakerCounter 同步或更嚴的條件
+                strong_voice = ok and (m["voiced_ratio"] >= 0.12) and (m["voiced_union"] >= 0.50) and (m.get("loud_frac", 0.0) >= 0.05)
+                if not strong_voice:
+                    logger.info(f"片段 {segment_index} - 無語音/過短（ratio={m['voiced_ratio']:.3f}, union={m['voiced_union']:.2f}s, loud={m.get('loud_frac',0.0):.3f}），跳過")
                     return []
 
-                logger.warning(f"片段 {segment_index} - 第一次偵測失敗，但疑似有人聲。改用 1–2 人重試")
-                try:
-                    # 2) 限制 1–2 人再跑一次
-                    retry = self.spk_counter.count_with_refine(
-                        audio=audio_tensor,
-                        sample_rate=TARGET_RATE,
-                        expected_min=1,
-                        expected_max=2,
-                        first_pass_range=(1, 2)
-                    )
-                    if retry > 0:
-                        detected_speakers = retry
-                    else:
-                        # 3) 仍失敗才保守回 1
-                        detected_speakers = 1
-                        logger.warning(f"片段 {segment_index} - 重試仍失敗，保守假定單人")
-                except Exception as e:
-                    logger.error(f"片段 {segment_index} - 備援重試例外: {e}")
-                    detected_speakers = 1
+                logger.warning(f"片段 {segment_index} - 第一次偵測 0，但語音跡象偏強，嘗試 1–2 人重試")
+                retry = self.spk_counter.count_with_refine(
+                    audio=audio_tensor, sample_rate=TARGET_RATE,
+                    expected_min=1, expected_max=2,
+                    first_pass_range=(1, 2),
+                    allow_zero=False,           # 已確認強有聲，就不要再回 0
+                    debug=False
+                )
+                detected_speakers = max(1, int(retry))
             
             # 動態選擇模型
             current_model, current_model_type = self._get_appropriate_model(detected_speakers)
