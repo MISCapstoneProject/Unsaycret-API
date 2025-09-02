@@ -63,9 +63,9 @@ API_DEFAULT_MAX_RESULTS = 3
 API_MAX_WORKERS = 2
 
 # AS-Norm (Adaptive Score Normalization) 配置
-ENABLE_AS_NORM = False  # AS-Norm 開關，測試用
-AS_NORM_COHORT_SIZE = 50   # Z-Norm 用的 cohort 大小（用於統計計算）
-AS_NORM_TOP_K = 10         # T-Norm 用的 Top-K impostor scores（直接影響計算量）
+ENABLE_AS_NORM = True  # AS-Norm 開關，測試用
+AS_NORM_COHORT_SIZE = 100   # Z-Norm 用的 cohort 大小（用於統計計算）
+AS_NORM_TOP_K = 150        # T-Norm 用的 Top-K impostor scores（學術建議 100-300）
 AS_NORM_ALPHA = 0.5        # S-Norm 的權重參數（平衡 T-Norm 和 Z-Norm）
 
 # AS-Norm 種類開關 (可分別控制)

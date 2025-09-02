@@ -207,12 +207,6 @@ logger = get_logger(__name__)
 # 載入 SpeechBrain 語音辨識模型
 from speechbrain.inference import SpeakerRecognition
 
-# 條件性導入 AS-Norm 處理器（僅在啟用時）
-if ENABLE_AS_NORM:
-    from modules.database.cohort_manager import ASNormProcessor
-else:
-    ASNormProcessor = None
-
 # 全域參數設定（從環境配置載入）
 DEFAULT_SPEAKER_NAME = "未命名語者"  # 預設的語者名稱
 DEFAULT_FULL_NAME_PREFIX = "n"  # V2版本：預設full_name前綴
@@ -400,83 +394,7 @@ class AudioProcessor:
             raise
 
 
-# ==================== AS-Norm 工具函數 ====================
-
-def apply_as_norm_to_distances(test_embedding: np.ndarray, 
-                              distance_results: List[Tuple[str, str, float, int]],
-                              as_norm_processor) -> List[Tuple[str, str, float, int]]:
-    """
-    對距離結果應用 AS-Norm 正規化
-    
-    這是一個便利函數，用於批量處理多個語者的距離計算
-    
-    Args:
-        test_embedding: 測試音訊的嵌入向量
-        distance_results: 原始距離結果列表 [(voice_print_id, speaker_name, distance, update_count)]
-        as_norm_processor: AS-Norm 處理器實例
-        
-    Returns:
-        List[Tuple[str, str, float, int]]: 正規化後的距離結果
-    """
-    if not ENABLE_AS_NORM or not distance_results:
-        return distance_results
-        
-    logger.info(f"🔧 開始 AS-Norm 正規化處理 ({len(distance_results)} 個候選語者)")
-    normalized_results = []
-    
-    for i, (voice_print_id, speaker_name, original_distance, update_count) in enumerate(distance_results, 1):
-        try:
-            logger.debug(f"📊 處理第 {i} 個候選語者: {speaker_name} (原始距離: {original_distance:.4f})")
-            
-            # 獲取目標語者的嵌入向量
-            voice_print_collection = as_norm_processor.client.collections.get("VoicePrint")
-            target_obj = voice_print_collection.query.fetch_object_by_id(
-                uuid=voice_print_id,
-                include_vector=True
-            )
-            
-            if target_obj and target_obj.vector:
-                # 處理 named vector
-                vec_dict = target_obj.vector
-                raw_vec = vec_dict["default"] if isinstance(vec_dict, dict) else vec_dict
-                target_embedding = np.array(raw_vec, dtype=float)
-                
-                # 應用 AS-Norm
-                normalized_distance = as_norm_processor.apply_as_norm(
-                    test_embedding, target_embedding, speaker_name
-                )
-                
-                # 詳細日誌輸出
-                improvement = original_distance - normalized_distance
-                improvement_pct = (improvement / original_distance * 100) if original_distance > 0 else 0
-                
-                logger.info(f"✅ {speaker_name}: {original_distance:.4f} → {normalized_distance:.4f} "
-                           f"(改善: {improvement:+.4f}, {improvement_pct:+.1f}%)")
-                
-                normalized_results.append((voice_print_id, speaker_name, normalized_distance, update_count))
-            else:
-                # 無法獲取嵌入向量時，保持原始距離
-                logger.warning(f"⚠️  無法獲取 {speaker_name} 的嵌入向量，保持原始距離")
-                normalized_results.append((voice_print_id, speaker_name, original_distance, update_count))
-                
-        except Exception as e:
-            logger.warning(f"❌ 對語者 {speaker_name} 應用 AS-Norm 時發生錯誤: {e}")
-            # 發生錯誤時保持原始距離
-            normalized_results.append((voice_print_id, speaker_name, original_distance, update_count))
-    
-    # 排序結果（按正規化後的距離）
-    normalized_results.sort(key=lambda x: x[2])
-    
-    # 總結日誌
-    if normalized_results:
-        best_speaker = normalized_results[0][1]
-        best_distance = normalized_results[0][2]
-        logger.info(f"🎯 AS-Norm 正規化完成，最佳匹配: {best_speaker} (正規化距離: {best_distance:.4f})")
-    
-    return normalized_results
-
-
-# ==================== AS-Norm 功能結束 ====================
+# ==================== 音訊處理工具函數結束 ====================
 
 
 class WeaviateRepository:
@@ -516,13 +434,12 @@ class WeaviateRepository:
             logger.info("使用命令 'docker-compose -f weaviate_study/docker-compose.yml up -d' 啟動 Weaviate")
             raise
     
-    def compare_embedding(self, new_embedding: np.ndarray, as_norm_processor=None) -> Tuple[Optional[str], Optional[str], float, List[Tuple[str, str, float, int]]]:
+    def compare_embedding(self, new_embedding: np.ndarray) -> Tuple[Optional[str], Optional[str], float, List[Tuple[str, str, float, int]]]:
         """
         比較新的嵌入向量與資料庫中所有現有嵌入向量的相似度
         
         Args:
             new_embedding: 新的嵌入向量
-            as_norm_processor: AS-Norm 處理器，可選
             
         Returns:
             tuple: (最佳匹配ID, 最佳匹配語者名稱, 最小距離, 所有距離列表)
@@ -533,7 +450,7 @@ class WeaviateRepository:
             # 計算新向量與數據庫中所有向量的距離
             results = voice_print_collection.query.near_vector(
                 near_vector=new_embedding.tolist(),
-                limit=3,  # 測試! 返回前 3 個最相似的結果
+                limit=10,  # 返回前 10 個最相似的結果
                 return_properties=["speaker_name", "update_count", "sample_count", "created_at", "updated_at"],  # V2屬性
                 return_metadata=MetadataQuery(distance=True)
             )
@@ -561,20 +478,8 @@ class WeaviateRepository:
                 speaker_name = obj.properties.get("speaker_name")
                 update_count = obj.properties.get("update_count")  # 恢復使用update_count
                 
-                # 移除重複的比對輸出，交由上層處理
-                # distance_str = f"{distance:.4f}" if distance is not None else "未知"
-                # print(f"比對 - 語者: {speaker_name}, "
-                #       f"更新次數: {update_count}, 餘弦距離: {distance_str}")
-                
                 # 保存距離資訊（使用update_count作為第4個參數）
                 distances.append((object_id, speaker_name, distance, update_count))
-            
-            # 應用 AS-Norm (如果啟用)
-            if as_norm_processor and ENABLE_AS_NORM:
-                logger.info("🔧 啟動 AS-Norm 分數正規化處理...")
-                distances = apply_as_norm_to_distances(new_embedding, distances, as_norm_processor)
-                logger.info("✅ AS-Norm 分數正規化處理完成")
-            # AS-Norm 停用時完全靜默，不輸出任何相關日誌
             
             # 找出最小距離
             if distances:
@@ -936,11 +841,7 @@ class SpeakerIdentifier:
         self.threshold_update = THRESHOLD_UPDATE
         self.threshold_new = THRESHOLD_NEW
         
-        # 只有在啟用 AS-Norm 時才初始化處理器
-        if ENABLE_AS_NORM and ASNormProcessor is not None:
-            self.as_norm_processor = ASNormProcessor(self.database.client)
-        else:
-            self.as_norm_processor = None
+        # 不再初始化 AS-Norm 處理器，改為動態創建
         
         # 設置日誌格式
         self.verbose = True  # 控制詳細輸出
@@ -957,85 +858,99 @@ class SpeakerIdentifier:
         """設置是否顯示詳細輸出"""
         self.verbose = verbose
     
-    def set_as_norm_enabled(self, enabled: bool) -> None:
+    def compare_embedding_with_as_norm(self, new_embedding: np.ndarray) -> Tuple[Optional[str], Optional[str], float, List[Tuple[str, str, float, int]]]:
         """
-        設置是否啟用 AS-Norm 功能
+        使用 AS-Norm 進行嵌入向量比對
         
         Args:
-            enabled: True 啟用 AS-Norm，False 停用
-        """
-        global ENABLE_AS_NORM
-        old_value = ENABLE_AS_NORM
-        ENABLE_AS_NORM = enabled
-        
-        # 動態創建或銷毀 AS-Norm 處理器
-        if enabled and self.as_norm_processor is None and ASNormProcessor is not None:
-            # 啟用時創建處理器
-            self.as_norm_processor = ASNormProcessor(self.database.client)
-        elif not enabled and self.as_norm_processor is not None:
-            # 停用時銷毀處理器
-            self.as_norm_processor = None
-        
-        if self.verbose:
-            if enabled and not old_value:
-                print("✅ AS-Norm 正規化已啟用")
-            elif not enabled and old_value:
-                print("❌ AS-Norm 正規化已停用")
-    
-    def configure_as_norm(self, t_norm: bool = True, z_norm: bool = True, s_norm: bool = True,
-                         cohort_size: int = 100, top_k: int = 10, alpha: float = 0.9) -> None:
-        """
-        配置 AS-Norm 參數
-        
-        Args:
-            t_norm: 是否啟用 T-Norm
-            z_norm: 是否啟用 Z-Norm
-            s_norm: 是否啟用 S-Norm
-            cohort_size: cohort 大小
-            top_k: Top-K impostor 分數
-            alpha: S-Norm 權重參數
-        """
-        global ENABLE_T_NORM, ENABLE_Z_NORM, ENABLE_S_NORM
-        global AS_NORM_COHORT_SIZE, AS_NORM_TOP_K, AS_NORM_ALPHA
-        
-        ENABLE_T_NORM = t_norm
-        ENABLE_Z_NORM = z_norm
-        ENABLE_S_NORM = s_norm
-        AS_NORM_COHORT_SIZE = cohort_size
-        AS_NORM_TOP_K = top_k
-        AS_NORM_ALPHA = alpha
-        
-        # 更新 AS-Norm 處理器的參數（只有在處理器存在時）
-        if self.as_norm_processor is not None:
-            self.as_norm_processor.cohort_size = cohort_size
-            self.as_norm_processor.top_k = top_k
-            self.as_norm_processor.alpha = alpha
-        
-        if self.verbose:
-            if self.as_norm_processor is not None:
-                print(f"🔧 AS-Norm 配置已更新:")
-                print(f"   T-Norm: {t_norm}, Z-Norm: {z_norm}, S-Norm: {s_norm}")
-                print(f"   Cohort Size: {cohort_size}, Top-K: {top_k}, Alpha: {alpha}")
-            else:
-                print("⚠️ AS-Norm 處理器未啟用，配置已保存但未生效")
-    
-    def get_as_norm_status(self) -> Dict[str, Any]:
-        """
-        獲取 AS-Norm 當前狀態
-        
+            new_embedding: 新的嵌入向量
+            
         Returns:
-            Dict[str, Any]: AS-Norm 狀態資訊
+            tuple: (最佳匹配ID, 最佳匹配語者名稱, 最小距離, 所有距離列表)
         """
-        return {
-            "enabled": ENABLE_AS_NORM,
-            "processor_initialized": self.as_norm_processor is not None,
-            "t_norm": ENABLE_T_NORM,
-            "z_norm": ENABLE_Z_NORM,
-            "s_norm": ENABLE_S_NORM,
-            "cohort_size": AS_NORM_COHORT_SIZE,
-            "top_k": AS_NORM_TOP_K,
-            "alpha": AS_NORM_ALPHA
-        }
+        if not ENABLE_AS_NORM:
+            # AS-Norm 未啟用時，回退到普通比對
+            logger.warning("AS-Norm 未啟用，使用普通比對方式")
+            return self.database.compare_embedding(new_embedding)
+        
+        try:
+            # 動態導入 cohort_manager
+            from modules.database.cohort_manager import ASNormProcessor
+            
+            # 先進行普通比對獲取候選
+            best_id, best_name, best_distance, all_distances = self.database.compare_embedding(new_embedding)
+            
+            if not all_distances:
+                return best_id, best_name, best_distance, all_distances
+            
+            logger.info(f"🔧 開始 AS-Norm 正規化處理 ({len(all_distances)} 個候選語者)")
+            
+            # 創建 AS-Norm 處理器
+            as_norm_processor = ASNormProcessor(self.database.client)
+            
+            # 對每個候選語者應用 AS-Norm
+            normalized_results = []
+            for i, (voice_print_id, speaker_name, original_distance, update_count) in enumerate(all_distances, 1):
+                try:
+                    logger.debug(f"📊 處理第 {i} 個候選語者: {speaker_name} (原始距離: {original_distance:.4f})")
+                    
+                    # 獲取目標語者的嵌入向量
+                    voice_print_collection = self.database.client.collections.get("VoicePrint")
+                    target_obj = voice_print_collection.query.fetch_object_by_id(
+                        uuid=voice_print_id,
+                        include_vector=True
+                    )
+                    
+                    if target_obj and target_obj.vector:
+                        # 處理 named vector
+                        vec_dict = target_obj.vector
+                        raw_vec = vec_dict["default"] if isinstance(vec_dict, dict) else vec_dict
+                        target_embedding = np.array(raw_vec, dtype=float)
+                        
+                        # 應用 AS-Norm
+                        normalized_distance = as_norm_processor.apply_as_norm(
+                            new_embedding, target_embedding, speaker_name
+                        )
+                        
+                        # 詳細日誌輸出
+                        improvement = original_distance - normalized_distance  # 距離減少表示改善
+                        improvement_pct = (improvement / original_distance * 100) if original_distance > 0 else 0
+                        
+                        logger.info(f"✅ {speaker_name}: {original_distance:.4f} → {normalized_distance:.4f} "
+                                   f"(改善: {improvement:+.4f}, {improvement_pct:+.1f}%)")
+                        
+                        normalized_results.append((voice_print_id, speaker_name, normalized_distance, update_count))
+                    else:
+                        # 無法獲取嵌入向量時，保持原始距離
+                        logger.warning(f"⚠️  無法獲取 {speaker_name} 的嵌入向量，保持原始距離")
+                        normalized_results.append((voice_print_id, speaker_name, original_distance, update_count))
+                        
+                except Exception as e:
+                    logger.warning(f"❌ 對語者 {speaker_name} 應用 AS-Norm 時發生錯誤: {e}")
+                    # 發生錯誤時保持原始距離
+                    normalized_results.append((voice_print_id, speaker_name, original_distance, update_count))
+            
+            # 排序結果（按正規化後的距離）
+            normalized_results.sort(key=lambda x: x[2])
+            
+            # 總結日誌
+            if normalized_results:
+                best_speaker = normalized_results[0][1]
+                best_distance = normalized_results[0][2]
+                best_id = normalized_results[0][0]
+                logger.info(f"🎯 AS-Norm 正規化完成，最佳匹配: {best_speaker} (正規化距離: {best_distance:.4f})")
+                return best_id, best_speaker, best_distance, normalized_results
+            else:
+                return None, None, float('inf'), []
+                
+        except ImportError as e:
+            logger.error(f"無法導入 AS-Norm 處理器: {e}")
+            logger.warning("回退到普通比對方式")
+            return self.database.compare_embedding(new_embedding)
+        except Exception as e:
+            logger.error(f"AS-Norm 處理過程中發生錯誤: {e}")
+            logger.warning("回退到普通比對方式")
+            return self.database.compare_embedding(new_embedding)
     
     def _handle_very_similar(self, best_id: str, best_name: str, best_distance: float) -> Tuple[str, str, float]:
         """
@@ -1319,11 +1234,11 @@ class SpeakerIdentifier:
             # 提取嵌入向量
             new_embedding = self.audio_processor.extract_embedding_from_stream(signal, sr)
 
-            # 與 Weaviate 中的嵌入向量比對，傳遞 AS-Norm 處理器
-            best_id, best_name, best_distance, all_distances = self.database.compare_embedding(
-                new_embedding, 
-                as_norm_processor=self.as_norm_processor if ENABLE_AS_NORM else None
-            )
+            # 與 Weaviate 中的嵌入向量比對，根據 AS-Norm 設定選擇比對方式
+            if ENABLE_AS_NORM:
+                best_id, best_name, best_distance, all_distances = self.compare_embedding_with_as_norm(new_embedding)
+            else:
+                best_id, best_name, best_distance, all_distances = self.database.compare_embedding(new_embedding)
 
             # 輸出比對結果
             if self.verbose and all_distances:

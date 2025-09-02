@@ -24,7 +24,7 @@ AS-Norm Cohort 資料庫管理模組
 
 技術架構：
 -----------
-- 聲紋提取：SpeechBrain ECAPA-TDNN 模型
+- 聲紋提取：pyannote/embedding 模型 (512維)
 - 向量資料庫：Weaviate V2
 - 音頻處理：librosa + soundfile
 - 切片策略：固定長度切片 + 重疊窗口
@@ -64,6 +64,7 @@ import soundfile as sf
 from typing import List, Dict, Any, Optional, Tuple
 from datetime import datetime
 from pathlib import Path
+import pytz  # 新增：時區支援
 
 # 添加模組路徑
 current_dir = os.path.dirname(os.path.abspath(__file__))
@@ -71,18 +72,20 @@ project_root = os.path.dirname(os.path.dirname(current_dir))
 sys.path.insert(0, project_root)
 
 import weaviate
+import weaviate.classes.config as wcc
 import torch
 from speechbrain.inference import SpeakerRecognition
+from pyannote.audio import Inference
+from pyannote.core import Segment
 from scipy.spatial.distance import cosine
 from scipy.signal import resample_poly  # 新增：與 VID_identify_v5.py 一致的重新採樣
-import weaviate.classes as wc
 from weaviate.classes.query import Filter
 
 # 導入項目模組
 from utils.logger import get_logger
 from utils.env_config import get_model_save_dir, HF_ACCESS_TOKEN
 from utils.constants import (
-    AS_NORM_COHORT_COLLECTION, SPEECHBRAIN_SPEAKER_MODEL,
+    AS_NORM_COHORT_COLLECTION, SPEECHBRAIN_SPEAKER_MODEL, PYANNOTE_SPEAKER_MODEL,
     AUDIO_TARGET_RATE, AUDIO_SAMPLE_RATE,
     ENABLE_AS_NORM, AS_NORM_COHORT_SIZE, AS_NORM_TOP_K, AS_NORM_ALPHA,
     ENABLE_T_NORM, ENABLE_Z_NORM, ENABLE_S_NORM, AS_NORM_USE_DEDICATED_COHORT
@@ -90,6 +93,18 @@ from utils.constants import (
 
 # 創建模組專屬日誌器
 logger = get_logger(__name__)
+
+# 台北時區設定
+TAIPEI_TZ = pytz.timezone('Asia/Taipei')
+
+def get_taipei_time() -> datetime:
+    """
+    獲取台北時間
+    
+    Returns:
+        datetime: 台北時區的當前時間
+    """
+    return datetime.now(TAIPEI_TZ)
 
 
 class ASNormProcessor:
@@ -127,10 +142,12 @@ class ASNormProcessor:
     def compute_t_norm_score(self, test_embedding: np.ndarray, target_embedding: np.ndarray, 
                            impostor_embeddings: List[np.ndarray]) -> float:
         """
-        計算 T-Norm 正規化分數
+        計算 T-Norm 正規化分數（在距離空間操作）
         
         T-Norm 通過使用 impostor 模型分數來正規化目標分數
-        公式: (score - mean_impostor) / std_impostor
+        在距離空間的公式: (target_distance - mean_impostor_distance) / std_impostor_distance
+        
+        注意：正規化後的值可能為負數（表示比平均 impostor 更相似）
         
         Args:
             test_embedding: 測試音訊的嵌入向量
@@ -138,72 +155,73 @@ class ASNormProcessor:
             impostor_embeddings: impostor 語者的嵌入向量列表
             
         Returns:
-            float: T-Norm 正規化後的分數
+            float: T-Norm 正規化後的距離分數
         """
         if not impostor_embeddings:
             # 沒有 impostor 時，返回原始餘弦距離
             return cosine(test_embedding, target_embedding)
             
-        # 計算目標分數（餘弦距離）
-        target_score = cosine(test_embedding, target_embedding)
+        # 計算目標距離（餘弦距離）
+        target_distance = cosine(test_embedding, target_embedding)
         
-        # 計算 impostor 分數
-        impostor_scores = []
+        # 計算 impostor 距離
+        impostor_distances = []
         for imp_embedding in impostor_embeddings:
-            imp_score = cosine(test_embedding, imp_embedding)
-            impostor_scores.append(imp_score)
+            imp_distance = cosine(test_embedding, imp_embedding)
+            impostor_distances.append(imp_distance)
             
-        # 計算 impostor 分數的統計量
-        mean_impostor = np.mean(impostor_scores)
-        std_impostor = np.std(impostor_scores)
+        # 計算 impostor 距離的統計量
+        mean_impostor_distance = np.mean(impostor_distances)
+        std_impostor_distance = np.std(impostor_distances)
         
-        # T-Norm 正規化
-        if std_impostor > 0:
-            t_norm_score = (target_score - mean_impostor) / std_impostor
+        # T-Norm 正規化（在距離空間）
+        if std_impostor_distance > 0:
+            # 注意：目標距離小於平均 impostor 距離時，正規化值為負
+            t_norm_distance = (target_distance - mean_impostor_distance) / std_impostor_distance
         else:
-            t_norm_score = target_score
+            t_norm_distance = target_distance
             
-        return t_norm_score
+        return t_norm_distance
     
     def compute_z_norm_score(self, test_embedding: np.ndarray, target_embedding: np.ndarray) -> float:
         """
-        計算 Z-Norm 正規化分數
+        計算 Z-Norm 正規化分數（在距離空間操作）
         
         Z-Norm 使用測試語音對所有已知語者的統計分布進行正規化
-        公式: (score - mean_all) / std_all
+        在距離空間的公式: (target_distance - mean_all_distance) / std_all_distance
         
         Args:
             test_embedding: 測試音訊的嵌入向量
             target_embedding: 目標語者的嵌入向量
             
         Returns:
-            float: Z-Norm 正規化後的分數
+            float: Z-Norm 正規化後的距離分數
         """
-        # 計算目標分數
-        target_score = cosine(test_embedding, target_embedding)
+        # 計算目標距離（餘弦距離）
+        target_distance = cosine(test_embedding, target_embedding)
         
         # 獲取所有語者的嵌入向量
         all_embeddings = self._get_all_speaker_embeddings()
         
         if not all_embeddings:
-            return target_score
+            return target_distance
             
-        # 計算對所有語者的分數
-        all_scores = []
+        # 計算對所有語者的距離
+        all_distances = []
         for embedding in all_embeddings:
-            score = cosine(test_embedding, embedding)
-            all_scores.append(score)
+            distance = cosine(test_embedding, embedding)
+            all_distances.append(distance)
             
-        # Z-Norm 正規化
-        mean_all = np.mean(all_scores)
-        std_all = np.std(all_scores)
+        # Z-Norm 正規化（在距離空間）
+        mean_all_distance = np.mean(all_distances)
+        std_all_distance = np.std(all_distances)
         
-        if std_all > 0:
-            z_norm_score = (target_score - mean_all) / std_all
+        if std_all_distance > 0:
+            z_norm_distance = (target_distance - mean_all_distance) / std_all_distance
         else:
-            z_norm_score = target_score
+            z_norm_distance = target_distance
             
-        return z_norm_score
+        return z_norm_distance
     
     def compute_s_norm_score(self, test_embedding: np.ndarray, target_embedding: np.ndarray,
                            impostor_embeddings: List[np.ndarray]) -> float:
@@ -235,9 +253,9 @@ class ASNormProcessor:
     def apply_as_norm(self, test_embedding: np.ndarray, target_embedding: np.ndarray,
                      target_id: str) -> float:
         """
-        應用 AS-Norm 處理
+        應用 AS-Norm 處理（修正版：保持統計穩定性和區別性）
         
-        根據配置選擇性地應用不同的正規化方法
+        根據配置選擇性地應用不同的正規化方法，確保不會破壞距離的區別能力
         
         Args:
             test_embedding: 測試音訊的嵌入向量
@@ -245,57 +263,107 @@ class ASNormProcessor:
             target_id: 目標語者ID
             
         Returns:
-            float: 正規化後的分數
+            float: 正規化後的距離分數（與原始餘弦距離概念一致）
         """
         if not ENABLE_AS_NORM:
             # AS-Norm 關閉時，返回原始餘弦距離
-            original_score = cosine(test_embedding, target_embedding)
-            logger.debug(f"⚪ AS-Norm 已停用，返回原始餘弦距離: {original_score:.4f}")
-            return original_score
+            original_distance = cosine(test_embedding, target_embedding)
+            logger.debug(f"⚪ AS-Norm 已停用，返回原始餘弦距離: {original_distance:.4f}")
+            return original_distance
             
         # 計算原始餘弦距離作為對比
-        original_score = cosine(test_embedding, target_embedding)
-        logger.debug(f"📏 原始餘弦距離: {original_score:.4f}")
+        original_distance = cosine(test_embedding, target_embedding)
+        logger.debug(f"📏 原始餘弦距離: {original_distance:.4f}")
         
         # 獲取 impostor 嵌入向量
         impostor_embeddings = self._get_impostor_embeddings(target_id)
         
-        # 根據配置選擇正規化方法
+        # 根據配置選擇正規化方法（在距離空間操作）
         if ENABLE_S_NORM and ENABLE_T_NORM and ENABLE_Z_NORM:
             # 完整 S-Norm
             logger.debug("🔧 使用完整 S-Norm (T-Norm + Z-Norm 組合)")
-            normalized_score = self.compute_s_norm_score(test_embedding, target_embedding, impostor_embeddings)
+            normalized_distance = self.compute_s_norm_score(test_embedding, target_embedding, impostor_embeddings)
         elif ENABLE_T_NORM and ENABLE_Z_NORM:
             # T-Norm + Z-Norm 組合
             logger.debug("🔧 使用 T-Norm + Z-Norm 組合")
-            t_score = self.compute_t_norm_score(test_embedding, target_embedding, impostor_embeddings)
-            z_score = self.compute_z_norm_score(test_embedding, target_embedding)
-            normalized_score = 0.5 * t_score + 0.5 * z_score
+            t_distance = self.compute_t_norm_score(test_embedding, target_embedding, impostor_embeddings)
+            z_distance = self.compute_z_norm_score(test_embedding, target_embedding)
+            normalized_distance = 0.5 * t_distance + 0.5 * z_distance
         elif ENABLE_T_NORM:
             # 僅 T-Norm
             logger.debug("🔧 使用 T-Norm 正規化")
-            normalized_score = self.compute_t_norm_score(test_embedding, target_embedding, impostor_embeddings)
+            normalized_distance = self.compute_t_norm_score(test_embedding, target_embedding, impostor_embeddings)
         elif ENABLE_Z_NORM:
             # 僅 Z-Norm
             logger.debug("🔧 使用 Z-Norm 正規化")
-            normalized_score = self.compute_z_norm_score(test_embedding, target_embedding)
+            normalized_distance = self.compute_z_norm_score(test_embedding, target_embedding)
         else:
             # 所有正規化都關閉，返回原始分數
             logger.debug("⚪ 所有正規化方法都已停用，返回原始分數")
-            normalized_score = original_score
+            return original_distance
         
-        # 記錄正規化效果
-        improvement = original_score - normalized_score
-        logger.debug(f"📊 正規化結果: {original_score:.4f} → {normalized_score:.4f} (改善: {improvement:+.4f})")
+        # 檢查正規化結果的合理性
+        if abs(normalized_distance) > 10:
+            logger.warning(f"⚠️ AS-Norm 正規化值異常: {normalized_distance:.4f}，cohort 資料可能有問題")
+            logger.warning(f"⚠️ 回退到原始距離: {original_distance:.4f}")
+            return original_distance
         
-        return normalized_score
+        # 使用保守的映射策略，保持區別性
+        from utils.constants import THRESHOLD_LOW, THRESHOLD_UPDATE, THRESHOLD_NEW
+        
+        # 修正版映射：保持原始距離的相對關係，只做適度調整
+        # 核心理念：好的匹配小幅改善，壞的匹配保持原樣或略微惡化
+        
+        if normalized_distance <= -2.0:
+            # 很好的匹配：距離減少 20-40%
+            reduction_factor = 0.6 + 0.2 * max(0, min(1, (normalized_distance + 4) / 2))
+            final_distance = original_distance * reduction_factor
+        elif normalized_distance <= -1.0:
+            # 好的匹配：距離減少 10-20%
+            reduction_factor = 0.8 + 0.1 * (normalized_distance + 2) / 1
+            final_distance = original_distance * reduction_factor
+        elif normalized_distance <= 0:
+            # 中等匹配：距離減少 0-10%
+            reduction_factor = 0.9 + 0.1 * (normalized_distance + 1) / 1
+            final_distance = original_distance * reduction_factor
+        elif normalized_distance <= 1.0:
+            # 較差匹配：距離保持不變或略微增加
+            increase_factor = 1.0 + 0.1 * normalized_distance / 1
+            final_distance = original_distance * increase_factor
+        else:
+            # 很差匹配：距離增加 10-20%
+            increase_factor = 1.1 + 0.1 * min(1.0, (normalized_distance - 1) / 2)
+            final_distance = original_distance * increase_factor
+        
+        # 確保結果在合理範圍內
+        final_distance = max(0.001, min(2.0, final_distance))
+        
+        # 記錄正規化效果和原始數據
+        improvement = original_distance - final_distance  # 距離減少表示改善
+        improvement_percent = (improvement / original_distance) * 100 if original_distance > 0 else 0
+        
+        # 詳細記錄正規化過程
+        logger.debug(f"📊 原始餘弦距離: {original_distance:.4f}")
+        logger.debug(f"📊 AS-Norm 正規化值: {normalized_distance:.4f}")
+        logger.debug(f"📊 最終映射距離: {final_distance:.4f}")
+        
+        # 根據實際效果記錄
+        if abs(improvement_percent) < 1:
+            logger.debug(f"📊 正規化結果: {original_distance:.4f} → {final_distance:.4f} (微調: {improvement:+.4f})")
+        elif improvement > 0:
+            logger.debug(f"📊 正規化結果: {original_distance:.4f} → {final_distance:.4f} (改善: {improvement:+.4f}, {improvement_percent:+.1f}%)")
+        else:
+            logger.debug(f"📊 正規化結果: {original_distance:.4f} → {final_distance:.4f} (調整: {improvement:+.4f}, {improvement_percent:+.1f}%)")
+        
+        return final_distance
     
     def _get_impostor_embeddings(self, target_id: str) -> List[np.ndarray]:
         """
         獲取 impostor 語者的嵌入向量（用於 T-Norm）
         
-        如果啟用專門的cohort資料庫，則從CohortVoicePrint collection獲取
-        否則從主要的VoicePrint collection中排除目標語者後獲取
+        邏輯說明：
+        1. 直接從專門的 CohortVoicePrint collection 獲取
+        2. cohort 資料庫本身就不包含目標語者，無需過濾
         
         Args:
             target_id: 目標語者ID
@@ -308,38 +376,22 @@ class ASNormProcessor:
             return []
             
         try:
-            # 根據配置選擇資料來源
-            if AS_NORM_USE_DEDICATED_COHORT:
-                collection_name = AS_NORM_COHORT_COLLECTION
-                # 檢查專門的cohort collection是否存在
-                if not self.client.collections.exists(collection_name):
-                    logger.warning(f"專門的cohort collection '{collection_name}' 不存在，回退到主資料庫")
-                    collection_name = "VoicePrint"
-                    use_where_filter = True
-                else:
-                    use_where_filter = False  # cohort資料庫中沒有目標語者，不需要過濾
-            else:
-                collection_name = "VoicePrint"
-                use_where_filter = True
-            
-            collection = self.client.collections.get(collection_name)
-            
-            # 根據是否需要過濾目標語者來構建查詢
-            if use_where_filter:
-                results = collection.query.fetch_objects(
-                    where=Filter.by_property("speaker_name").not_equal(target_id),
-                    return_properties=["speaker_name"],
-                    include_vector=True,
-                    limit=self.top_k  # 直接查詢 top_k 數量，避免不必要的資料傳輸
-                )
-            else:
-                # 從專門的cohort資料庫獲取，不需要過濾
-                results = collection.query.fetch_objects(
-                    include_vector=True,
-                    limit=self.top_k
-                )
-            
             impostor_embeddings = []
+            
+            # 檢查 cohort 資料庫是否存在
+            if not self.client.collections.exists(AS_NORM_COHORT_COLLECTION):
+                logger.error(f"❌ Cohort 資料庫 '{AS_NORM_COHORT_COLLECTION}' 不存在，無法獲取 impostor 嵌入向量")
+                return []
+            
+            logger.debug(f"🎯 使用專門的 cohort 資料庫: {AS_NORM_COHORT_COLLECTION}")
+            collection = self.client.collections.get(AS_NORM_COHORT_COLLECTION)
+            
+            # 從 cohort 資料庫獲取，無需過濾（cohort 本身就不包含目標語者）
+            results = collection.query.fetch_objects(
+                include_vector=True,
+                limit=self.top_k
+            )
+            
             for obj in results.objects:
                 if obj.vector:
                     # 處理 named vector
@@ -348,8 +400,14 @@ class ASNormProcessor:
                     embedding = np.array(raw_vec, dtype=float)
                     impostor_embeddings.append(embedding)
             
-            logger.debug(f"從 {collection_name} 獲取了 {len(impostor_embeddings)} 個 impostor 嵌入向量")
-            return impostor_embeddings  # 已經限制在 top_k 數量內
+            logger.debug(f"✅ 從 cohort 資料庫獲取了 {len(impostor_embeddings)} 個 impostor 嵌入向量（目標: {self.top_k}）")
+            
+            if len(impostor_embeddings) == 0:
+                logger.warning("⚠️ 未能從 cohort 資料庫獲取任何 impostor 嵌入向量")
+            elif len(impostor_embeddings) < self.top_k:
+                logger.warning(f"⚠️ cohort 資料庫嵌入向量數量不足：獲取 {len(impostor_embeddings)} 個，目標 {self.top_k} 個")
+            
+            return impostor_embeddings
             
         except Exception as e:
             logger.warning(f"獲取 impostor 嵌入向量時發生錯誤: {e}")
@@ -359,8 +417,9 @@ class ASNormProcessor:
         """
         獲取背景模型嵌入向量（用於 Z-Norm）
         
-        如果啟用專門的cohort資料庫，則從CohortVoicePrint collection獲取
-        否則從主要的VoicePrint collection獲取
+        邏輯說明：
+        1. 直接使用專門的 cohort 資料庫來保持統計穩定性
+        2. Z-Norm 需要足夠的統計樣本（使用 cohort_size 限制）
         
         Returns:
             List[np.ndarray]: 背景模型嵌入向量列表
@@ -370,24 +429,21 @@ class ASNormProcessor:
             return []
             
         try:
-            # 根據配置選擇資料來源
-            if AS_NORM_USE_DEDICATED_COHORT:
-                collection_name = AS_NORM_COHORT_COLLECTION
-                # 檢查專門的cohort collection是否存在
-                if not self.client.collections.exists(collection_name):
-                    logger.warning(f"專門的cohort collection '{collection_name}' 不存在，回退到主資料庫")
-                    collection_name = "VoicePrint"
-            else:
-                collection_name = "VoicePrint"
+            all_embeddings = []
             
-            collection = self.client.collections.get(collection_name)
+            # 檢查 cohort 資料庫是否存在
+            if not self.client.collections.exists(AS_NORM_COHORT_COLLECTION):
+                logger.error(f"❌ Cohort 資料庫 '{AS_NORM_COHORT_COLLECTION}' 不存在，無法獲取背景模型嵌入向量")
+                return []
+            
+            logger.debug(f"🎯 使用專門的 cohort 資料庫進行 Z-Norm: {AS_NORM_COHORT_COLLECTION}")
+            collection = self.client.collections.get(AS_NORM_COHORT_COLLECTION)
             
             results = collection.query.fetch_objects(
                 include_vector=True,
-                limit=self.cohort_size  # Z-Norm 需要更多樣本來計算統計量
+                limit=self.cohort_size  # Z-Norm 使用 cohort_size 而非 top_k
             )
             
-            all_embeddings = []
             for obj in results.objects:
                 if obj.vector:
                     # 處理 named vector
@@ -396,7 +452,13 @@ class ASNormProcessor:
                     embedding = np.array(raw_vec, dtype=float)
                     all_embeddings.append(embedding)
             
-            logger.debug(f"從 {collection_name} 獲取了 {len(all_embeddings)} 個背景模型嵌入向量")
+            logger.debug(f"✅ 從 cohort 資料庫獲取了 {len(all_embeddings)} 個背景模型嵌入向量（目標: {self.cohort_size}）")
+            
+            if len(all_embeddings) == 0:
+                logger.warning("⚠️ 未能從 cohort 資料庫獲取任何背景模型嵌入向量")
+            elif len(all_embeddings) < self.cohort_size:
+                logger.warning(f"⚠️ cohort 資料庫嵌入向量數量不足：獲取 {len(all_embeddings)} 個，目標 {self.cohort_size} 個")
+            
             return all_embeddings
             
         except Exception as e:
@@ -407,14 +469,25 @@ class ASNormProcessor:
 class CohortDatabaseManager:
     """AS-Norm Cohort 資料庫管理器"""
     
-    def __init__(self, model_name: str = None) -> None:
+    def __init__(self, model_name: str = None, model_type: str = "pyannote") -> None:
         """
         初始化 Cohort 資料庫管理器
         
         Args:
-            model_name: 聲紋提取模型名稱，預設使用 SPEECHBRAIN_SPEAKER_MODEL
+            model_name: 聲紋提取模型名稱（將被 model_type 覆蓋）
+            model_type: 模型類型，可選值: "speechbrain" 或 "pyannote"
         """
-        self.model_name = model_name or SPEECHBRAIN_SPEAKER_MODEL
+        # ====== 這裡改模型類型 ======
+        self.model_type = model_type
+        # =========================
+        
+        if self.model_type == "speechbrain":
+            self.model_name = SPEECHBRAIN_SPEAKER_MODEL
+        elif self.model_type == "pyannote":
+            self.model_name = PYANNOTE_SPEAKER_MODEL
+        else:
+            raise ValueError(f"不支援的模型類型: {self.model_type}")
+            
         self.client = None
         self.speaker_model = None
         self._connect_database()
@@ -430,25 +503,37 @@ class CohortDatabaseManager:
             raise
     
     def _init_speaker_model(self) -> None:
-        """初始化聲紋提取模型"""
+        """初始化聲紋提取模型（支援 speechbrain 和 pyannote）"""
         try:
             logger.info(f"🔧 正在載入聲紋提取模型: {self.model_name}")
-            
-            # 設定模型快取目錄
-            model_save_dir = get_model_save_dir("speechbrain_recognition")
-            os.makedirs(model_save_dir, exist_ok=True)
+            logger.info(f"🎯 模型類型: {self.model_type}")
             
             # 設定設備
             self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
             logger.info(f"🔧 使用設備: {self.device}")
             
-            # 載入 SpeechBrain 語者辨識模型
-            self.speaker_model = SpeakerRecognition.from_hparams(
-                source=self.model_name,
-                savedir=model_save_dir,
-                use_auth_token=HF_ACCESS_TOKEN
-            )
-            logger.info("✅ 聲紋提取模型載入成功")
+            if self.model_type == "speechbrain":
+                # 載入 SpeechBrain 語者辨識模型
+                model_save_dir = get_model_save_dir("speechbrain_recognition")
+                os.makedirs(model_save_dir, exist_ok=True)
+                
+                self.speaker_model = SpeakerRecognition.from_hparams(
+                    source=self.model_name,
+                    savedir=model_save_dir,
+                    use_auth_token=HF_ACCESS_TOKEN
+                )
+                logger.info("✅ SpeechBrain ECAPA-TDNN 模型載入成功 (192維)")
+                
+            elif self.model_type == "pyannote":
+                # 載入 pyannote 語者嵌入模型
+                self.speaker_model = Inference(
+                    self.model_name, 
+                    window="whole",
+                    device=self.device,
+                    use_auth_token=HF_ACCESS_TOKEN
+                )
+                self.Segment = Segment  # 保存 Segment 類別以便後續使用
+                logger.info("✅ pyannote/embedding 模型載入成功 (512維)")
             
         except Exception as e:
             logger.error(f"❌ 載入聲紋提取模型失敗: {e}")
@@ -478,16 +563,16 @@ class CohortDatabaseManager:
             cohort_collection = self.client.collections.create(
                 name=AS_NORM_COHORT_COLLECTION,
                 properties=[
-                    wc.Property(name="create_time", data_type=wc.DataType.DATE),
-                    wc.Property(name="cohort_id", data_type=wc.DataType.TEXT),  # 背景模型識別碼
-                    wc.Property(name="source_dataset", data_type=wc.DataType.TEXT),  # 來源資料集
-                    wc.Property(name="gender", data_type=wc.DataType.TEXT),  # 性別（可選）
-                    wc.Property(name="language", data_type=wc.DataType.TEXT),  # 語言（可選）
-                    wc.Property(name="description", data_type=wc.DataType.TEXT),  # 描述
+                    wcc.Property(name="create_time", data_type=wcc.DataType.DATE),
+                    wcc.Property(name="cohort_id", data_type=wcc.DataType.TEXT),  # 背景模型識別碼
+                    wcc.Property(name="source_dataset", data_type=wcc.DataType.TEXT),  # 來源資料集
+                    wcc.Property(name="gender", data_type=wcc.DataType.TEXT),  # 性別（可選）
+                    wcc.Property(name="language", data_type=wcc.DataType.TEXT),  # 語言（可選）
+                    wcc.Property(name="description", data_type=wcc.DataType.TEXT),  # 描述
                 ],
-                vectorizer_config=wc.Configure.Vectorizer.none(),
-                vector_index_config=wc.Configure.VectorIndex.hnsw(
-                    distance_metric=wc.VectorDistances.COSINE
+                vectorizer_config=wcc.Configure.Vectorizer.none(),
+                vector_index_config=wcc.Configure.VectorIndex.hnsw(
+                    distance_metric=wcc.VectorDistances.COSINE
                 )
             )
             logger.info(f"✅ 成功建立 cohort collection '{AS_NORM_COHORT_COLLECTION}'")
@@ -497,9 +582,12 @@ class CohortDatabaseManager:
             logger.error(f"❌ 初始化 cohort collection 時發生錯誤: {e}")
             return False
     
-    def reset_cohort_collection(self) -> bool:
+    def reset_cohort_collection(self, force: bool = False) -> bool:
         """
         重置 cohort collection（刪除所有資料並重新建立）
+        
+        Args:
+            force: 是否強制重置，若為 False 會先確認資料庫狀態
         
         Returns:
             bool: 是否成功重置
@@ -507,15 +595,37 @@ class CohortDatabaseManager:
         try:
             logger.info(f"🗑️  正在重置 cohort collection: {AS_NORM_COHORT_COLLECTION}")
             
+            # 如果不是強制模式，先檢查現有資料
+            if not force and self.client.collections.exists(AS_NORM_COHORT_COLLECTION):
+                stats = self.get_cohort_statistics()
+                current_count = stats.get('total_count', 0)
+                if current_count > 0:
+                    logger.warning(f"⚠️  當前 cohort 資料庫包含 {current_count} 筆資料")
+                    logger.warning(f"⚠️  重置操作將刪除所有現有資料")
+                    logger.info(f"💡 如需強制重置，請設定 force=True")
+                    return False
+                else:
+                    logger.info(f"📊 當前 cohort 資料庫為空，繼續重置操作")
+            
+            # 記錄重置時間
+            reset_time = get_taipei_time()
+            logger.info(f"🕐 重置時間: {reset_time.strftime('%Y-%m-%d %H:%M:%S %Z')}")
+            
             # 刪除現有 collection
             if self.client.collections.exists(AS_NORM_COHORT_COLLECTION):
                 self.client.collections.delete(AS_NORM_COHORT_COLLECTION)
                 logger.info(f"🗑️  已刪除現有的 cohort collection")
+            else:
+                logger.info(f"ℹ️  Cohort collection 不存在，直接建立新的")
             
             # 重新建立
             success = self.initialize_cohort_collection()
             if success:
                 logger.info(f"✅ 成功重置 cohort collection")
+                
+                # 驗證重置結果
+                final_stats = self.get_cohort_statistics()
+                logger.info(f"📊 重置後狀態: 總計 {final_stats.get('total_count', 0)} 筆資料")
             
             return success
             
@@ -539,7 +649,7 @@ class CohortDatabaseManager:
     
     def extract_embedding(self, audio_path: str) -> Optional[np.ndarray]:
         """
-        從音頻檔案提取聲紋嵌入向量
+        從音頻檔案提取聲紋嵌入向量（支援 speechbrain 和 pyannote）
         與 VID_identify_v5.py 保持完全一致的實作
         
         Args:
@@ -567,13 +677,40 @@ class CohortDatabaseManager:
                 logger.warning(f"⚠️  音頻檔案太短，跳過: {audio_path} ({len(waveform)/target_sr:.2f}s)")
                 return None
             
-            # 轉換為張量並設置正確的設備（與 VID_identify_v5.py 一致）
-            waveform_tensor = torch.tensor(waveform, dtype=torch.float32).unsqueeze(0).to(self.device)
-            embedding = self.speaker_model.encode_batch(waveform_tensor)
-            
-            # 轉換為 numpy array 並正規化（與 VID_identify_v5.py 一致）
-            embedding_np = embedding.squeeze().cpu().numpy()
-            embedding_np = embedding_np / np.linalg.norm(embedding_np)  # L2 正規化
+            # 根據模型類型提取嵌入向量
+            if self.model_type == "speechbrain":
+                # SpeechBrain 模型處理
+                waveform_tensor = torch.tensor(waveform, dtype=torch.float32).unsqueeze(0).to(self.device)
+                embedding = self.speaker_model.encode_batch(waveform_tensor)
+                
+                # 轉換為 numpy array 並正規化
+                embedding_np = embedding.squeeze().cpu().numpy()
+                embedding_np = embedding_np / np.linalg.norm(embedding_np)  # L2 正規化
+                
+            elif self.model_type == "pyannote":
+                # pyannote 模型處理（使用臨時檔案方式）
+                import tempfile
+                import soundfile as sf
+                
+                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+                    temp_path = temp_file.name
+                    # 將信號寫入臨時文件
+                    sf.write(temp_path, waveform, target_sr)
+                
+                try:
+                    # 整個音頻模式：使用 crop 方法
+                    duration = len(waveform) / target_sr
+                    segment = self.Segment(0, duration)
+                    embedding = self.speaker_model.crop(temp_path, segment)
+                    
+                    # 轉換為 numpy array 並正規化
+                    embedding_np = embedding.squeeze()  # 移除第一維
+                    embedding_np = embedding_np / np.linalg.norm(embedding_np)  # L2 正規化
+                    
+                finally:
+                    # 清理臨時文件
+                    if os.path.exists(temp_path):
+                        os.unlink(temp_path)
             
             return embedding_np
             
@@ -679,7 +816,7 @@ class CohortDatabaseManager:
             
             # 準備元數據
             properties = {
-                "create_time": datetime.now(),
+                "create_time": get_taipei_time(),
                 "cohort_id": file_name,  # 使用檔名作為 cohort_id
                 "source_dataset": source_dataset,  # 使用檔名或指定的 source_dataset
                 "gender": metadata.get("gender", "unknown") if metadata else "unknown",
@@ -871,7 +1008,7 @@ class CohortDatabaseManager:
             str: 輸出檔案路徑
         """
         if output_file is None:
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+            timestamp = get_taipei_time().strftime("%Y%m%d_%H%M%S")
             output_file = f"cohort_info_{timestamp}.json"
         
         try:
@@ -922,6 +1059,8 @@ def main():
     parser.add_argument("--gender", type=str, help="語者性別")
     parser.add_argument("--language", type=str, default="zh", help="語音語言")
     parser.add_argument("--output", type=str, help="匯出檔案路徑")
+    parser.add_argument("--force", action="store_true", 
+                       help="強制執行重置操作（忽略資料確認）")
     
     args = parser.parse_args()
     
@@ -935,8 +1074,10 @@ def main():
             
         elif args.action == "reset":
             print("🗑️  正在重置 cohort collection...")
-            success = manager.reset_cohort_collection()
+            success = manager.reset_cohort_collection(force=args.force)
             print(f"✅ 重置{'成功' if success else '失敗'}")
+            if not success and not args.force:
+                print("💡 提示：如需強制重置，請加上 --force 參數")
             
         elif args.action == "import":
             if not args.folder:

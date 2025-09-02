@@ -23,6 +23,7 @@ models
 R3SI
 pipeline_stages.csv
 eval_outputs/
+TCC-300_dynamic_2
 
 # 測試檔案
 *test_report.json

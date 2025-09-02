@@ -970,12 +970,12 @@ class AudioSeparator:
             absolute_start_time: 音訊的絕對開始時間（datetime 物件）
         """
         try:
-            # 先以寬鬆範圍跑一次，並套用重疊感知後處理；若你的批次確定雙人，可設 expected_min/max=2
+            # 先以寬鬆範圍跑一次，並套用重疊感知後處理；針對單語者處理，允許 1-2 人範圍
             detected_speakers = self.spk_counter.count_with_refine(
                 audio=audio_tensor,
                 sample_rate=TARGET_RATE,
-                expected_min=2,
-                expected_max=2,
+                expected_min=1,           # 最少 1 人
+                expected_max=2,           # 最多 2 人，適合單語者或雙語者音檔
                 first_pass_range=(1, 3),
                 allow_zero=False,         # <== 允許回傳 0（無語音）
                 debug=False
