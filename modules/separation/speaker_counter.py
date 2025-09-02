@@ -42,6 +42,14 @@ class SpeakerCounter:
     # 絕對 dBFS 門檻（對 full-scale 1.0）
     VAD_ABS_DBFS_MIN = -46.0      # 幀/全段的最低聲能
     VAD_LOUD_DBFS    = -40.0      # 至少若干幀須超過此能量，避免底噪誤判
+    
+    # --- KMeans(3) 後備的更嚴門檻 ---
+    K3_MIN_PROP = 0.22        # 原本 0.15 → 拉高，第三群至少 22% 有聲幀
+    K3_MIN_QUALITY = 0.25     # 原本 0.12 → 拉高
+    K3_MIN_ISLANDS = 3        # 第三群至少要有 3 段以上的獨立時間島
+    K3_MIN_ISLAND_DUR = 0.20  # 每段至少 0.20s
+    K3_MIN_RMS_DBFS = -35.0   # 第三群的能量不能太小（排除噪音/擦音群）
+
 
     def __init__(
         self,
@@ -152,13 +160,16 @@ class SpeakerCounter:
                                 self._dbg(debug, f"可能是 3語者? → retry(3,3) accepted by rel3={third_eff_rel:.3f}")
                                 accepted_retry = True
 
-                # ★ 就在這裡接 KMeans(3) 後備（等價於你問的那段 else 的位置）
+                # 接 KMeans(3) 後備（等價於你問的那段 else 的位置）
                 if not accepted_retry:
-                    # (3,3) 仍只有 2 或 diar3 失敗 → 嘗試 KMeans(3) 後備
-                    k3 = self._kmeans_3_fallback(audio, sample_rate, debug=debug)
-                    if k3 == 3:
-                        self._dbg(debug, "fallback KMeans(3) → set n=3")
-                        return 3  # 直接回傳 3，結束流程
+                    # 若兩個候選的非重疊時間幾乎都為 0（極端重疊），多半是 2 人而不是 3 人 → 跳過 KMeans 後備
+                    if max(nonovs) < 0.02:
+                        self._dbg(debug, "kmeans3: skip because top2 non-overlap ~ 0 (likely 2 fully-overlapped)")
+                    else:
+                        k3 = self._kmeans_3_fallback(audio, sample_rate, debug=debug)
+                        if k3 == 3:
+                            self._dbg(debug, "fallback KMeans(3) → set n=3")
+                            return 3
 
         # --- 有效分數和相對值的輔助函數
         def eff_of(k: str) -> float:
@@ -598,12 +609,59 @@ class SpeakerCounter:
 
         self._dbg(debug, f"kmeans3: props={props}, quality={quality:.3f}")
 
+        # 計算第三群佔比 & 簡單品質後
         third_prop = sorted(props, reverse=True)[2]
-        if third_prop >= 0.15 and quality >= 0.12:
-            self._dbg(debug, "kmeans3: accept → return 3")
-            return 3
-        self._dbg(debug, "kmeans3: reject")
-        return 0
+        if third_prop < self.K3_MIN_PROP or quality < self.K3_MIN_QUALITY:
+            self._dbg(debug, f"kmeans3: reject by prop/quality (prop={third_prop:.3f}, quality={quality:.3f})")
+            return 0
+
+        # 取得第三群的 frame 索引（相對於 logmel/掩碼對齊後的時間軸）
+        third_label = torch.argsort(counts, descending=True)[2].item()
+        all_idx = torch.arange(T_logmel, device=y.device)[mask]
+        third_idx = all_idx[y == third_label]  # frame 索引
+
+        # 計算「時間島」個數與各島時長（hop=15ms）
+        def _island_durations(idx: torch.Tensor, hop_s: float = 0.015):
+            if idx.numel() == 0:
+                return []
+            gaps = (idx[1:] - idx[:-1]) > 1
+            # 找出每段的起訖
+            boundaries = torch.where(gaps)[0].cpu().tolist()
+            starts = [0] + [b + 1 for b in boundaries]
+            ends   = boundaries + [idx.numel() - 1]
+            durs = []
+            for s, e in zip(starts, ends):
+                frames = (e - s + 1)
+                durs.append(frames * hop_s)
+            return durs
+
+        durs = _island_durations(third_idx)
+        long_islands = sum(1 for d in durs if d >= self.K3_MIN_ISLAND_DUR)
+        if long_islands < self.K3_MIN_ISLANDS:
+            self._dbg(debug, f"kmeans3: reject by temporal spread (long_islands={long_islands})")
+            return 0
+
+        # 能量門檻：把第三群 frame 對回原波形估算 RMS（粗略即可）
+        win = int(0.030 * sr); hop = int(0.015 * sr)
+        rms_vals = []
+        for fi in third_idx.tolist():
+            s = fi * hop
+            e = s + win
+            seg = w[s:e]
+            if seg.numel():
+                rms_vals.append(torch.sqrt((seg**2).mean()).item())
+        if not rms_vals:
+            self._dbg(debug, "kmeans3: reject (no frames for energy)")
+            return 0
+        rms_mean = sum(rms_vals) / len(rms_vals)
+        rms_dbfs = -120.0 if rms_mean <= 1e-12 else 20.0 * math.log10(rms_mean)
+        if rms_dbfs < self.K3_MIN_RMS_DBFS:
+            self._dbg(debug, f"kmeans3: reject by low energy ({rms_dbfs:.1f} dBFS)")
+            return 0
+
+        # 通過所有條件才接受
+        self._dbg(debug, "kmeans3: accept → return 3")
+        return 3
     
     # -------------------------- 日誌記錄 ----------------------------
     def _dbg(self, debug: bool, msg: str) -> None:
