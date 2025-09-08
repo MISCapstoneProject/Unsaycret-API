@@ -962,285 +962,146 @@ class AudioSeparator:
 
     def separate_and_save(self, audio_tensor, output_dir, segment_index, absolute_start_time=None):
         """
-        分離並儲存音訊，並回傳 (path, start, end) 列表。
-        流程：語者計數 → 動態模型選擇 → 分離 → 強化(可選) → 儲存
-        
-        Args:
-            audio_tensor: 音訊張量
-            output_dir: 輸出目錄
-            segment_index: 片段索引
-            absolute_start_time: 音訊的絕對開始時間（datetime 物件）
+        分離並儲存音訊（僅保留原始分離結果，不做任何後處理）
+        流程：語者計數 → 動態模型選擇 → 分離 → 儲存
         """
         try:
-            # 先以寬鬆範圍跑一次，並套用重疊感知後處理；若你的批次確定雙人，可設 expected_min/max=2
+            # 1) 語者數量偵測（維持原邏輯）
             detected_speakers = self.spk_counter.count_with_refine(
                 audio=audio_tensor,
                 sample_rate=TARGET_RATE,
                 expected_min=1,
                 expected_max=3,
                 first_pass_range=(1, 3),
-                allow_zero=True,         # <== 允許回傳 0（無語音）
-                debug=False
+                allow_zero=True,
+                debug=False,
             )
-
             logger.info(f"片段 {segment_index} - 偵測到 {detected_speakers} 位說話者")
-            
-            # 備援：第一次回 0 → 只有在「強有聲」才重試 1–2 人
+
             if detected_speakers == 0:
                 ok, m = self.spk_counter._has_voice(audio_tensor, TARGET_RATE, return_metrics=True)
-                # 與 SpeakerCounter 同步或更嚴的條件
                 strong_voice = ok and (m["voiced_ratio"] >= 0.12) and (m["voiced_union"] >= 0.50) and (m.get("loud_frac", 0.0) >= 0.05)
                 if not strong_voice:
-                    logger.info(f"片段 {segment_index} - 無語音/過短（ratio={m['voiced_ratio']:.3f}, union={m['voiced_union']:.2f}s, loud={m.get('loud_frac',0.0):.3f}），跳過")
+                    logger.info(
+                        f"片段 {segment_index} - 無語音/過短（ratio={m['voiced_ratio']:.3f}, "
+                        f"union={m['voiced_union']:.2f}s, loud={m.get('loud_frac',0.0):.3f}），跳過"
+                    )
                     return []
-
                 logger.warning(f"片段 {segment_index} - 第一次偵測 0，但語音跡象偏強，嘗試 1–2 人重試")
                 retry = self.spk_counter.count_with_refine(
-                    audio=audio_tensor, sample_rate=TARGET_RATE,
-                    expected_min=1, expected_max=2,
-                    first_pass_range=(1, 2),
-                    allow_zero=False,           # 已確認強有聲，就不要再回 0
-                    debug=False
+                    audio=audio_tensor,
+                    sample_rate=TARGET_RATE,
+                    expected_min=1,
+                    expected_max=3,
+                    first_pass_range=(1, 3),
+                    allow_zero=False,
+                    debug=False,
                 )
                 detected_speakers = max(1, int(retry))
-            
-            # 動態選擇模型
+
+            # 2) 動態選擇模型（維持原邏輯）
             current_model, current_model_type = self._get_appropriate_model(detected_speakers)
-            
-            # 使用動態模型管理器取得模型配置
-            if self.model_manager:
-                model_config = self.model_manager.get_model_config(current_model_type)
-            else:
-                model_config = MODEL_CONFIGS[current_model_type]
-            
+            model_config = self.model_manager.get_model_config(current_model_type) if self.model_manager else MODEL_CONFIGS[current_model_type]
             logger.debug(f"使用模型: {current_model_type.value} (偵測語者: {detected_speakers})")
-            
-            # 記錄絕對時間戳
+
+            # 3) 時間戳處理（維持原邏輯）
             if absolute_start_time is None:
                 from datetime import timezone, timedelta
                 taipei_tz = timezone(timedelta(hours=8))
                 absolute_start_time = datetime.now(taipei_tz)
-            
-            # 初始化累計時間戳
             current_t0 = getattr(self, "_current_t0", 0.0)
-            results = []   # 用來收 (path, start, end, absolute_timestamp)
             seg_duration = audio_tensor.shape[-1] / TARGET_RATE
-            
+            results = []
+
             with torch.no_grad():
-                
-                # 確保輸入是 [batch, samples] 格式
-                if len(audio_tensor.shape) == 3:
-                    # 如果是 [batch, channels, samples]，需要去掉 channels 維度
-                    if audio_tensor.shape[1] == 1:
-                        audio_tensor = audio_tensor.squeeze(1)  # 變成 [batch, samples]
-                
-                # 使用選定的模型進行分離
+                # 4) 輸入整理成 [batch, samples]
+                if len(audio_tensor.shape) == 3 and audio_tensor.shape[1] == 1:
+                    audio_tensor = audio_tensor.squeeze(1)
+
+                # 5) 做「原始分離」
                 separated = current_model.separate_batch(audio_tensor)
+
+                # 6) 僅做固定比例的「峰值正規化」以統一尺度（維持原 _normalize_estimates）
+                #    不做任何音質增強/濾波/投影回混音等後處理
                 separated, layout, spk_axis, time_axis = self._normalize_estimates(separated)
-                
-                # 取得混音（原始輸入）一維波形
-                mix_wave = audio_tensor[0].detach().cpu()
-                
-                # 1) 分離後先不動：保留原始 for 評分/選路（SI-SDR 對常數縮放不敏感）
+
+                # 7) 依 layout 取出候選，保留單人情境的選路邏輯（但仍輸出原始分離結果）
                 raw_for_select = separated
+                enhanced_separated = separated  # ← 不再呼叫 enhance_separation（已移除）
 
-                # 2) 僅為最後輸出「可選」做強化（不要用強化後訊號做任何評分/選路）
-                enhanced_separated = self.enhance_separation(separated) if self.enable_noise_reduction else separated
-
-                # 3) 推斷 layout，統一取得「模型輸出說話者數」與取片函式
-                if layout == "BST":           # [B, S, T]
+                if layout == "BST":  # [B, S, T]
                     model_output_speakers = enhanced_separated.shape[spk_axis]
                     def _get_cand(idx):  return raw_for_select[0, idx, :].detach().cpu()
                     def _get_final(idx): return enhanced_separated[0, idx, :].detach().cpu()
-                elif layout == "BTS":         # [B, T, S]
+                elif layout == "BTS":  # [B, T, S]
                     model_output_speakers = enhanced_separated.shape[2]
                     def _get_cand(idx):  return raw_for_select[0, :, idx].detach().cpu()
                     def _get_final(idx): return enhanced_separated[0, :, idx].detach().cpu()
-                else:                         # "BT" → 單一路輸出（無法做多路選路）
+                else:  # "BT"
                     model_output_speakers = 1
                     def _get_cand(idx):  return raw_for_select[0, :].detach().cpu()
                     def _get_final(idx): return enhanced_separated[0, :].detach().cpu()
 
-                # —— 單人情境：用「原始」候選做選路與 SI-SDR 分數 ——
+                # 單人情境的最佳路徑選擇（不涉及任何音訊處理，只是選哪一路）
+                best_idx = 0
                 if detected_speakers == 1 and model_output_speakers >= 2:
                     candidates = [_get_cand(j) for j in range(model_output_speakers)]
                     try:
-                        best_idx, best_tensor_raw, stats_list = self.single_selector.select(candidates, mix_wave, return_stats=True)
-                        if stats_list is not None:
-                            s = stats_list[best_idx]
-                            logger.info(
-                                f"1-spk 選路：speaker{best_idx+1} | "
-                                f"SI-SDR={s['si_sdr_db']:.2f} dB, band={s['band_ratio']:.2f}, "
-                                f"tonality={s['tonality']:.2f}, zcr_penalty={s['zcr_penalty']:.2f}, rms={s['rms']:.4f}"
-                            )
-                        # 真的要輸出時，才拿「同一索引」的 enhanced（或原始，視設定）
-                        best_tensor = _get_final(best_idx)
-                        enhanced_separated = best_tensor.unsqueeze(0).unsqueeze(-1).to(self.device)  # -> [1, T, 1]
+                        best_idx, _, _ = self.single_selector.select(candidates, audio_tensor[0].detach().cpu(), return_stats=True)
+                        enhanced_separated = _get_final(best_idx).unsqueeze(0).unsqueeze(-1).to(self.device)  # [1, T, 1]
                         model_output_speakers = 1
-                        
-                        if hasattr(self, "_last_single_route_idx") and self._last_single_route_idx is not None:
-                            prev_idx = self._last_single_route_idx
-                            prev_score = self._last_single_route_score if self._last_single_route_score is not None else -1e9
-                            cur_score = s.get("score", s["si_sdr_db"])  # 你的 selector 若有整體 score 就用它，否則用 SI-SDR 代替
-                            # 若兩路分數差異很小，鎖定上次的路徑（避免來回跳）
-                            if abs(cur_score - prev_score) < 0.03 and best_idx != prev_idx:
-                                best_idx = prev_idx
-                        
-                        # 更新路徑記憶
-                        self._last_single_route_idx = best_idx
-                        self._last_single_route_score = s.get("score", s["si_sdr_db"])
-                        
                     except Exception:
                         logger.exception("單人選路失敗，改用 speaker1 作為保守輸出")
-                        best_tensor = _get_final(0)
-                        enhanced_separated = best_tensor.unsqueeze(0).unsqueeze(-1).to(self.device)
+                        enhanced_separated = _get_final(0).unsqueeze(0).unsqueeze(-1).to(self.device)
                         model_output_speakers = 1
-                
-                # 把 estimates 統一成 [S, T] on CPU
+
+                # 8) 統一成 [S, T]（不再做任何投影回混音、維納濾波或 frame gate）
                 if enhanced_separated.ndim == 3:   # [B, T, S]
                     est_ST = enhanced_separated[0].transpose(0, 1).detach().cpu()  # [S, T]
                 else:
                     est_ST = enhanced_separated.detach().cpu().unsqueeze(0)        # [1, T]
 
-                # 單人情境：若模型有 >=2 路，僅保留被選中的那一路（用你上面算出的 best_idx）
                 if detected_speakers == 1 and est_ST.shape[0] >= 2:
+                    # 只保留被選中的那一路
                     try:
-                        # 你上面已經選出 best_idx；這裡只保留那一路
                         est_ST = est_ST[best_idx:best_idx+1, :]
                     except Exception:
                         est_ST = est_ST[0:1, :]
 
-                # === 1) Projection-back：用混音能量做線性重定標（超小成本、很有效） ===
-                x = mix_wave  # [T] CPU
-                for s in range(est_ST.shape[0]):
-                    y = est_ST[s]
-                    denom = torch.dot(y, y).clamp_min(1e-8)
-                    alpha = torch.dot(x, y) / denom
-                    est_ST[s] = alpha * y
-
-                # === 2) Mixture-consistent Wiener（稍微銳一點，但不激進） ===
-                if detected_speakers == 1:
-                    est_ST = stft_wiener_refine(
-                        est_ST, x,
-                        n_fft=1024, hop=256, win_length=1024,
-                        wiener_p=0.7
-                    )
-                # est_ST = stft_wiener_refine(
-                #     est_ST, x,
-                #     n_fft=1024, hop=256, win_length=1024,
-                #     wiener_p=0.8
-                # )
-
-                # （可選）對多人再加一點點時間框主導門控，壓小漏音（如果你本來就有 framewise_dominance_gate，就沿用）
-                # if int(detected_speakers) >= 2:
-                #     est_ST = stft_wiener_refine(
-                #         est_ST, x,
-                #         n_fft=1024, hop=256, win_length=1024,
-                #         wiener_p=2.2
-                #     )
-                #     est_ST = framewise_dominance_gate(
-                #         est_ST, frame=320, hop=160,
-                #         rel_ratio=0.24,   # 原先 0.36；愈高愈不嚴，較自然
-                #         min_floor=0.12,   # 原先 0.10；墊高一點避免乾裂與沙砂
-                #         fade=240          # 稍微拉長 crossfade，邊界更平滑
-                #     )
-                
-                del separated
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-                
-                timestamp = datetime.now().strftime('%Y%m%d-%H_%M_%S')
-                
-                # 根據實際情況決定要分離多少個語者
-                # 策略：使用偵測到的語者數量，但不超過模型輸出的通道數
-                # effective_speakers = min(detected_speakers, model_output_speakers, model_config["num_speakers"])
-                # >>> FIX: 以 est_ST 的 S 為準；避免用模型原始輸出數或偵測數導致不一致
+                # 9) 儲存原始分離結果（不做 fade、dither、品質評分、pretty copy）
                 S, T = est_ST.shape
                 effective_speakers = min(int(detected_speakers), int(S), int(model_config["num_speakers"]))
-                
                 logger.debug(
-                    f"分離參數 - 偵測: {detected_speakers}, "
-                    f"est_ST通道: {S}, 模型支援: {model_config['num_speakers']}, 有效: {effective_speakers}"
+                    f"分離參數 - 偵測: {detected_speakers}, est_ST通道: {S}, "
+                    f"模型支援: {model_config['num_speakers']}, 有效: {effective_speakers}"
                 )
-                
+
                 saved_count = 0
                 start_time = current_t0
-                
+                timestamp = datetime.now().strftime('%Y%m%d-%H_%M_%S')
+
                 for i in range(effective_speakers):
                     try:
-                        # >>> FIX: est_ST 是 [S, T]，正確取法：
                         speaker_audio = est_ST[i].contiguous()  # 1D [T]
-
-                        fade_ms = 24.0 if int(detected_speakers) == 1 else 16.0
-                        
-                        # 先做淡入淡出，減少邊界噪點
-                        speaker_audio = fade_io(speaker_audio.clone(), TARGET_RATE, fade_ms=fade_ms)
-
-                        # 動態範圍保護（只在必要時縮放），然後 clamp
-                        max_val = float(torch.max(torch.abs(speaker_audio)))
-                        if max_val > 0.97:
-                            speaker_audio = speaker_audio * (0.95 / max_val)
-                        speaker_audio = speaker_audio.clamp_(-1.0, 1.0)
-
-                        # 能量門檻（保守一點）
-                        rms = torch.sqrt(torch.mean(speaker_audio ** 2))
-                        if rms <= 0.004:
-                            logger.debug(f"語者 {i+1} 能量太低 (RMS={rms:.6f}), 跳過儲存")
-                            continue
-                    
-                        id_audio = _prep_id_audio(speaker_audio, TARGET_RATE)   # ← 一律走這條給語者辨識
-                        
-                        final_tensor = id_audio.unsqueeze(0).cpu()  # [1, T]
-                        final_tensor = _tpdf_dither(final_tensor, level_db=-92.0)
-                        
-                        # 在保存前後、或錄音模式每段處理完，快速評估一次
-                        metrics = assess_audio_quality(id_audio, TARGET_RATE, logger=logger)
-                        logger.info(f"品質 {metrics['grade']}({metrics['quality_score']:.1f}) | "
-                                    f"rms={metrics['rms_dbfs']:.1f}dBFS, snr≈{metrics['snr_db_est']:.1f}dB, "
-                                    f"centroid={metrics['spectral_centroid_hz']:.0f}Hz, clip={metrics['clipping_pct']*100:.2f}%")
-
-                        # 若有參考訊號（例如混音），也可以：
-                        metrics = assess_audio_quality(speaker_audio, TARGET_RATE, logger=logger, ref_wave=mix_wave)
-                        logger.info(f"SI-SDR={metrics.get('si_sdr_db', float('nan')):.2f} dB")
-                        
+                        final_tensor = speaker_audio.unsqueeze(0).cpu()  # [1, T]
                         output_file = os.path.join(
                             output_dir,
                             f"speaker{i+1}.wav"
-                            # f"speaker{i+1}_{timestamp}_{segment_index}.wav"
+                            # 若要保留動態檔名可改為：f"speaker{i+1}_{timestamp}_{segment_index}.wav"
                         )
-                        
-                        # 保存音訊時使用較高的品質設定
-                        torchaudio.save(
-                            output_file,
-                            final_tensor,
-                            TARGET_RATE,
-                            bits_per_sample=16  # 指定16位元確保音質
-                        )
-                        
-                        # 另外存一份給人聽（不影響辨識流程）
-                        if detected_speakers == 1 and getattr(self, "save_pretty_copy", False):
-                            pretty_path = output_file.replace(".wav", "_pretty.wav")
-                            pretty = _gentle_blend(speaker_audio, mix_wave, ratio=0.08)
-                            torchaudio.save(pretty_path, pretty.unsqueeze(0).cpu(), TARGET_RATE, bits_per_sample=16)
-                        
-                        # 計算絕對時間戳
-                        absolute_timestamp = absolute_start_time.timestamp() + start_time
+                        torchaudio.save(output_file, final_tensor, TARGET_RATE, bits_per_sample=16)
 
-                        results.append((output_file,
-                                start_time,
-                                start_time + seg_duration,
-                                absolute_timestamp))  # 加入絕對時間戳
+                        absolute_timestamp = absolute_start_time.timestamp() + start_time
+                        results.append((output_file, start_time, start_time + seg_duration, absolute_timestamp))
                         self.output_files.append(output_file)
-                        
                         saved_count += 1
-                        
                     except Exception as e:
                         logger.warning(f"儲存語者 {i+1} 失敗: {e}")
-                
+
                 if saved_count > 0:
                     logger.info(f"片段 {segment_index} 完成，儲存 {saved_count}/{effective_speakers} 個檔案 (使用 {current_model_type.value})")
-                
-            # 更新累計時間到下一段
+
+            # 10) 更新時間累計
             current_t0 += seg_duration
             self._current_t0 = current_t0
 
