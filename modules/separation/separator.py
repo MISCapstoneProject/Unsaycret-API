@@ -335,10 +335,16 @@ class AudioSeparator:
         )
         
         try:
-            self.resampler = torchaudio.transforms.Resample(
-                orig_freq=RATE,
-                new_freq=TARGET_RATE
-            ).to(self.device)
+            # 只有當採樣率不同時才建立重採樣器
+            if RATE != TARGET_RATE:
+                self.resampler = torchaudio.transforms.Resample(
+                    orig_freq=RATE,
+                    new_freq=TARGET_RATE
+                ).to(self.device)
+                logger.info(f"🔄 建立重採樣器: {RATE}Hz → {TARGET_RATE}Hz")
+            else:
+                self.resampler = None
+                logger.info(f"✅ 採樣率一致 ({RATE}Hz)，無需重採樣")
         except Exception as e:
             logger.error(f"重新取樣器初始化失敗: {e}")
             raise
@@ -730,9 +736,12 @@ class AudioSeparator:
             if audio_tensor.shape[0] == 2:
                 audio_tensor = torch.mean(audio_tensor, dim=0, keepdim=True)
 
-            # 移至 GPU 並重新取樣至 16kHz
+            # 移至 GPU 並條件式重採樣
             audio_tensor = audio_tensor.to(self.device)
-            resampled = self.resampler(audio_tensor)
+            if self.resampler is not None:
+                resampled = self.resampler(audio_tensor)
+            else:
+                resampled = audio_tensor
             
             # 確保形狀正確
             if len(resampled.shape) == 1:
