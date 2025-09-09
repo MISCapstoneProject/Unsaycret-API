@@ -217,7 +217,7 @@ class AudioProcessor:
         可選值: "speechbrain" 或 "pyannote"
         """
         # ====== 這裡改模型類型 ======
-        self.model_type = "pyannote"
+        self.model_type = "speechbrain"
         # =========================
 
         self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
