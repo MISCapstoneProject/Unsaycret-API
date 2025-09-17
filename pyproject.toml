@@ -7,7 +7,7 @@ name = "unsaycret-api"
 version = "0.4.1"
 description = "Modular speech processing system: separation, speaker identification, ASR, API, Weaviate V2 integration"
 readme = "README.md"
-requires-python = ">=3.12"
+requires-python = "3.12.11"
 authors = [
   { name = "MISCapstoneProject" }
 ]

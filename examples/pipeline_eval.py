@@ -12,11 +12,22 @@ import torch
 import torchaudio
 import tempfile
 
+import sys
+from pathlib import Path
+
+# 將專案根目錄加入 Python 路徑
+project_root = Path(__file__).parent.parent
+sys.path.insert(0, str(project_root))
+
 from pipelines.orchestrator import init_pipeline_modules,run_pipeline_file
+from utils.logger import get_logger
 from modules.separation.separator import AudioSeparator
 from modules.asr.text_utils import compute_cer, normalize_zh
 # from modules.identification.VID_identify_v5 import SpeakerIdentifier
 # from modules.asr.whisper_asr import WhisperASR
+
+# 創建 logger 實例
+logger = get_logger(__name__)
 
 
 @dataclass
@@ -47,7 +58,11 @@ def load_mixture_map(path: Path) -> List[Tuple[str, str, str, str]]:
     with path.open("r", encoding="utf-8") as f:
         reader = csv.DictReader(f)
         for row in reader:
-            rows.append((row["mix_id"], row["mix_file"], row["src1"], row["src2"]))
+            # 跨平台路徑處理：手動將 Windows 風格的 \ 轉換為 / 
+            # 這樣在 macOS/Linux/Windows 都能正確處理
+            src1_normalized = row["src1"].replace("\\", "/")
+            src2_normalized = row["src2"].replace("\\", "/")
+            rows.append((row["mix_id"], row["mix_file"], src1_normalized, src2_normalized))
     return rows
 
 #計算SI-SDR 可同時計算分離前和分離後的SDR
@@ -197,7 +212,7 @@ def process_one_mixture(
     try:
         bundle, _ , stats = run_pipeline_file(mix_path,3, sep=sep, spk=spk, asr=asr)
     except Exception as e:
-        print(f"[ERROR] 處理檔案 {mix_path} 時出錯：{e}")
+        logger.error(f"處理檔案 {mix_path} 時出錯：{e}")
         return {
             "mix_id": mix_id,
             "mix_file": mix_path,
@@ -231,6 +246,7 @@ def process_one_mixture(
     if clean_dir and mixture_rows:
         row = next((r for r in mixture_rows if r[0] == mix_id), None)
         if row:
+            # 路徑已在 load_mixture_map 中正規化，直接使用即可
             src1 = clean_dir / row[2]
             src2 = clean_dir / row[3]
             sep_paths = [Path(s["path"]) for s in bundle if "path" in s]
@@ -238,22 +254,22 @@ def process_one_mixture(
             result.update(sisdr_metrics)
             
             # --- 取出 true speaker IDs from mixture_map row ---
-            # row[2] = "speaker10/…", row[3] = "speaker1/…"
-            # row[2] = "speaker10/speaker10_17.wav"
+            # 路徑已正規化，直接使用 Path 解析
+            # row[2] = "speaker10/speaker10_17.wav" (已正規化)
             # Path(row[2]).parent.name → "speaker10"
             # .replace("speaker", "spk") → "spk10"
             
             true_spk1 = Path(row[2]).parent.name.replace("speaker", "spk")
             true_spk2 = Path(row[3]).parent.name.replace("speaker", "spk")
             true_speakers = [true_spk1, true_spk2]
-            # print(f"🔍 真實語者：{true_speakers}")
+            # logger.debug(f"真實語者：{true_speakers}")
             
             # --- 取出 pipeline 預測的所有 speaker IDs ---
             pred_speakers = [seg.get("speaker") for seg in bundle]
-            # print(f"🔍 預測語者：{pred_speakers}")
+            # logger.debug(f"預測語者：{pred_speakers}")
             # --- 計算 accuracy ---
             acc = compute_accuracy(pred_speakers, true_speakers)
-            # print(f"🔍 語者辨識準確率：{acc:.2f}")
+            # logger.debug(f"語者辨識準確率：{acc:.2f}")
             result["accuracy"] = acc
             
                         # === CER & ref/pred text for each speaker === #
@@ -266,8 +282,7 @@ def process_one_mixture(
             # 2) Normalize (去標點、空格、統一繁體)
             ref_norm1 = normalize_zh(raw_ref1)
             ref_norm2 = normalize_zh(raw_ref2)
-            # print(f"🔍 正規化文字1：{ref_norm1}"
-            #         f" 正規化文字2：{ref_norm2}")
+            # logger.debug(f"正規化文字1：{ref_norm1}, 正規化文字2：{ref_norm2}")
 
             # 3) 直接抓 bundle 前兩段文字，不理會 speaker id
             pred_texts = [seg.get("text", "") for seg in bundle if seg.get("text")]
@@ -277,14 +292,13 @@ def process_one_mixture(
 
             normA = normalize_numbers_to_zh(normalize_zh(predA))
             normB = normalize_numbers_to_zh(normalize_zh(predB))
-            # print(f"🔍 預測文字1：{pred_norm1}"
-            #         f" 預測文字2：{pred_norm2}")
+            # logger.debug(f"預測文字1：{normA}, 預測文字2：{normB}")
             # 4) 交叉計算 4 個 CER
             cA1 = compute_cer(ref_norm1, normA) if ref_norm1 else None
             cB2 = compute_cer(ref_norm2, normB) if ref_norm2 else None
             cA2 = compute_cer(ref_norm2, normA) if ref_norm2 else None
             cB1 = compute_cer(ref_norm1, normB) if ref_norm1 else None
-            # print(f"🔍 CER1：{cer1:.4f} CER2：{cer2:.4f}")
+            # logger.debug(f"CER1：{cA1:.4f if cA1 else 'N/A'} CER2：{cB2:.4f if cB2 else 'N/A'}")
             
                         # 5) 選「加總最小」的配對
             if (cA1 or 0) + (cB2 or 0) <= (cA2 or 0) + (cB1 or 0):
@@ -305,7 +319,7 @@ def process_one_mixture(
             torch.cuda.empty_cache()
             gc.collect()
         else:
-            print(f"[WARN] mix_id {mix_id} not found in mixture_map")
+            logger.warning(f"mix_id {mix_id} not found in mixture_map")
         
             
 
@@ -328,7 +342,7 @@ def run_and_evaluate_pipeline(
 
         for mix_id, mix_file, *_ in test_rows:              # ② 逐筆跑
             mix_path = mix_dir / mix_file
-            print(f"👉 處理 {mix_id} → {mix_path}")
+            logger.info(f"處理 {mix_id} → {mix_path}")
 
             res = process_one_mixture(
                 str(mix_path), mix_id,
@@ -340,14 +354,14 @@ def run_and_evaluate_pipeline(
 
             # ③ 如果 pipeline 出錯就跳過，不寫進 CSV
             if "error" in res:
-                print(f"🚨 跳過 {mix_id}，原因：{res['error']}")
+                logger.warning(f"跳過 {mix_id}，原因：{res['error']}")
                 continue
 
             # ④ 只留下指定欄位
             row = {k: res.get(k, "") for k in cols}
             writer.writerow(row)
 
-    print(f"✅ 全部完成！結果已寫入 {output_csv}")
+    logger.info(f"全部完成！結果已寫入 {output_csv}")
     
 def main():
     # 1️⃣ 清空 GPU 快取
@@ -374,7 +388,7 @@ def main():
     # test_mix_id = "m05"  # 你可以自訂一個 ID
     # test_mix_path = "data/mix/m05.wav"  # ← 改成你實際有的音檔路徑！
 
-    # print(f"👉 處理測試音檔：{test_mix_path}")
+    # logger.info(f"處理測試音檔：{test_mix_path}")
     # result = process_one_mixture(
     #     test_mix_path,
     #     test_mix_id,
@@ -388,7 +402,7 @@ def main():
     # #  寫入 JSON 檔
     # with open(f"{test_mix_id}_result.json", "w", encoding="utf-8") as f:
     #     json.dump(result, f, indent=2, ensure_ascii=False)
-    # print(f"💾 已儲存 JSON 檔至：{test_mix_id}_result.json")
+    # logger.info(f"已儲存 JSON 檔至：{test_mix_id}_result.json")
     
     
 if __name__ == "__main__":

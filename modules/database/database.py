@@ -171,11 +171,24 @@ def format_rfc3339(dt: Optional[datetime] = None) -> str:
 # UUID 驗證工具
 UUID_PATTERN = re.compile(r"^[0-9a-fA-F-]{36}$")
 
-def valid_uuid(value: str) -> bool:
-    """檢查字串是否為有效 UUID 格式。"""
+def valid_uuid(value) -> bool:
+    """檢查值是否為有效 UUID 格式。
+    
+    Args:
+        value: 待檢查的值，可以是字符串或 Weaviate UUID 對象
+        
+    Returns:
+        bool: 是否為有效的 UUID 格式
+    """
     if not value:
         return False
-    return bool(UUID_PATTERN.match(value))
+    
+    # 統一轉換為字符串進行格式檢查
+    try:
+        uuid_str = str(value)
+        return bool(UUID_PATTERN.match(uuid_str))
+    except Exception:
+        return False
 
 # 默認常數
 DEFAULT_SPEAKER_NAME = "未命名語者"
@@ -955,6 +968,9 @@ class DatabaseService:
             int: 更新後的更新次數，若更新失敗則返回 0
         """
         try:
+            # 確保 UUID 是字符串格式
+            voiceprint_uuid = str(voiceprint_uuid)
+            
             if not valid_uuid(voiceprint_uuid):
                 logger.error(f"無效的聲紋向量 UUID 格式: {voiceprint_uuid}")
                 return 0

@@ -16,6 +16,8 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import torch
 import torchaudio
 import pyaudio  # type: ignore
+import numpy as np
+from scipy.signal import resample_poly
 
 from utils.logger import get_logger
 from utils.constants import DEFAULT_WHISPER_MODEL,DEFAULT_WHISPER_BEAM_SIZE
@@ -156,6 +158,22 @@ def run_pipeline_file(raw_wav: str, max_workers: int = 3, sep=None, spk=None, as
     total_start = time.perf_counter()
 
     waveform, sr = torchaudio.load(raw_wav)
+    
+    # 確保單聲道：如果是多聲道，轉為單聲道（取平均）
+    if waveform.shape[0] > 1:
+        logger.info(f"🔄 多聲道音檔 ({waveform.shape[0]} 聲道) → 單聲道")
+        waveform = torch.mean(waveform, dim=0, keepdim=True)
+    
+    # 如果採樣率不等於16000就重採樣（使用高品質 scipy resample_poly）
+    if sr != 16000:
+        logger.info(f"🔄 採樣率 {sr} ≠ 16000，進行重採樣")
+        # 轉換為 numpy 進行高品質重採樣
+        waveform_np = waveform.cpu().numpy()
+        # 此時已確保是單聲道，直接處理
+        resampled = resample_poly(waveform_np.squeeze(), 16000, sr)
+        waveform = torch.from_numpy(resampled).unsqueeze(0)
+        sr = 16000
+    
     # ← 把 waveform 傳到 separator 設定的裝置 (cuda or cpu)
     waveform = waveform.to(sep.device)
     audio_len = waveform.shape[1] / sr
