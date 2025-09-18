@@ -20,7 +20,7 @@ import numpy as np
 from scipy.signal import resample_poly
 
 from utils.logger import get_logger
-from utils.constants import DEFAULT_WHISPER_MODEL,DEFAULT_WHISPER_BEAM_SIZE
+from utils.constants import DEFAULT_WHISPER_MODEL,DEFAULT_WHISPER_BEAM_SIZE, USE_DIARIZATION_STREAMING
 from utils.env_config import FORCE_CPU, CUDA_DEVICE_INDEX
 from modules.separation.separator import AudioSeparator
 from modules.identification.VID_identify_v5 import SpeakerIdentifier
@@ -57,6 +57,7 @@ def init_pipeline_modules():
     logger.info(f"🚀 使用設備: {'cuda:' + str(current_cuda_device) if use_gpu else 'cpu'}")
 
     sep = AudioSeparator()
+    if USE_DIARIZATION_STREAMING: sep.reset_streaming_state(slice_len=4.0, cut_margin=0.5, ema=0.1)
     spk = SpeakerIdentifier()
     asr = WhisperASR(model_name=DEFAULT_WHISPER_MODEL, gpu=use_gpu, beam=DEFAULT_WHISPER_BEAM_SIZE)
 
@@ -372,7 +373,7 @@ def run_pipeline_dir(
 
 # ───────────────────────── Stream Mode ─────────────────────────
 def run_pipeline_stream(
-    chunk_secs: float = 6.0,
+    chunk_secs: float = 4.0,
     rate: int = 16000,
     channels: int = 1,
     frames_per_buffer: int = 1024,
@@ -415,7 +416,11 @@ def run_pipeline_stream(
         if chunk_start_time is None:
             chunk_start_time = stream_start_time + timedelta(seconds=t0)
 
-        segments = sep.separate_and_save(waveform, seg_dir.as_posix(), segment_index=idx, absolute_start_time=chunk_start_time)
+        if USE_DIARIZATION_STREAMING:
+            segments = sep._diarize_and_save_streaming(waveform, seg_dir.as_posix(), segment_index=idx, absolute_start_time=chunk_start_time)
+        else:
+            segments = sep.separate_and_save(waveform, seg_dir.as_posix(), segment_index=idx, absolute_start_time=chunk_start_time)
+        
         speaker_paths = sorted(seg_dir.glob("speaker*.wav"))
         if not speaker_paths:
             logger.warning("segment %d 無 speaker wav", idx)
@@ -588,7 +593,7 @@ def main():
 
     # stream
     p_stream = sub.add_parser("stream", help="live stream from microphone")
-    p_stream.add_argument("--chunk", type=float, default=6.0, help="seconds per chunk")
+    p_stream.add_argument("--chunk", type=float, default=4.0, help="seconds per chunk")
     p_stream.add_argument("--workers", type=int, default=2)
     p_stream.add_argument("--record_secs", type=float, default=18.0,
                           help="total recording time in seconds (None for infinite)")

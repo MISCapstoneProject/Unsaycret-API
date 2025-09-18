@@ -9,6 +9,8 @@ try:
 except Exception:
     Pipeline = None  # 延遲導入處理
 
+from utils.logger import get_logger
+logger = get_logger(__name__)
 
 class SpeakerCounter:
     """
@@ -31,24 +33,24 @@ class SpeakerCounter:
     SECOND_PASS_NON_OVERLAP = 0.22
 
     # 重疊信用
-    OVERLAP_ALPHA = 0.50          # 有效 = 非重疊 + ALPHA * 重疊
+    OVERLAP_ALPHA = 0.70          # 有效 = 非重疊 + ALPHA * 重疊
     REL_MIN_STRONG = 0.18         # 有效相對值的強重疊接受度
 
     # VAD 閾值
     VAD_MIN_DBFS = -46.0          # 相對於峰值的 dBFS
     VAD_MIN_ZCR = 0.02
-    VAD_MAX_ZCR = 0.25
+    VAD_MAX_ZCR = 0.40
     
     # 絕對 dBFS 門檻（對 full-scale 1.0）
     VAD_ABS_DBFS_MIN = -46.0      # 幀/全段的最低聲能
     VAD_LOUD_DBFS    = -40.0      # 至少若干幀須超過此能量，避免底噪誤判
     
     # --- KMeans(3) 後備的更嚴門檻 ---
-    K3_MIN_PROP = 0.22        # 原本 0.15 → 拉高，第三群至少 22% 有聲幀
+    K3_MIN_PROP = 0.10        # 原本 0.15 → 拉高，第三群至少 22% 有聲幀
     K3_MIN_QUALITY = 0.25     # 原本 0.12 → 拉高
-    K3_MIN_ISLANDS = 3        # 第三群至少要有 3 段以上的獨立時間島
+    K3_MIN_ISLANDS = 1        # 第三群至少要有 1 段以上的獨立時間島
     K3_MIN_ISLAND_DUR = 0.20  # 每段至少 0.20s
-    K3_MIN_RMS_DBFS = -35.0   # 第三群的能量不能太小（排除噪音/擦音群）
+    K3_MIN_RMS_DBFS = -40.0   # 第三群的能量不能太小（排除噪音/擦音群）
 
 
     def __init__(
@@ -107,7 +109,7 @@ class SpeakerCounter:
             ok, vad = self._has_voice(audio, sample_rate, debug=debug, return_metrics=True)
             self._dbg(debug, f"VAD 閘控: ok={ok}, dbfs={vad['dbfs']:.1f}, zcr={vad['zcr']:.3f}, "
                              f"ratio={vad['voiced_ratio']:.3f}, union={vad['voiced_union']:.2f}s")
-            if (not ok) or (vad["voiced_ratio"] < min_voiced_ratio) or (vad["voiced_union"] < min_voiced_union):
+            if (vad["voiced_ratio"] < min_voiced_ratio) and (vad["voiced_union"] < min_voiced_union):
                 self._dbg(debug, "→ 靜音: 返回 0（跳過分離）")
                 return 0
 
@@ -137,7 +139,9 @@ class SpeakerCounter:
             top2 = sorted(keep, key=lambda k: eff_map[k], reverse=True)[:2]
             rels = [eff_map[k] / eff_sum for k in top2]
             nonovs = [stats[k]["non_overlap"] for k in top2]
-            suspicious_three = (0.35 <= min(rels) <= max(rels) <= 0.65) and (max(nonovs) <= 0.10)
+            suspicious_three = (0.30 <= min(rels) <= max(rels) <= 0.70) and (
+                min(nonovs) <= 0.05 or max(nonovs) >= 0.50
+            )
             self._dbg(debug, f"可能是 3語者? rels={rels}, nonov(top2)={nonovs} -> {suspicious_three}")
 
             if suspicious_three:
@@ -170,6 +174,8 @@ class SpeakerCounter:
                         if k3 == 3:
                             self._dbg(debug, "fallback KMeans(3) → set n=3")
                             return 3
+            else:
+                pass  # not suspicious_three
 
         # --- 有效分數和相對值的輔助函數
         def eff_of(k: str) -> float:
@@ -609,6 +615,11 @@ class SpeakerCounter:
 
         self._dbg(debug, f"kmeans3: props={props}, quality={quality:.3f}")
 
+        ACCEPT_BY_QUALITY = 1.30 # 高品質直接接受
+        if quality >= ACCEPT_BY_QUALITY:
+            self._dbg(debug, f"kmeans3: accept by high quality={quality:.3f}")
+            return 3
+        
         # 計算第三群佔比 & 簡單品質後
         third_prop = sorted(props, reverse=True)[2]
         if third_prop < self.K3_MIN_PROP or quality < self.K3_MIN_QUALITY:

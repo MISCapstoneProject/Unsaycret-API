@@ -138,6 +138,7 @@
 ===============================================================================
 """
 from __future__ import annotations
+import math
 import os
 import numpy as np
 import torch
@@ -253,7 +254,7 @@ _GLOBAL_SPEAKER_PIPELINE_CACHE = None
 # ================== 語者分離類別 ======================
 
 class AudioSeparator:
-    def __init__(self, model_type: SeparationModel = DEFAULT_MODEL, enable_noise_reduction=True, snr_threshold=SNR_THRESHOLD, enable_dynamic_model=True):
+    def __init__(self, model_type: SeparationModel = DEFAULT_MODEL, enable_noise_reduction=True, snr_threshold=SNR_THRESHOLD, enable_dynamic_model=True, use_diarization = True):
         # 設備選擇邏輯：優先考慮 FORCE_CPU 設定
         if FORCE_CPU:
             self.device = "cpu"
@@ -365,6 +366,12 @@ class AudioSeparator:
             'segments_skipped': 0,
             'errors': 0
         }
+        # 新增耗時統計
+        self.timing_stats = {
+            'separation_time_ms_total': 0.0,   # 累計純模型推論時間
+            'segment_time_ms_total': 0.0,      # 累計整個片段處理時間
+            'separation_calls': 0              # 推論次數
+        }
         
         self.max_buffer_size = int(RATE * MAX_BUFFER_MINUTES * 60 / CHUNK)
 
@@ -383,8 +390,11 @@ class AudioSeparator:
         self._last_single_route_idx = None
         self._last_single_route_score = None
         
+        self.use_diarization = use_diarization
+        
         logger.info("AudioSeparator 初始化完成")
 
+    
     def _init_speaker_count_pipeline(self):
         """初始化語者計數管線 - 使用全域快取"""
         global _GLOBAL_SPEAKER_PIPELINE_CACHE
@@ -416,6 +426,35 @@ class AudioSeparator:
             logger.warning(f"語者計數管線載入失敗: {e}")
             self.speaker_count_pipeline = None
 
+    def _ensure_diar_pipeline(self):
+        """
+        取得 pyannote diarization 管線（沿用既有的 HF token 與 device）。
+        會利用與語者計數共用的全域快取（若存在）。
+        """
+        global _GLOBAL_SPEAKER_PIPELINE_CACHE
+        try:
+            # 若先前 _init_speaker_count_pipeline 已載入相同模型，可直接使用
+            if getattr(self, "speaker_count_pipeline", None) is not None:
+                return self.speaker_count_pipeline
+
+            if _GLOBAL_SPEAKER_PIPELINE_CACHE is not None:
+                return _GLOBAL_SPEAKER_PIPELINE_CACHE
+
+            if HF_ACCESS_TOKEN:
+                pipe = Pipeline.from_pretrained(
+                    "pyannote/speaker-diarization-3.1",
+                    use_auth_token=HF_ACCESS_TOKEN
+                )
+                pipe.to(torch.device(self.device))
+                _GLOBAL_SPEAKER_PIPELINE_CACHE = pipe
+                return pipe
+            else:
+                logger.warning("未提供 HF_ACCESS_TOKEN，無法啟用 diarization 管線")
+                return None
+        except Exception as e:
+            logger.error(f"載入 diarization 管線失敗: {e}")
+            return None
+    
     def _load_model(self):
         """載入語者分離模型"""
         model_name = self.model_config["model_name"]
@@ -643,63 +682,138 @@ class AudioSeparator:
         except:
             return audio
 
-    def enhance_separation(self, separated_signals):
-        """增強分離效果 - 改善音質"""
-        if not self.enable_noise_reduction:
+    def enhance_separation(self, separated_signals: torch.Tensor, fast: bool = False, preserve_rel_energy: bool = True) -> torch.Tensor:
+        """增強分離後音訊（可選）。
+        改進要點：
+        1. 自動判斷輸入 layout（支援 [B,S,T] / [B,T,S] / [S,T]）。
+        2. 避免錯誤假設為 [B,T,S]，保留原始 layout 回傳。
+        3. fast=True 時只做 peak clamp（快速路徑）。
+        4. 僅在 SNR 低於門檻時才套用 Wiener / spectral gating，避免過度處理。
+        5. 盡量停留於 GPU，只有必要（第三方函式）時轉 numpy，處理後再回傳。
+        6. preserve_rel_energy=True → 以所有說話者共同最大絕對值做一次性 peak normalize，
+           否則各說話者各自 normalize（會改變相對能量）。
+        7. 保護：處理失敗時回退原始訊號；所有輸出 clamp 至 [-0.98,0.98]。
+        """
+        if (not self.enable_noise_reduction) or separated_signals is None:
             return separated_signals
-        
-        # SpeechBrain 模型輸出格式處理
-        if len(separated_signals.shape) == 3:
-            # 格式通常為 [batch, time, speakers]
-            enhanced_signals = torch.zeros_like(separated_signals)
-            speaker_dim = 2
-            time_dim = 1
-        else:
-            separated_signals = separated_signals.unsqueeze(0)
-            enhanced_signals = torch.zeros_like(separated_signals)
-            speaker_dim = 2
-            time_dim = 1
-        
-        num_speakers = separated_signals.shape[speaker_dim]
-        
-        for i in range(min(num_speakers, self.num_speakers)):
-            if speaker_dim == 2:
-                current_signal = separated_signals[0, :, i].cpu().numpy()
+        with torch.no_grad():
+            x = separated_signals
+            orig_shape = x.shape
+            orig_dim = x.dim()
+            # ---- 標準化為 [B,S,T] 以便統一處理 ----
+            if orig_dim == 3:
+                # 嘗試辨識 layout
+                B, A, B2 = x.shape[0], x.shape[1], x.shape[2]
+                layout, spk_axis, time_axis = self._infer_layout(x)
+                # 轉為 [B,S,T]
+                if layout == "BST":
+                    bst = x  # [B,S,T]
+                elif layout == "BTS":
+                    bst = x.transpose(1, 2)  # [B,S,T]
+                else:
+                    bst = x  # fallback 視為 BST
+            elif orig_dim == 2:  # [S,T] 或 [T,S]（假設 S <= 4 ）
+                A, B2 = x.shape
+                if A <= 4 and B2 > 4:  # [S,T]
+                    bst = x.unsqueeze(0)
+                    layout, spk_axis, time_axis = "BST", 1, 2
+                elif B2 <= 4 and A > 4:  # [T,S]
+                    bst = x.transpose(0, 1).unsqueeze(0)
+                    layout, spk_axis, time_axis = "BST", 1, 2
+                else:  # 模糊 → 視為單說話者時間序列
+                    bst = x.unsqueeze(0).unsqueeze(0)  # [B=1,S=1,T]
+                    layout, spk_axis, time_axis = "BST", 1, 2
+            else:  # 其他形狀不支援
+                return separated_signals
+            # 確保為 float & GPU
+            bst = bst.to(self.device, dtype=torch.float32)
+            Bstd, S, T = bst.shape
+            if S == 0 or T == 0:
+                return separated_signals
+            # ---- 快速路徑 ----
+            if fast:
+                if preserve_rel_energy:
+                    peak = bst.abs().amax() .clamp_min(1e-8)
+                    bst = (bst / peak).clamp(-0.98, 0.98)
+                else:
+                    spk_peak = bst.abs().amax(dim=2, keepdim=True).clamp_min(1e-8)
+                    bst = (bst / spk_peak).clamp(-0.98, 0.98)
+                # 回復原 layout
+                if orig_dim == 3:
+                    if layout == "BST":
+                        return bst
+                    elif layout == "BTS":
+                        return bst.transpose(1, 2)
+                    else:
+                        return bst
+                elif orig_dim == 2:
+                    return bst[0] if orig_shape[0] <= 4 else bst[0].transpose(0, 1)
+            # ---- 正式增強 ----
+            enhanced_list = []
+            # 全域 peak（供 preserve_rel_energy 使用）
+            global_peak = bst.abs().amax().clamp_min(1e-8)
+            for s in range(S):
+                chan = bst[0, s] if Bstd == 1 else bst[:, s].mean(dim=0)  # 取代表波形（簡化）
+                # 計算 SNR（快速 torch 版）
+                # 估計背景：使用後 15% 低能量窗平均
+                frame = max(256, min(2048, T // 50))
+                if frame >= T:
+                    est_snr = 30.0
+                else:
+                    energy_frames = chan.unfold(0, frame, frame).pow(2).mean(dim=1)
+                    k = max(1, int(0.15 * energy_frames.numel()))
+                    noise_floor = energy_frames.topk(k, largest=False).values.mean().clamp_min(1e-10)
+                    signal_power = chan.pow(2).mean().clamp_min(1e-10)
+                    est_snr = float(10 * torch.log10(signal_power / noise_floor))
+                # 需要降噪才搬到 CPU → numpy
+                need_wiener = est_snr < (self.snr_threshold + 3)
+                need_gate = est_snr < self.snr_threshold
+                processed = chan.detach().cpu().numpy() if (need_wiener or need_gate) else chan.detach().cpu().numpy()
+                try:
+                    if need_wiener:
+                        processed = self.wiener_filter(processed)
+                    if need_gate:
+                        processed = self.spectral_gating(processed)
+                    # 平滑 & 動態壓縮（始終可做）
+                    processed = self.smooth_audio(processed)
+                    processed = self.dynamic_range_compression(processed)
+                except Exception:
+                    # 出錯回退原始
+                    processed = chan.detach().cpu().numpy()
+                # 轉回 tensor
+                proc_t = torch.from_numpy(processed).to(self.device, dtype=torch.float32)
+                # 對齊長度
+                if proc_t.numel() != T:
+                    if proc_t.numel() > T:
+                        proc_t = proc_t[:T]
+                    else:
+                        pad = T - proc_t.numel()
+                        proc_t = torch.nn.functional.pad(proc_t, (0, pad))
+                enhanced_list.append(proc_t.unsqueeze(0))  # [1,T]
+            enhanced = torch.cat(enhanced_list, dim=0).unsqueeze(0)  # [B=1,S,T]
+            # ---- 正規化策略 ----
+            if preserve_rel_energy:
+                peak = global_peak
+                enhanced = (enhanced / peak).clamp(-0.98, 0.98)
             else:
-                current_signal = separated_signals[0, :, i].cpu().numpy()
-            
-            # 多階段音質改善
-            processed_signal = current_signal
-            
-            # 1. 維納濾波
-            signal_snr = self.estimate_snr(current_signal)
-            if signal_snr < self.snr_threshold + 3:
-                processed_signal = self.wiener_filter(processed_signal)
-            
-            # 2. 傳統降噪（僅在必要時）
-            if signal_snr < self.snr_threshold:
-                processed_signal = self.spectral_gating(processed_signal)
-            
-            # 3. 音訊平滑和修復
-            processed_signal = self.smooth_audio(processed_signal)
-            
-            # 4. 動態範圍壓縮
-            processed_signal = self.dynamic_range_compression(processed_signal)
-            
-            # 5. 最終正規化
-            max_val = np.max(np.abs(processed_signal))
-            if max_val > 0:
-                processed_signal = processed_signal / max_val * 0.95
-            
-            length = min(len(processed_signal), separated_signals.shape[time_dim])
-            
-            if speaker_dim == 2:
-                enhanced_signals[0, :length, i] = torch.from_numpy(processed_signal[:length]).to(self.device)
-            else:
-                enhanced_signals[0, :length, i] = torch.from_numpy(processed_signal[:length]).to(self.device)
-        
-        return enhanced_signals
-        
+                spk_peak = enhanced.abs().amax(dim=2, keepdim=True).clamp_min(1e-8)
+                enhanced = (enhanced / spk_peak).clamp(-0.98, 0.98)
+            # ---- 回復原 layout ----
+            if orig_dim == 3:
+                if layout == "BST":
+                    return enhanced
+                elif layout == "BTS":
+                    return enhanced.transpose(1, 2)
+                else:
+                    return enhanced
+            elif orig_dim == 2:
+                # 若原始推測為 [S,T]
+                if orig_shape[0] <= 4 and orig_shape[1] > 4:
+                    return enhanced[0]  # [S,T]
+                else:  # 推測為 [T,S]
+                    return enhanced[0].transpose(0, 1)
+            return enhanced
+
     def set_save_audio_files(self, save: bool) -> None:
         """
         設定是否儲存分離後的音訊檔案
@@ -736,12 +850,9 @@ class AudioSeparator:
             if audio_tensor.shape[0] == 2:
                 audio_tensor = torch.mean(audio_tensor, dim=0, keepdim=True)
 
-            # 移至 GPU 並條件式重採樣
+            # 移至 GPU 並重新取樣至 16kHz
             audio_tensor = audio_tensor.to(self.device)
-            if self.resampler is not None:
-                resampled = self.resampler(audio_tensor)
-            else:
-                resampled = audio_tensor
+            resampled = self.resampler(audio_tensor)
             
             # 確保形狀正確
             if len(resampled.shape) == 1:
@@ -968,75 +1079,573 @@ class AudioSeparator:
                        f"成功處理: {stats['segments_processed']} ({success_rate:.1f}%), "
                        f"跳過: {stats['segments_skipped']}, "
                        f"錯誤: {stats['errors']}")
+        # 輸出耗時統計
+        if self.timing_stats['separation_calls'] > 0:
+            avg_sep = self.timing_stats['separation_time_ms_total'] / self.timing_stats['separation_calls']
+            avg_seg = self.timing_stats['segment_time_ms_total'] / max(1, stats['segments_processed'])
+            logger.info(
+                f"耗時統計 - 分離推論平均: {avg_sep:.1f} ms, 累計: {self.timing_stats['separation_time_ms_total']:.1f} ms | "
+                f"片段總處理平均: {avg_seg:.1f} ms"
+            )
 
-    def separate_and_save(self, audio_tensor, output_dir, segment_index, absolute_start_time=None):
+    def reset_streaming_state(self, slice_len: float = 4.0, cut_margin: float = 0.5, ema: float = 0.1):
         """
-        分離並儲存音訊（僅保留原始分離結果，不做任何後處理）
-        流程：語者計數 → 動態模型選擇 → 分離 → 儲存
+        初始化/重置串流狀態。建議在每段新對話開始時呼叫一次。
+        slice_len: 每片秒數（你現在是 4 秒）
+        cut_margin: 片頭/片尾保護帶秒數（只輸出中間 slice_len-2*cut_margin）
+        ema: 原型更新的 EMA 係數（0.1=保守；0.2=更快跟隨）
+        """
+        self._stream = {
+            "protos": {},          # {1: vec(D,), 2: vec(D,)}
+            "counters": {1: 1, 2: 1},  # 每位說話者輸出序號
+            "last_turns": [],      # 上一片的 turns: [(s_abs, e_abs, spk_idx)]
+            "slice_len": float(slice_len),
+            "cut_margin": float(cut_margin),
+            "ema": float(ema),
+            "inited": True
+        }
+        
+    def _stitch_with_last_slice(self, cur_turns_abs, margin=0.5, short_th=0.8):
+        """
+        與上一片結果做邊界一致性：若在邊界 ±margin 內，單獨跳人的短段(<short_th)改沿用上一片的說話者。
+        cur_turns_abs: List[(s_abs, e_abs, spk_idx)]
+        回傳修正後的 List[(s_abs, e_abs, spk_idx)]
+        """
+        if not getattr(self, "_stream", None) or not self._stream.get("last_turns"):
+            return cur_turns_abs
+        last = self._stream["last_turns"]
+        fixed = []
+        for s, e, k in cur_turns_abs:
+            # 找與本段重疊或接近的上一片段
+            overlapped = [ (ls, le, lk) for (ls, le, lk) in last if not (le < s - margin or ls > e + margin) ]
+            if overlapped and (e - s) < short_th:
+                # 取重疊最多的上一片段
+                best = max(overlapped, key=lambda t: min(e, t[1]) - max(s, t[0]))
+                _, _, lk = best
+                fixed.append((s, e, lk))
+            else:
+                fixed.append((s, e, k))
+        return fixed
+    
+    def _diarize_and_save_streaming(
+        self,
+        audio_tensor: torch.Tensor,
+        output_dir: str,
+        segment_index: int,
+        absolute_start_time=None,
+        min_on: float = 0.50,
+        min_off: float = 0.30,
+        collar: float = 0.10,
+        merge_gap: float = 0.20,
+        prefer_k: int = 2
+    ):
+        """
+        串流 4 秒切片用的 diarization：
+        1) 片內：diarize → turn 平滑（collar/merge/min_on）
+        2) 為每個 turn 抽 speaker embedding（pyannote/embedding）
+        3) 有原型(protos)時 → 以原型為中心做 3-5 回合指派→更新；沒有時 → 以最長兩段當種子
+        4) 與上一片做邊界一致性縫合（stitch）
+        5) 只輸出中間區段（cut_margin ~ 0.5s），避免邊界抖動
+        6) 命名：speaker{1/2}_{NNN}.wav（跨片累計編號）
+        回傳 [(path, start, end, absolute_ts_start), ...]
+        """
+        emit_overlap_s = 0.5 # 相鄰輸出重疊時間（秒）
+        try:
+            # 狀態
+            if not getattr(self, "_stream", None) or not self._stream.get("inited"):
+                self.reset_streaming_state()  # 自動初始化（也可由 orchestrator 顯式呼叫）
+
+            slice_len   = self._stream["slice_len"]
+            cut_margin  = self._stream["cut_margin"]
+            ema         = self._stream["ema"]
+
+            # 取得 pipeline
+            diar_pipe = getattr(self, "_ensure_diar_pipeline", None)
+            diar_pipe = diar_pipe() if diar_pipe else getattr(self, "speaker_count_pipeline", None)
+            if diar_pipe is None:
+                logger.warning("diarization 管線不可用，回退傳統分離流程")
+                return []
+
+            os.makedirs(output_dir, exist_ok=True)
+
+            # waveform: CPU float32 (1, T)
+            wf = audio_tensor[0] if audio_tensor.dim() == 2 else audio_tensor.view(-1)
+            wf = wf.to(torch.float32).cpu().contiguous()
+            if wf.dim() == 1: wf = wf.unsqueeze(0)
+            sr = TARGET_RATE
+            dur = wf.shape[-1] / sr
+
+            # 片內 diarization
+            diar = diar_pipe({"waveform": wf, "sample_rate": sr})
+
+            # 收集 & 平滑 turns
+            from collections import defaultdict
+            turns = defaultdict(list)  # lbl -> [(s,e)]
+            for seg, _trk, lbl in diar.itertracks(yield_label=True):
+                s = max(0.0, float(seg.start) - collar)
+                e = min(dur,  float(seg.end)   + collar)
+                if e > s: turns[lbl].append((s, e))
+
+            def _merge_and_refine(spans):
+                spans = sorted(spans, key=lambda x: x[0])
+                merged = []
+                for s, e in spans:
+                    if not merged: merged.append([s,e]); continue
+                    ps, pe = merged[-1]
+                    if s - pe <= merge_gap: merged[-1][1] = max(pe, e)
+                    else: merged.append([s,e])
+                refined = []
+                for s, e in merged:
+                    if (e - s) < min_on:
+                        if refined and (s - refined[-1][1]) <= min_off:
+                            refined[-1][1] = e
+                        else:
+                            continue
+                    refined.append([s, e])
+                return [(round(s,3), round(e,3)) for s,e in refined]
+
+            for lbl in list(turns.keys()):
+                turns[lbl] = _merge_and_refine(turns[lbl])
+
+            # 扁平化（時間排序）
+            spans_all = []
+            for lbl, spans in turns.items():
+                for (s,e) in spans:
+                    spans_all.append({"s": s, "e": e})
+            spans_all.sort(key=lambda x: x["s"])
+            if not spans_all:
+                self._stream["last_turns"] = []
+                return []
+
+            # 抽嵌入
+            embeddings = None
+            try:
+                from pyannote.audio import Model, Inference
+                _dev = torch.device(self.device) if not isinstance(self.device, torch.device) else self.device
+                if not hasattr(self, "_embedder") or self._embedder is None:
+                    _model = Model.from_pretrained("pyannote/embedding", use_auth_token=HF_ACCESS_TOKEN)
+                    self._embedder = Inference(_model, window="whole", device=_dev)
+
+                vecs = []
+                for it in spans_all:
+                    s_i = max(0, int(round(it["s"] * sr)))
+                    e_i = min(wf.shape[-1], int(round(it["e"] * sr)))
+                    if e_i <= s_i: vecs.append(None); continue
+                    clip = wf[:, s_i:e_i].to(torch.float32).cpu().contiguous()
+                    v = self._embedder({"waveform": clip, "sample_rate": sr})  # -> np.ndarray (D,)
+                    v = v.astype(np.float32); v /= (np.linalg.norm(v) + 1e-8)
+                    vecs.append(v)
+                if any(v is None for v in vecs): raise RuntimeError("empty span")
+                embeddings = np.stack(vecs, axis=0)  # (N,D)
+            except Exception as e:
+                logger.warning(f"[diarize] 嵌入模型不可用/失敗，跳過片內分群：{e}")
+                embeddings = None
+
+            # 以原型為中心的指派→更新；沒有原型就用「最長兩段」種子
+            N = len(spans_all)
+            assign = np.zeros(N, dtype=np.int64)  # 0 或 1
+            protos = self._stream["protos"]
+
+            if embeddings is not None and prefer_k >= 2 and N >= 2:
+                if 1 in protos and 2 in protos:
+                    # 有舊原型：直接用舊原型當中心
+                    P = np.stack([protos[1], protos[2]], axis=0)
+                else:
+                    # 沒舊原型：用「最長兩段」當種子
+                    lens = np.array([it["e"] - it["s"] for it in spans_all])
+                    i1 = int(np.argmax(lens))
+                    sim_to_i1 = embeddings @ embeddings[i1]
+                    mask = np.ones(N, dtype=bool); mask[i1] = False
+                    i2 = int(np.argmin(sim_to_i1[mask])); i2 = np.arange(N)[mask][i2]
+                    P = np.stack([embeddings[i1], embeddings[i2]], axis=0)
+
+                last = None
+                for _ in range(5):
+                    sim = embeddings @ P.T
+                    assign = sim.argmax(axis=1)
+                    if last is not None and np.all(assign == last): break
+                    for k in (0,1):
+                        mk = (assign == k)
+                        if mk.any():
+                            c = embeddings[mk].mean(axis=0)
+                            P[k] = c / (np.linalg.norm(c) + 1e-8)
+                    last = assign.copy()
+
+                # 以最早開口時間決定 speaker1/2
+                def first_onset_of(k):
+                    idx = np.where(assign == k)[0]
+                    return spans_all[int(idx.min())]["s"] if idx.size else 1e9
+                order = np.argsort([first_onset_of(0), first_onset_of(1)])
+                cluster_to_spk = {int(order[0]): 1, int(order[1]): 2}
+
+                # 更新原型（EMA）
+                for k in (0,1):
+                    mk = (assign == k)
+                    if mk.any():
+                        c = embeddings[mk].mean(axis=0)
+                        c = c / (np.linalg.norm(c) + 1e-8)
+                        spk = cluster_to_spk[int(k)]
+                        if spk in protos:
+                            protos[spk] = (1.0 - ema) * protos[spk] + ema * c
+                            protos[spk] /= (np.linalg.norm(protos[spk]) + 1e-8)
+                        else:
+                            protos[spk] = c
+            else:
+                # 無嵌入/單段：全部當成 speaker1
+                cluster_to_spk = {0: 1}
+                assign = np.zeros(N, dtype=np.int64)
+
+            # 轉為 (s_abs, e_abs, spk_idx)
+            cur_turns_abs = []
+            for i, k in enumerate(assign):
+                s = spans_all[i]["s"]; e = spans_all[i]["e"]
+                spk = cluster_to_spk[int(k)]
+                s_abs = (absolute_start_time.timestamp() + s) if absolute_start_time else None
+                cur_turns_abs.append((s_abs, (absolute_start_time.timestamp() + e) if absolute_start_time else None, spk))
+
+            # 與上一片邊界縫合
+            cur_turns_abs = self._stitch_with_last_slice(cur_turns_abs, margin=cut_margin, short_th=0.8)
+
+            expand = emit_overlap_s * 0.5
+            results = []
+            for i, k in enumerate(assign):
+                s = spans_all[i]["s"]
+                e = spans_all[i]["e"]
+
+                # 兩側各擴 0.25s
+                s_out = max(0.0, s - expand)
+                e_out = min(dur, e + expand)
+                if e_out - s_out <= 0:
+                    continue
+
+                # 以 floor/ceil 取樣索引，避免吃邊
+                s_i = max(0, int(math.floor(s_out * sr)))
+                e_i = min(wf.shape[-1], int(math.ceil(e_out * sr)))
+                if e_i <= s_i:
+                    continue
+
+                clip = wf[:, s_i:e_i]
+
+                spk = cluster_to_spk[int(k)]
+                if spk not in self._stream["counters"]:
+                    self._stream["counters"][spk] = 1
+                nnn = self._stream["counters"][spk]
+                self._stream["counters"][spk] += 1
+
+                out_path = os.path.join(output_dir, f"speaker{spk}_{nnn:03d}.wav")
+                torchaudio.save(out_path, clip, sr, bits_per_sample=16)
+
+                # 注意：回傳的 start/end 也用擴張後的邊界（便於 ASR 時間戳對齊）
+                abs_ts = (absolute_start_time.timestamp() + s_out) if absolute_start_time else None
+                results.append((out_path, s_out, e_out, abs_ts))
+                self.output_files.append(out_path)
+
+            # 更新 last_turns（用絕對時間存，供下一片 stitch）
+            if absolute_start_time is not None:
+                self._stream["last_turns"] = [
+                    (absolute_start_time.timestamp() + spans_all[i]["s"],
+                    absolute_start_time.timestamp() + spans_all[i]["e"],
+                    cluster_to_spk[int(assign[i])])
+                    for i in range(N)
+                ]
+            else:
+                self._stream["last_turns"] = []
+
+            return results
+
+        except Exception as e:
+            logger.error(f"diarize_and_save 失敗: {e}")
+            return []
+
+    def _diarize_and_save(
+        self,
+        audio_tensor: torch.Tensor,
+        output_dir: str,
+        segment_index: int,
+        absolute_start_time=None,
+        *,
+        min_on: float = 0.50,
+        min_off: float = 0.30,
+        collar: float = 0.10,
+        merge_gap: float = 0.20,
+        prefer_k: int = 2,
+    ):
+        """
+        pyannote diarization → turn 平滑 → 以「最長兩段」作原型的原型迭代分群 + 時序少數平滑 →
+        逐 turn 匯出短檔。回傳 [(path, start, end, absolute_ts_start), ...]
         """
         try:
-            # 1) 語者數量偵測（維持原邏輯）
+            # 0) 準備 pipeline / 輸出資料夾
+            diar_pipe = getattr(self, "_ensure_diar_pipeline", None)
+            diar_pipe = diar_pipe() if diar_pipe else getattr(self, "speaker_count_pipeline", None)
+            if diar_pipe is None:
+                logger.warning("diarization 管線不可用，回退傳統分離流程")
+                return []
+            os.makedirs(output_dir, exist_ok=True)
+
+            # 1) waveform：CPU float32 (1, T)
+            wf = audio_tensor[0] if audio_tensor.dim() == 2 else audio_tensor.view(-1)
+            wf = wf.to(torch.float32).cpu().contiguous()
+            if wf.dim() == 1: wf = wf.unsqueeze(0)
+            sr = TARGET_RATE
+            total_len = wf.shape[-1] / sr
+
+            # 2) diarization
+            diar = diar_pipe({"waveform": wf, "sample_rate": sr})
+
+            # 3) 取 turns + 平滑（collar / 合併 / 最短長度）
+            from collections import defaultdict
+            turns = defaultdict(list)  # lbl -> [(s,e),...]
+            for seg, _trk, lbl in diar.itertracks(yield_label=True):
+                s = max(0.0, float(seg.start) - collar)
+                e = min(total_len, float(seg.end) + collar)
+                if e > s: turns[lbl].append((s, e))
+
+            def _merge_and_refine(spans):
+                spans = sorted(spans, key=lambda x: x[0])
+                merged = []
+                for s,e in spans:
+                    if not merged: merged.append([s,e]); continue
+                    ps,pe = merged[-1]
+                    if s - pe <= merge_gap: merged[-1][1] = max(pe, e)
+                    else: merged.append([s,e])
+                refined = []
+                for s,e in merged:
+                    if (e - s) < min_on:
+                        if refined and (s - refined[-1][1]) <= min_off:
+                            refined[-1][1] = e
+                        else:
+                            continue
+                    refined.append([s,e])
+                return [(round(s,3), round(e,3)) for s,e in refined]
+
+            for lbl in list(turns.keys()):
+                turns[lbl] = _merge_and_refine(turns[lbl])
+
+            # 扁平化全場 turns（保持時間順序）
+            spans_all = []
+            for lbl, spans in turns.items():
+                for i,(s,e) in enumerate(spans):
+                    spans_all.append({'lbl': lbl, 's': s, 'e': e})
+            spans_all.sort(key=lambda x: x['s'])
+            if not spans_all:
+                logger.info(f"[diarize] 片段 {segment_index} 經平滑後無可用 turn")
+                return []
+
+            # 4) 抽每個 turn 的 speaker embedding（pyannote/embedding）
+            embeddings = None
+            try:
+                from pyannote.audio import Model, Inference
+                _dev = torch.device(self.device) if not isinstance(self.device, torch.device) else self.device
+                if not hasattr(self, "_embedder") or self._embedder is None:
+                    _model = Model.from_pretrained("pyannote/embedding", use_auth_token=HF_ACCESS_TOKEN)
+                    self._embedder = Inference(_model, window="whole", device=_dev)
+
+                vecs = []
+                for it in spans_all:
+                    s_i = max(0, int(round(it['s'] * sr)))
+                    e_i = min(wf.shape[-1], int(round(it['e'] * sr)))
+                    if e_i <= s_i: vecs.append(None); continue
+                    clip = wf[:, s_i:e_i].to(torch.float32).cpu().contiguous()
+                    v = self._embedder({"waveform": clip, "sample_rate": sr})  # -> np.ndarray (D,)
+                    v = v.astype(np.float32); v /= (np.linalg.norm(v) + 1e-8)
+                    vecs.append(v)
+                if any(v is None for v in vecs): raise RuntimeError("empty span")
+                embeddings = np.stack(vecs, axis=0)  # (N,D)
+            except Exception as e:
+                logger.warning(f"[diarize] 嵌入模型不可用/失敗，跳過重分群：{e}")
+                embeddings = None
+
+            # 5) 原型迭代分群（K=2，長段優先作原型）
+            N = len(spans_all)
+            assign = np.zeros(N, dtype=np.int64)  # 預設全 0
+            if embeddings is not None and N >= 2 and prefer_k >= 2:
+                # 5.1 以「最長兩段」做初始原型（避免短促笑聲當種子）
+                lens = np.array([it['e'] - it['s'] for it in spans_all])
+                i1 = int(np.argmax(lens))
+                # 第二個原型選「與 p1 最不相似」的長段
+                sim_to_i1 = embeddings @ embeddings[i1]
+                mask = np.ones(N, dtype=bool); mask[i1] = False
+                i2 = int(np.argmin(sim_to_i1[mask])); i2 = np.arange(N)[mask][i2]
+                P = np.stack([embeddings[i1], embeddings[i2]], axis=0)  # (2,D)
+
+                # 5.2 迭代：指派→更新（最多 10 回合或收斂）
+                last = None
+                for _ in range(10):
+                    sim = embeddings @ P.T          # (N,2)
+                    assign = sim.argmax(axis=1)     # 0 或 1
+                    if last is not None and np.all(assign == last): break
+                    for k in (0,1):
+                        mk = (assign == k)
+                        if mk.any():
+                            c = embeddings[mk].mean(axis=0)
+                            P[k] = c / (np.linalg.norm(c) + 1e-8)
+                    last = assign.copy()
+
+                # 5.3 時序少數平滑：孤立跳人的 turn 拉回前後多數
+                for i in range(1, N-1):
+                    if assign[i] != assign[i-1] and assign[i] != assign[i+1] and assign[i-1] == assign[i+1]:
+                        # 若當前這一段 < 0.8s，也視為噪聲優先跟前後一致
+                        if (spans_all[i]['e'] - spans_all[i]['s']) < 0.8:
+                            assign[i] = assign[i-1]
+
+                # 5.4 以每群最早開口時間決定 speaker1/2 的編號
+                def first_onset_of(k):
+                    idx = np.where(assign == k)[0]
+                    return spans_all[int(idx.min())]['s'] if idx.size else 1e9
+                order = np.argsort([first_onset_of(0), first_onset_of(1)])
+                cluster_to_spk = {int(order[0]): 1, int(order[1]): 2}
+
+            else:
+                # 無嵌入：用「先開口」的 label 排序回退
+                label_stats = []
+                for lbl, spans in turns.items():
+                    if spans:
+                        label_stats.append((lbl, min(s for s,_ in spans)))
+                ordered_labels = [lbl for (lbl, _) in sorted(label_stats, key=lambda t: t[1])]
+                lbl_to_spk = {lbl: i+1 for i,lbl in enumerate(ordered_labels)}
+                # 直接輸出（回退路徑）
+                results = []
+                for lbl in ordered_labels:
+                    spk_idx = lbl_to_spk[lbl]
+                    for k,(s,e) in enumerate(turns[lbl], start=1):
+                        s_i = max(0, int(round(s*sr))); e_i = min(wf.shape[-1], int(round(e*sr)))
+                        if e_i <= s_i: continue
+                        clip = wf[:, s_i:e_i]
+                        out_path = os.path.join(output_dir, f"speaker{spk_idx}_{k:03d}.wav")
+                        torchaudio.save(out_path, clip, sr, bits_per_sample=16)
+                        abs_ts = absolute_start_time.timestamp() + s if absolute_start_time else None
+                        results.append((out_path, s, e, abs_ts)); self.output_files.append(out_path)
+                if results:
+                    logger.info(f"[diarize] 片段 {segment_index} → 回退輸出 {len(results)} 段（無嵌入）")
+                return results
+
+            # 6) 依 assign 產生輸出（speaker{1/2}_{序號}.wav；每位按時間排序流水號）
+            idx_by_spk = {1: [], 2: []}
+            for i,k in enumerate(assign):
+                spk = cluster_to_spk[int(k)]
+                idx_by_spk[spk].append(i)
+            for spk in idx_by_spk:
+                idx_by_spk[spk].sort(key=lambda i: spans_all[i]['s'])
+
+            counters = {1: 1, 2: 1}
+            results = []
+            for spk in (1,2):
+                for i in idx_by_spk[spk]:
+                    s = spans_all[i]['s']; e = spans_all[i]['e']
+                    s_i = max(0, int(round(s*sr))); e_i = min(wf.shape[-1], int(round(e*sr)))
+                    if e_i <= s_i: continue
+                    clip = wf[:, s_i:e_i]
+                    out_path = os.path.join(output_dir, f"speaker{spk}_{counters[spk]:03d}.wav")
+                    counters[spk] += 1
+                    torchaudio.save(out_path, clip, sr, bits_per_sample=16)
+                    abs_ts = absolute_start_time.timestamp() + s if absolute_start_time else None
+                    results.append((out_path, s, e, abs_ts)); self.output_files.append(out_path)
+
+            logger.info(f"[diarize] 片段 {segment_index} → 原型分群+平滑輸出 {len(results)} 段")
+            return results
+
+        except Exception as e:
+            logger.error(f"diarize_and_save 失敗: {e}")
+            return []
+    
+    def separate_and_save(self, audio_tensor, output_dir, segment_index, absolute_start_time=None):
+        """
+        分離並儲存音訊，並回傳 (path, start, end) 列表。
+        流程：語者計數 → 動態模型選擇 → 分離 → 強化(可選) → 儲存
+        
+        Args:
+            audio_tensor: 音訊張量
+            output_dir: 輸出目錄
+            segment_index: 片段索引
+            absolute_start_time: 音訊的絕對開始時間（datetime 物件）
+        """
+        
+        # 新增：若啟用 diarization，改走 diarization 路徑，回傳相容格式
+        if getattr(self, "use_diarization", False):
+            return self._diarize_and_save(audio_tensor, output_dir, segment_index, absolute_start_time)
+        
+        try:
+            total_start = time.perf_counter()  # 片段總耗時起點
+            # 先以寬鬆範圍跑一次，並套用重疊感知後處理；若你的批次確定雙人，可設 expected_min/max=2
             detected_speakers = self.spk_counter.count_with_refine(
                 audio=audio_tensor,
                 sample_rate=TARGET_RATE,
-                expected_min=1,
+                expected_min=0,
                 expected_max=3,
-                first_pass_range=(1, 3),
-                allow_zero=True,
-                debug=False,
+                first_pass_range=(0, 3),
+                allow_zero=True,         # <== 允許回傳 0（無語音）
+                debug=True
             )
-            logger.info(f"片段 {segment_index} - 偵測到 {detected_speakers} 位說話者")
 
+            logger.info(f"片段 {segment_index} - 偵測到 {detected_speakers} 位說話者")
+            
+            # 備援：第一次回 0 → 只有在「強有聲」才重試 1–2 人
             if detected_speakers == 0:
                 ok, m = self.spk_counter._has_voice(audio_tensor, TARGET_RATE, return_metrics=True)
-                strong_voice = ok and (m["voiced_ratio"] >= 0.12) and (m["voiced_union"] >= 0.50) and (m.get("loud_frac", 0.0) >= 0.05)
+                # 與 SpeakerCounter 同步或更嚴的條件
+                strong_voice = (
+                    ok and
+                    (m["dbfs"] > -35.0) and
+                    (m["voiced_ratio"] >= 0.20) and
+                    (m["voiced_union"] >= 1.00) and
+                    (m.get("loud_frac", 0.0) >= 0.10)
+                )
                 if not strong_voice:
                     logger.info(
                         f"片段 {segment_index} - 無語音/過短（ratio={m['voiced_ratio']:.3f}, "
                         f"union={m['voiced_union']:.2f}s, loud={m.get('loud_frac',0.0):.3f}），跳過"
                     )
                     return []
+
                 logger.warning(f"片段 {segment_index} - 第一次偵測 0，但語音跡象偏強，嘗試 1–2 人重試")
                 retry = self.spk_counter.count_with_refine(
-                    audio=audio_tensor,
-                    sample_rate=TARGET_RATE,
-                    expected_min=1,
-                    expected_max=3,
-                    first_pass_range=(1, 3),
-                    allow_zero=False,
-                    debug=False,
+                    audio=audio_tensor, sample_rate=TARGET_RATE,
+                    expected_min=1, expected_max=2,
+                    first_pass_range=(1, 2),
+                    allow_zero=False,           # 已確認強有聲，就不要再回 0
+                    debug=False
                 )
-                detected_speakers = max(1, int(retry))
-
-            # 2) 動態選擇模型（維持原邏輯）
+                detected_speakers = int(retry)
+            
+            # 動態選擇模型
             current_model, current_model_type = self._get_appropriate_model(detected_speakers)
             model_config = self.model_manager.get_model_config(current_model_type) if self.model_manager else MODEL_CONFIGS[current_model_type]
             logger.debug(f"使用模型: {current_model_type.value} (偵測語者: {detected_speakers})")
-
-            # 3) 時間戳處理（維持原邏輯）
+            
+            # 記錄絕對時間戳
             if absolute_start_time is None:
                 from datetime import timezone, timedelta
                 taipei_tz = timezone(timedelta(hours=8))
                 absolute_start_time = datetime.now(taipei_tz)
+            
+            # 初始化累計時間戳
             current_t0 = getattr(self, "_current_t0", 0.0)
+            results = []   # 用來收 (path, start, end, absolute_timestamp)
             seg_duration = audio_tensor.shape[-1] / TARGET_RATE
             results = []
 
-            with torch.no_grad():
+            with torch.inference_mode():
                 # 4) 輸入整理成 [batch, samples]
                 if len(audio_tensor.shape) == 3 and audio_tensor.shape[1] == 1:
                     audio_tensor = audio_tensor.squeeze(1)
 
                 # 5) 做「原始分離」
+                sep_start = time.perf_counter()
                 separated = current_model.separate_batch(audio_tensor)
-
+                sep_time_ms = (time.perf_counter() - sep_start) * 1000.0
+                self.timing_stats['separation_time_ms_total'] += sep_time_ms
+                self.timing_stats['separation_calls'] += 1
+                logger.info(f"片段 {segment_index} 分離推論耗時 {sep_time_ms:.1f} ms")
+                
                 # 6) 僅做固定比例的「峰值正規化」以統一尺度（維持原 _normalize_estimates）
                 #    不做任何音質增強/濾波/投影回混音等後處理
                 separated, layout, spk_axis, time_axis = self._normalize_estimates(separated)
 
                 # 7) 依 layout 取出候選，保留單人情境的選路邏輯（但仍輸出原始分離結果）
                 raw_for_select = separated
-                enhanced_separated = separated  # ← 不再呼叫 enhance_separation（已移除）
+                enhanced_separated = self.enhance_separation(separated)
+                del separated  # 釋放記憶體
 
                 if layout == "BST":  # [B, S, T]
                     model_output_speakers = enhanced_separated.shape[spk_axis]
@@ -1110,9 +1719,10 @@ class AudioSeparator:
                 if saved_count > 0:
                     logger.info(f"片段 {segment_index} 完成，儲存 {saved_count}/{effective_speakers} 個檔案 (使用 {current_model_type.value})")
 
-            # 10) 更新時間累計
-            current_t0 += seg_duration
-            self._current_t0 = current_t0
+            # 10) 更新時間 & 紀錄總耗時
+            total_time_ms = (time.perf_counter() - total_start) * 1000.0
+            self.timing_stats['segment_time_ms_total'] += total_time_ms
+            logger.info(f"片段 {segment_index} 分離總處理耗時 {total_time_ms:.1f} ms")
 
             if not results:
                 raise RuntimeError("Speaker separation produced no valid tracks")
