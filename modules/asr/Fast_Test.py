@@ -21,7 +21,13 @@ import re
 import numpy as np
 import librosa
 
-from modules.asr.llm_repair import llm_repair_pipeline, write_srt_with_repair
+import queue
+from collections import deque
+
+try:
+    import sounddevice as sd
+except ImportError:
+    sd = None
 
 try:
     from faster_whisper import WhisperModel
@@ -166,6 +172,10 @@ class Aggregator:
                                 None, 0, 0, dropped_tokens, [], [], [])
 
         first_new_start = kept[0].start #第一個新token的start
+        
+        cut_time = first_new_start - self.fuse_back #計算剪尾時間 (往前推 fuse_back 秒)
+
+
         # ===== 新增：前緣寬限，避免接縫誤剪 =====
         if self.front_grace_sec > 0 and self.state.tail:
             gap = first_new_start - self.state.tail[-1].end
@@ -173,8 +183,8 @@ class Aggregator:
                 # 這一窗不剪尾（把 cut_time 推到超大）
                 cut_time = 1e9
         # =========================================
-        cut_time = first_new_start - self.fuse_back #計算剪尾時間 (往前推 fuse_back 秒)
-
+        
+        
         # 只剪「被新窗充分覆蓋」且「靠近尾端」的 TAIL token
         to_cut: List[Tok] = []
         cut_details: List[CutDetail] = []
@@ -348,6 +358,97 @@ class FileStreamSimulator:
         return win
 
 
+
+class MicStream:
+    """Capture live audio into a sliding window deque and yield windows every stride.
+
+    The sounddevice callback pushes float32 frames into a queue, while a deque keeps
+    the most recent window_len seconds so each yielded numpy array aligns with TARGET_SR.
+    """
+    def __init__(self, window_len: float, stride: float, block_sec: float = 0.1, device=None) -> None:
+        if sd is None:
+            raise RuntimeError('sounddevice is required for microphone mode')
+        self.window_samples = max(1, int(round(window_len * TARGET_SR)))
+        self.stride_samples = max(1, int(round(stride * TARGET_SR)))
+        self.block_samples = max(1, int(round(block_sec * TARGET_SR)))
+        self.device = device
+        self._queue = queue.Queue()
+        self._ring = deque(maxlen=self.window_samples)
+        self._started = False
+        self._stride_accum = 0
+        self._total_samples = 0
+        self._stopped = False
+        self._stream = sd.InputStream(
+            samplerate=TARGET_SR,
+            channels=1,
+            dtype='float32',
+            device=self.device,
+            blocksize=self.block_samples,
+            callback=self._callback,
+        )
+
+    def _callback(self, indata, frames, time_info, status):
+        if status:
+            print(f'[Mic] Input status: {status}', file=sys.stderr)
+        try:
+            self._queue.put_nowait(indata[:, 0].copy())
+        except Exception:
+            pass
+
+    def __enter__(self):
+        self._stream.start()
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        self.stop()
+        return False
+
+    def stop(self) -> None:
+        if self._stopped:
+            return
+        self._stopped = True
+        try:
+            self._stream.stop()
+            self._stream.close()
+        except Exception:
+            pass
+        try:
+            self._queue.put_nowait(None)
+        except Exception:
+            pass
+
+    def _build_window(self) -> np.ndarray:
+        window = np.zeros(self.window_samples, dtype=np.float32)
+        if self._ring:
+            data = np.fromiter(self._ring, dtype=np.float32, count=len(self._ring))
+            window[-len(data):] = data
+        return window
+
+    def windows(self):
+        try:
+            while True:
+                block = self._queue.get()
+                if block is None:
+                    break
+                block = block.reshape(-1)
+                if not len(block):
+                    continue
+                self._ring.extend(block)
+                self._total_samples += len(block)
+                if not self._started:
+                    if len(self._ring) < self.window_samples:
+                        continue
+                    self._started = True
+                    yield self._build_window(), self._total_samples / TARGET_SR
+                    self._stride_accum = 0
+                    continue
+                self._stride_accum += len(block)
+                while self._stride_accum >= self.stride_samples:
+                    self._stride_accum -= self.stride_samples
+                    yield self._build_window(), self._total_samples / TARGET_SR
+        finally:
+            self.stop()
+
 ################################################################################
 # Decoder (FAST)
 ################################################################################
@@ -507,6 +608,143 @@ def create_decoder(args) -> "FastDecoder":
     return FastDecoder(args.model_name, device, compute_type, args.beam_size, args.language)
 
 # ---------- single-file runner (no per-window logs) ----------
+
+def process_window(window: np.ndarray, sim_time: float, args, agg: Aggregator, dec: "FastDecoder", *, is_last_window: bool) -> dict:
+    abs_start = max(0.0, sim_time - args.window_len)
+    toks, rtf = dec.decode_window(window, abs_start)
+
+    win_start = max(0.0, sim_time - args.window_len)
+    win_end = sim_time
+    eps = args.epsilon
+    is_first_window = win_start <= 1e-6
+
+    if is_first_window or win_start < args.guard_sec:
+        accept_s = 0.0
+    else:
+        accept_s = win_start + args.guard_sec
+    accept_s = max(accept_s, agg.state.last_committed_end - eps)
+
+    mid_toks = []
+    window_drop_left = []
+    window_drop_right = []
+    for t in toks:
+        if t.start < accept_s - eps:
+            window_drop_left.append(t)
+            continue
+        if is_last_window:
+            keep = t.end <= (win_end + args.last_slack_sec) + eps
+        else:
+            keep = t.end <= (win_end - args.guard_sec) + eps
+        if keep:
+            mid_toks.append(t)
+        else:
+            window_drop_right.append(t)
+
+    if agg.state.tail and args.protect_head_sec > 0:
+        tail_head = agg.state.tail[0].start
+        cutoff = tail_head + args.protect_head_sec
+        cutoff = max(cutoff, agg.state.last_committed_end + 0.005)
+        cutoff = max(cutoff, accept_s)
+
+        seam_free = agg.state.tail[-1].end - agg.fuse_back
+
+        kept_mid = []
+        for t in mid_toks:
+            if t.start >= cutoff - agg.eps:
+                kept_mid.append(t)
+            elif t.start >= seam_free - agg.eps:
+                kept_mid.append(t)
+        mid_toks = kept_mid
+
+    if is_last_window and agg.state.tail and args.final_protect_sec > 0:
+        tail_end = agg.state.tail[-1].end
+        protect_start = max(accept_s, tail_end - args.final_protect_sec)
+        mid_toks = [t for t in mid_toks if t.start >= protect_start - args.epsilon]
+
+    report = agg.append_fast(mid_toks)
+
+    return {
+        'toks': toks,
+        'report': report,
+        'rtf': rtf,
+        'win_start': win_start,
+        'win_end': win_end,
+        'window_drop_left': window_drop_left,
+        'window_drop_right': window_drop_right,
+    }
+
+
+def log_window_progress(args, agg: Aggregator, diag: dict) -> None:
+    report = diag['report']
+    sim_time = diag['win_end']
+    window_drop_left = diag['window_drop_left']
+    window_drop_right = diag['window_drop_right']
+    toks = diag['toks']
+    win_start = diag['win_start']
+    win_end = diag['win_end']
+    rtf = diag['rtf']
+
+    C = agg.committed_text()
+    T = agg.tail_text()
+    V = agg.view_text()
+    tail_dur = agg.tail_duration()
+    last_c = agg.state.last_committed_end
+    p = (sum(t.prob for t in agg.state.tail) / max(1, len(agg.state.tail))) if agg.state.tail else 0.0
+
+    print(
+        f"t={sim_time:5.1f}s | +{report.kept_new:02d}tok | "
+        f"drop_win(L/R)={len(window_drop_left):02d}/{len(window_drop_right):02d} | "
+        f"drop_floor={report.dropped_by_floor:02d} | "
+        f"cut_tail={report.cut_tail_count:02d} | commit={report.committed_moved:02d} | "
+        f"tail={tail_dur:4.2f}s | last={last_c:5.2f}s | RTF={rtf:4.2f} | p={p:4.2f}"
+    )
+
+    orig_text = tokens_to_text(toks)
+    text_dropL = tokens_to_text(window_drop_left)
+    text_dropR = tokens_to_text(window_drop_right)
+    text_floor = tokens_to_text(report.dropped_by_floor_tokens)
+    text_cut = tokens_to_text(report.cut_tail_tokens)
+
+    print(f"{win_start:.0f}-{win_end:.0f} 原(視窗ASR): {truncate_middle(orig_text, args.view_width)}")
+    print(f"       丟棄(視窗-左): {truncate_middle(text_dropL, args.view_width) if text_dropL else '（無）'}")
+    print(f"       丟棄(視窗-右): {truncate_middle(text_dropR, args.view_width) if text_dropR else '（無）'}")
+    print(f"       丟棄(地板/舊時間): {truncate_middle(text_floor, args.view_width) if text_floor else '（無）'}")
+    if report.cut_tail_tokens:
+        brief = ", ".join([f"{d.tok.text}(覆蓋{d.cover_sec:.2f}s/{d.cover_ratio:.2f})" for d in report.cut_details[:3]])
+        print(f"       切除(尾端覆蓋達標): {truncate_middle(text_cut, args.view_width)}")
+        print(f"       └ 覆蓋細節: {brief}" if brief else "       └ 覆蓋細節: -")
+    else:
+        print("       切除(尾端覆蓋達標): （無）")
+    print(f"       合併後: {truncate_middle(V, args.view_width)}")
+    print('[C] ' + truncate_middle(C, args.view_width))
+    print('[T] ' + truncate_middle(T, args.view_width))
+    print('[VIEW] ' + truncate_middle(V, args.view_width))
+    print('-' * min(args.view_width, 120))
+
+
+
+def maybe_run_repair(args, toks_dict, hyp_text):
+    if not getattr(args, 'repair_enable', False):
+        return hyp_text, False, None, None
+    try:
+        from modules.asr.llm_repair import llm_repair_pipeline, write_srt_with_repair
+    except Exception as e:
+        print(f"[WARN] repair enabled but llm_repair unavailable, skip repair: {e}", file=sys.stderr)
+        return hyp_text, False, None, None
+
+    res = llm_repair_pipeline(
+        tokens=toks_dict,
+        provider=args.repair_provider,
+        model=args.repair_model,
+        host=args.repair_host,
+        api_key=args.repair_api_key or os.environ.get('GROQ_API_KEY'),
+        opencc_config=args.opencc_config,
+        whitelist_path=args.whitelist,
+        glossary_path=args.glossary,
+        gap_period=args.seed_period_gap,
+        gap_comma=args.seed_comma_gap,
+    )
+    return res.clean_text, True, res, write_srt_with_repair
 def run_one_file(audio_path: Path, args, dec: "FastDecoder") -> dict:
     print(f"[RUN] {audio_path}")
 
@@ -520,185 +758,63 @@ def run_one_file(audio_path: Path, args, dec: "FastDecoder") -> dict:
         cov_min_overlap_sec=args.cov_min_overlap_sec,
         cov_min_cover_ratio=args.cov_min_cover_ratio,
     )
-    # ← 新增這行，把 fuse_back 改用 CLI
     agg.fuse_back = float(args.fuse_back)
     agg.dedup_near_gap = float(args.dedup_near_gap)
     agg.dedup_overlap_ratio = float(args.dedup_overlap_ratio)
-    agg.dedup_repeat_gap = float(args.dedup_repeat_gap)      # ★ 新增
-    agg.dedup_bigram_gap = float(args.dedup_bigram_gap)      # ★ 新增
+    agg.dedup_repeat_gap = float(args.dedup_repeat_gap)
+    agg.dedup_bigram_gap = float(args.dedup_bigram_gap)
+
     sim_time = args.window_len
     while not sim.done():
         window = sim.tick()
-        if window is None: break
+        if window is None:
+            break
 
-        abs_start = max(0.0, sim_time - args.window_len)
-        toks, rtf = dec.decode_window(window, abs_start)
-
-        win_start = max(0.0, sim_time - args.window_len)
-        win_end   = sim_time
-        is_last_window = (sim_time >= sim.duration - 1e-3)  # 給較寬 margin，避免浮點誤差
-        is_first_window = (win_start <= 1e-6)
-
-        if is_first_window:
-            accept_s = 0.0
-        elif win_start < args.guard_sec:
-            accept_s = 0.0
-        else:
-            accept_s = win_start + args.guard_sec
-        accept_s = max(accept_s, agg.state.last_committed_end - args.epsilon)
-                
-        eps = args.epsilon
-        is_last_window = (sim_time >= sim.duration - 1e-3)  # 比舊的更穩定
-
-        base_e = win_end if is_last_window else (win_end - args.guard_sec)
-        hard_e = base_e if not is_last_window else (win_end + args.last_slack_sec)
-
-        def keep_token(t):
-            if t.start < accept_s - eps:
-                return False
-            if is_last_window:
-                # 最後一窗：整顆只要「結尾」在 hard_e 之內就放行（允許起頭跨過 base_e）
-                return t.end <= (win_end + args.last_slack_sec) + eps
-            else:
-                # 中間視窗：照舊，不能碰到右 guard
-                return t.end <= (win_end - args.guard_sec) + eps
-
-
-        mid_toks = [t for t in toks if keep_token(t)]
-        window_drop_left  = [t for t in toks if t.start < accept_s - eps]
-        window_drop_right = [t for t in toks if (t.start >= accept_s - eps) and (not keep_token(t))]
-
-
-
-        if agg.state.tail and args.protect_head_sec > 0:
-            tail_head = agg.state.tail[0].start
-            cutoff = tail_head + args.protect_head_sec
-            cutoff = max(cutoff, agg.state.last_committed_end + 0.005)
-            cutoff = max(cutoff, accept_s)
-
-            # 接縫放行：允許接縫附近的小段進來修補上一窗尾巴
-            seam_free = agg.state.tail[-1].end - agg.fuse_back
-
-            kept_mid = []
-            for t in mid_toks:
-                if t.start >= cutoff - agg.eps:
-                    kept_mid.append(t)
-                else:
-                    if t.start >= seam_free - agg.eps:
-                        kept_mid.append(t)
-            mid_toks = kept_mid
-
-
-
-        if is_last_window and agg.state.tail and args.final_protect_sec > 0:
-            tail_end = agg.state.tail[-1].end
-            protect_start = max(accept_s, tail_end - args.final_protect_sec)
-            mid_toks = [t for t in mid_toks if t.start >= protect_start - args.epsilon]
-
-        report = agg.append_fast(mid_toks)
-
-        # ------ logs （保留原本逐窗觀測） ------
-        C = agg.committed_text()
-        T = agg.tail_text()
-        V = agg.view_text()
-        tail_dur = agg.tail_duration()
-        last_c = agg.state.last_committed_end
-        p = (sum(t.prob for t in agg.state.tail) / max(1, len(agg.state.tail))) if agg.state.tail else 0.0
-
-        print(
-            f"t={sim_time:5.1f}s | +{report.kept_new:02d}tok | "
-            f"drop_win(L/R)={len(window_drop_left):02d}/{len(window_drop_right):02d} | "
-            f"drop_floor={report.dropped_by_floor:02d} | "
-            f"cut_tail={report.cut_tail_count:02d} | commit={report.committed_moved:02d} | "
-            f"tail={tail_dur:4.2f}s | last={last_c:5.2f}s | RTF={rtf:4.2f} | p={p:4.2f}"
-        )
-
-        orig_text  = tokens_to_text(toks)
-        text_dropL = tokens_to_text(window_drop_left)
-        text_dropR = tokens_to_text(window_drop_right)
-        text_floor = tokens_to_text(report.dropped_by_floor_tokens)
-        text_cut   = tokens_to_text(report.cut_tail_tokens)
-
-        print(f"{win_start:.0f}-{win_end:.0f} 原(視窗ASR): {truncate_middle(orig_text, args.view_width)}")
-        print(f"       丟棄(視窗-左): {truncate_middle(text_dropL, args.view_width) if text_dropL else '（無）'}")
-        print(f"       丟棄(視窗-右): {truncate_middle(text_dropR, args.view_width) if text_dropR else '（無）'}")
-        print(f"       丟棄(地板/舊時間): {truncate_middle(text_floor, args.view_width) if text_floor else '（無）'}")
-        if report.cut_tail_tokens:
-            brief = ", ".join([f"{d.tok.text}(覆蓋{d.cover_sec:.2f}s/{d.cover_ratio:.2f})" for d in report.cut_details[:3]])
-            print(f"       切除(尾端覆蓋達標): {truncate_middle(text_cut, args.view_width)}")
-            print(f"       └ 覆蓋細節: {brief}" if brief else "       └ 覆蓋細節: -")
-        else:
-            print("       切除(尾端覆蓋達標): （無）")
-        print(f"       合併後: {truncate_middle(V, args.view_width)}")
-
-        print('[C] ' + truncate_middle(C, args.view_width))
-        print('[T] ' + truncate_middle(T, args.view_width))
-        print('[VIEW] ' + truncate_middle(V, args.view_width))
-        print('-' * min(args.view_width, 120))
+        is_last_window = sim_time >= sim.duration - 1e-3
+        diag = process_window(window, sim_time, args, agg, dec, is_last_window=is_last_window)
+        log_window_progress(args, agg, diag)
 
         if args.real_time:
             time.sleep(max(0.0, args.stride))
 
         sim_time += args.stride
 
-    # finalize & write outputs（每檔各自輸出）
     agg.finalize()
     committed = agg.state.committed
 
-    # 轉 token 給修字管線（不修也用得到）
     toks_dict = [{"text": t.text, "start": t.start, "end": t.end, "prob": t.prob} for t in committed]
     hyp_text = tokens_to_text(committed)
 
-    # （A）是否啟用 LLM Repair
-    if getattr(args, 'repair_enable', False):
-        res = llm_repair_pipeline(
-            tokens=toks_dict,
-            provider=args.repair_provider,
-            model=args.repair_model,
-            host=args.repair_host,
-            api_key=args.repair_api_key or os.environ.get("GROQ_API_KEY"),
-            opencc_config=args.opencc_config,
-            whitelist_path=args.whitelist,
-            glossary_path=args.glossary,
-            gap_period=args.seed_period_gap,
-            gap_comma=args.seed_comma_gap,
-        )
-        clean_text = res.clean_text
-    else:
-        clean_text = hyp_text
+    clean_text, repair_used, repair_res, repair_writer = maybe_run_repair(args, toks_dict, hyp_text)
 
-    # （B）輸出
     os.makedirs(args.out_dir, exist_ok=True)
     stem = audio_path.stem
 
     if args.subtitle_format == 'srt':
-        if getattr(args, 'repair_enable', False):
-            # 用修後句子 + 原始時間 gap 重切
-            write_srt_with_repair(
+        if repair_used and repair_writer is not None:
+            repair_writer(
                 str(Path(args.out_dir) / f"{stem}.srt"),
                 toks_dict,
                 clean_text,
                 gap_break=args.srt_gap_break,
-                max_line=args.srt_max_line
+                max_line=args.srt_max_line,
             )
         else:
-            # 走原本的極簡 SRT
             write_srt(Path(args.out_dir) / f"{stem}.srt", committed)
     else:
-        # 純文字：若有修字就寫修後，否則原文
         with open(Path(args.out_dir) / f"{stem}.txt", 'w', encoding='utf-8') as f:
             f.write(clean_text + "\n")
 
-    # （C）edits 審計日誌（有啟用修字時）
-    if getattr(args, 'repair_enable', False):
+
+    if repair_used and repair_res is not None:
         try:
             with open(Path(args.out_dir) / f"{stem}.edits.jsonl", 'w', encoding='utf-8') as ef:
-                for e in res.edits:
+                for e in repair_res.edits:
                     ef.write(json.dumps(e.__dict__, ensure_ascii=False) + "\n")
+
         except Exception:
             pass
 
-    # （D）JSONL（沿用你的邏輯）
     if args.keep_jsonl and (not args.no_jsonl):
         write_jsonl(Path(args.out_dir) / f"{stem}.jsonl", committed)
 
@@ -709,10 +825,95 @@ def run_one_file(audio_path: Path, args, dec: "FastDecoder") -> dict:
         'avg_prob': (sum(t.prob for t in committed) / max(1, len(committed))) if committed else 0.0,
     }
     print(f"[OK]  {audio_path}")
-    return {'text': clean_text if getattr(args, 'repair_enable', False) else hyp_text, 'metrics': metrics}
+    return {'text': clean_text, 'metrics': metrics}
 
 
 
+
+
+def run_mic_mode(args, dec: "FastDecoder") -> None:
+    if sd is None:
+        print('[ERROR] sounddevice not installed. pip install sounddevice', file=sys.stderr)
+        sys.exit(1)
+
+    device = None
+    if getattr(args, 'mic_device', None) not in (None, ''):
+        candidate = args.mic_device
+        try:
+            device = int(candidate)
+        except (ValueError, TypeError):
+            device = candidate
+
+    agg = Aggregator(
+        commit_tail_sec=args.commit_tail_sec,
+        epsilon=args.epsilon,
+        san_near_dup_gap=args.san_near_dup_gap,
+        san_back_overlap_tol=args.san_back_overlap_tol,
+        san_overlap_ratio=args.san_overlap_ratio,
+        cov_min_overlap_sec=args.cov_min_overlap_sec,
+        cov_min_cover_ratio=args.cov_min_cover_ratio,
+    )
+    agg.fuse_back = float(args.fuse_back)
+    agg.dedup_near_gap = float(args.dedup_near_gap)
+    agg.dedup_overlap_ratio = float(args.dedup_overlap_ratio)
+    agg.dedup_repeat_gap = float(args.dedup_repeat_gap)
+    agg.dedup_bigram_gap = float(args.dedup_bigram_gap)
+
+    args.real_time = True
+    timestamp = time.strftime('%Y%m%d-%H%M%S')
+    print('[INFO] Starting microphone mode. Press Ctrl+C to stop.')
+
+    mic = MicStream(args.window_len, args.stride, block_sec=args.mic_block_sec, device=device)
+    try:
+        with mic:
+            for window, latest_time in mic.windows():
+                sim_time = max(args.window_len, latest_time)
+                diag = process_window(window, sim_time, args, agg, dec, is_last_window=False)
+                log_window_progress(args, agg, diag)
+    except KeyboardInterrupt:
+        print('\n[INFO] Microphone session interrupted by user.')
+
+    finally:
+        mic.stop()
+
+    agg.finalize()
+    committed = agg.state.committed
+    toks_dict = [{"text": t.text, "start": t.start, "end": t.end, "prob": t.prob} for t in committed]
+    hyp_text = tokens_to_text(committed)
+    clean_text, repair_used, repair_res, repair_writer = maybe_run_repair(args, toks_dict, hyp_text)
+
+    os.makedirs(args.out_dir, exist_ok=True)
+    stem = f'live_{timestamp}'
+
+    if args.subtitle_format == 'srt':
+        if repair_used and repair_writer is not None:
+            repair_writer(
+                str(Path(args.out_dir) / f"{stem}.srt"),
+                toks_dict,
+                clean_text,
+                gap_break=args.srt_gap_break,
+                max_line=args.srt_max_line,
+            )
+        else:
+            write_srt(Path(args.out_dir) / f"{stem}.srt", committed)
+    else:
+        with open(Path(args.out_dir) / f"{stem}.txt", 'w', encoding='utf-8') as f:
+            f.write(clean_text + "\n")
+
+
+    if repair_used and repair_res is not None:
+        try:
+            with open(Path(args.out_dir) / f"{stem}.edits.jsonl", 'w', encoding='utf-8') as ef:
+                for e in repair_res.edits:
+                    ef.write(json.dumps(e.__dict__, ensure_ascii=False) + "\n")
+
+        except Exception:
+            pass
+
+    if args.keep_jsonl and (not args.no_jsonl):
+        write_jsonl(Path(args.out_dir) / f"{stem}.jsonl", committed)
+
+    print(f"[DONE] Live transcript saved to {Path(args.out_dir) / stem}.{args.subtitle_format}")
 
 ################################################################################
 # Pretty terminal printing
@@ -911,6 +1112,7 @@ def parse_args():
     group.add_argument('--audio', type=str, help='Single audio file (wav/mp3/flac)')
     group.add_argument('--inputs', nargs='+', help='Process multiple audio files (list)')
     group.add_argument('--input-glob', type=str, help='Glob pattern for input files, e.g., "data/*.wav"')
+    group.add_argument('--mic', action='store_true', help='Use live microphone input (real-time)')
 
     # 基本模型參數
     p.add_argument('--model-name', type=str, default='medium', help='faster-whisper model (e.g., small, medium, large-v3)')
@@ -932,6 +1134,8 @@ def parse_args():
     p.add_argument('--protect-head-sec', type=float, default=0.8, help='tail前段保護區 (秒)')
     p.add_argument('--final-protect-sec', type=float, default=0.6, help='最後一窗的尾端保護區 (秒)')
     p.add_argument('--real-time', action='store_true', help='模擬真實時間刷新的節奏 (每步進sleep stride秒)')
+    p.add_argument('--mic-device', type=str, default=None, help='麥克風裝置 index 或名稱 (sounddevice 規則)')
+    p.add_argument('--mic-block-sec', type=float, default=0.1, help='麥克風 callback block 大小 (秒)')
 
     # 同窗清理 knobs
     p.add_argument('--san-near-dup-gap', type=float, default=0.12, help='同字、時間幾乎緊貼(≤這個gap) → 視為重覆，丟掉後者')
@@ -988,12 +1192,17 @@ def parse_args():
     
     return p.parse_args()
 
+
 def main():
     args = parse_args()
     if isinstance(args.language, str) and args.language.lower() in {'none', 'auto', 'null'}:
         args.language = None
 
-    # 收集輸入檔
+    if getattr(args, 'mic', False):
+        dec = create_decoder(args)
+        run_mic_mode(args, dec)
+        return
+
     files: List[Path] = []
     if args.inputs:
         files.extend([Path(p) for p in args.inputs])
@@ -1006,10 +1215,8 @@ def main():
         print("[ERROR] No input files. Use --audio or --inputs or --input-glob", file=sys.stderr)
         sys.exit(1)
 
-    # 只建立一次 decoder，整批沿用
     dec = create_decoder(args)
 
-    # 批次跑
     results = []
     for pth in files:
         try:
@@ -1019,7 +1226,6 @@ def main():
             results.append(row)
         except Exception as e:
             print(f"[ERROR] {pth} failed: {e}", file=sys.stderr)
-            # 不中斷，繼續下一檔
             results.append({
                 'file': str(pth),
                 'duration_sec': '',
@@ -1029,7 +1235,6 @@ def main():
                 'CER': '',
             })
 
-    # 可選評估
     if args.ref_dir:
         for row in results:
             if not row.get('hyp'):
@@ -1040,15 +1245,14 @@ def main():
                 with open(refp, 'r', encoding='utf-8') as f:
                     ref = f.read()
                 unit = args.eval_unit
-                wer, _ = compute_error_rate(row['hyp'], ref, unit='word' if unit in ('word','auto') else unit)
-                cer, _ = compute_error_rate(row['hyp'], ref, unit='char' if unit in ('char','auto') else unit)
+                wer, _ = compute_error_rate(row['hyp'], ref, unit='word' if unit in ('word', 'auto') else unit)
+                cer, _ = compute_error_rate(row['hyp'], ref, unit='char' if unit in ('char', 'auto') else unit)
                 row['WER'] = f"{wer:.4f}"
                 row['CER'] = f"{cer:.4f}"
             else:
                 row['WER'] = ''
                 row['CER'] = ''
 
-    # 寫 summary CSV
     os.makedirs(args.out_dir, exist_ok=True)
     summary_path = Path(args.out_dir) / "summary.csv"
     fieldnames = ['file', 'duration_sec', 'tokens', 'avg_prob', 'WER', 'CER']
