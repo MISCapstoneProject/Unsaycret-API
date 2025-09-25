@@ -171,7 +171,8 @@ from utils.constants import (
     DEFAULT_SEPARATION_MODEL,
     AUDIO_SAMPLE_RATE, AUDIO_CHUNK_SIZE, AUDIO_CHANNELS, 
     AUDIO_WINDOW_SIZE, AUDIO_OVERLAP, AUDIO_MIN_ENERGY_THRESHOLD, 
-    AUDIO_MAX_BUFFER_MINUTES, API_MAX_WORKERS, AUDIO_TARGET_RATE
+    AUDIO_MAX_BUFFER_MINUTES, API_MAX_WORKERS, AUDIO_TARGET_RATE,
+    USE_DIARIZATION_STREAMING
 )
 
 # 導入動態模型管理器
@@ -254,7 +255,7 @@ _GLOBAL_SPEAKER_PIPELINE_CACHE = None
 # ================== 語者分離類別 ======================
 
 class AudioSeparator:
-    def __init__(self, model_type: SeparationModel = DEFAULT_MODEL, enable_noise_reduction=True, snr_threshold=SNR_THRESHOLD, enable_dynamic_model=True, use_diarization = True):
+    def __init__(self, model_type: SeparationModel = DEFAULT_MODEL, enable_noise_reduction=True, snr_threshold=SNR_THRESHOLD, enable_dynamic_model=True, use_diarization = USE_DIARIZATION_STREAMING):
         # 設備選擇邏輯：優先考慮 FORCE_CPU 設定
         if FORCE_CPU:
             self.device = "cpu"
