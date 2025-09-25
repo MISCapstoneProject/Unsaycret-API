@@ -403,8 +403,11 @@ def run_pipeline_stream(
         t0 = idx * chunk_secs
         t1 = t0 + chunk_secs
 
-        waveform = torch.frombuffer(raw_bytes, dtype=torch.int16).float() / 32768.0
+        # 直接把 bytes 解成 float32，數值本來就在 [-1, 1] 範圍
+        waveform = torch.frombuffer(raw_bytes, dtype=torch.float32)
+        # 保持 shape: (1, N)
         waveform = waveform.view(1, -1)
+
 
         seg_dir = out_root / f"segment_{idx:03d}"
         seg_dir.mkdir(parents=True, exist_ok=True)
