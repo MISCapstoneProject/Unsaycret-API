@@ -1,5 +1,7 @@
 import torch
 import math
+import numpy as np
+from scipy.signal import butter, sosfiltfilt
 try:
     import torchaudio
     import torchaudio.functional as AF
@@ -295,3 +297,208 @@ def _tpdf_dither(x: torch.Tensor, level_db: float = -90.0):
     amp = 10.0 ** (level_db / 20.0)
     d = (torch.rand_like(x) - 0.5 + torch.rand_like(x) - 0.5) * amp
     return (x + d).clamp(-1.0, 1.0)
+
+
+def normalize_audio(
+    wav: torch.Tensor, sr: int,
+    method: str = "lufs",           # "lufs" | "rms" | "peak"
+    target_lufs: float = -20.0,     # 對話常用 -20 LUFS；廣播 -23 LUFS
+    target_rms_dbfs: float = -23.0, # 若走 RMS
+    true_peak_dbfs: float = -1.0,   # 最終不超過 -1 dBFS
+    max_gain_db: float = 12.0,      # 單段最大增益（避免把底噪拉太高）
+    noise_gate_dbfs: float = -55.0  # 低於此 RMS 視為背景音，不做增益
+) -> torch.Tensor:
+    """
+    wav: float32, 範圍約 [-1,1]，形狀 (1, T) 或 (T,)
+    回傳：正規化後的 wav（float32）
+    """
+    if wav.dim() == 2:
+        x = wav.squeeze(0)
+    else:
+        x = wav
+
+    x = x.to(torch.float32).contiguous()
+    if x.numel() == 0:
+        return wav
+
+    # 基本量測
+    peak = float(x.abs().max().item() + 1e-12)
+    rms  = float(torch.sqrt(torch.mean(x**2)).item() + 1e-12)
+    rms_dbfs  = 20.0 * np.log10(rms)
+    peak_dbfs = 20.0 * np.log10(peak)
+
+    # 很小聲/近乎靜音：避免把底噪放大
+    if rms_dbfs < noise_gate_dbfs and peak_dbfs < (noise_gate_dbfs + 10.0):
+        # 仍做一次小幅「峰值對齊到 -3 dBFS」的處理，但增益上限更保守
+        peak_target = 10 ** (-3.0 / 20.0)
+        if peak > 0:
+            scale = min(peak_target / peak, 10 ** (6.0 / 20.0))  # 至多 +6dB
+            x = torch.clamp(x * scale, -1.0, 1.0)
+        return x.unsqueeze(0) if wav.dim() == 2 else x
+
+    # 計算建議增益（dB）
+    gain_db = 0.0
+    if method == "lufs":
+        try:
+            import pyloudnorm as pyln
+            meter = pyln.Meter(sr, block_size=0.400, filter_class="K-weighting")
+            lufs = float(meter.integrated_loudness(x.cpu().numpy()))
+            gain_db = float(target_lufs - lufs)
+        except Exception:
+            method = "rms"  # 退回 RMS
+    if method == "rms":
+        # 將目前 RMS 拉到目標 dBFS
+        gain_db = float(target_rms_dbfs - rms_dbfs)
+    if method == "peak":
+        # 將峰值對齊到 true_peak_dbfs（但會再做一次真峰值限制）
+        peak_target = 10 ** (true_peak_dbfs / 20.0)
+        if peak > 0:
+            scale = peak_target / peak
+            gain_db = 20.0 * np.log10(max(scale, 1e-8))
+        else:
+            gain_db = 0.0
+
+    # 限制增益範圍（避免過度放大或壓小）
+    gain_db = float(np.clip(gain_db, -6.0, max_gain_db))
+    scale = 10.0 ** (gain_db / 20.0)
+    x = x * float(scale)
+
+    # 真峰值限制到 -1 dBFS（或你設定的 true_peak_dbfs）
+    peak_after = float(x.abs().max().item() + 1e-12)
+    peak_after_dbfs = 20.0 * np.log10(peak_after)
+    if peak_after_dbfs > true_peak_dbfs:
+        limit_scale = 10.0 ** ((true_peak_dbfs - peak_after_dbfs) / 20.0)
+        x = x * float(limit_scale)
+
+    # 最終保險
+    x = torch.clamp(x, -1.0, 1.0)
+    return x.unsqueeze(0) if wav.dim() == 2 else x
+
+class OnlineNoiseReducer:
+    """
+    低延遲「線上」降躁：
+    1) HP/LP 濾掉低頻隆隆與超高頻底噪
+    2) STFT 頻譜門控（Wiener-like spectral subtraction）
+    3) 以 EMA 維持噪音底噪模型，隨時間更新
+    """
+    def __init__(
+        self,
+        sr: int = 16000,
+        hp_cut: float = 60.0,      # Hz，高通，去風切/空調
+        lp_cut: float = 7800.0,    # Hz，語音上限 7~8k
+        frame_len: float = 0.032,  # 32ms
+        hop_len: float = 0.008,    # 8ms
+        gate_strength_db: float = 9.0,   # 越大抑制越強（建議 6~12dB）
+        min_floor_db: float = -18.0,     # 最低增益地板（避免過度抽乾）
+        noise_update: float = 0.05,      # 噪音譜線上 EMA 更新率
+        energy_vad_dbfs: float = -50.0   # 低於此片段 RMS 視為噪音候選
+    ):
+        self.sr = sr
+        self.hp_cut = hp_cut
+        self.lp_cut = lp_cut
+        # STFT 參數
+        self.n_fft = int(2 ** np.ceil(np.log2(max(128, int(frame_len * sr)))))
+        self.hop = max(1, int(hop_len * sr))
+        self.win = torch.hann_window(self.n_fft)
+        # 門控參數
+        self.gate_k = 10 ** (-gate_strength_db / 20.0)
+        self.floor = 10 ** (min_floor_db / 20.0)
+        self.noise_update = float(noise_update)
+        self.energy_vad_dbfs = float(energy_vad_dbfs)
+        # 狀態
+        self.noise_mag = None  # (F,) 頻帶噪音幅度估計
+        # 濾波器
+        self.sos_hp = butter(2, self.hp_cut / (sr / 2), btype="highpass", output="sos")
+        self.sos_lp = butter(3, self.lp_cut / (sr / 2), btype="lowpass", output="sos")
+
+    def _pre_filt(self, x: torch.Tensor) -> torch.Tensor:
+        # x: (1, T) float32 [-1,1]
+        arr = x.squeeze(0).detach().cpu().numpy()
+        y = sosfiltfilt(self.sos_hp, arr)
+        y = sosfiltfilt(self.sos_lp, y)
+
+        # 🔧 關鍵修補：確保不是負 stride、且是連續記憶體
+        y = np.ascontiguousarray(y, dtype=np.float32)
+
+        return torch.from_numpy(y).unsqueeze(0)
+
+    def _stft(self, x: torch.Tensor) -> torch.Tensor:
+        return torch.stft(x, n_fft=self.n_fft, hop_length=self.hop, win_length=self.n_fft,
+                          window=self.win.to(x.device), return_complex=True, center=True)
+
+    def _istft(self, X: torch.Tensor, length: int) -> torch.Tensor:
+        y = torch.istft(X, n_fft=self.n_fft, hop_length=self.hop, win_length=self.n_fft,
+                        window=self.win.to(X.device), length=length, center=True)
+        return y.unsqueeze(0)
+
+    def process(self, wav: torch.Tensor, sr: int | None = None) -> torch.Tensor:
+        """
+        wav: (1, T) float32 [-1,1]
+        回傳同長度、降躁後的 (1, T)
+        """
+        if wav.numel() == 0:
+            return wav
+        if sr is not None and sr != self.sr:
+            # 如果外部重採樣了，重建濾波器與大小
+            self.__init__(sr=sr, hp_cut=self.hp_cut, lp_cut=self.lp_cut,
+                          frame_len=self.n_fft / self.sr, hop_len=self.hop / self.sr,
+                          gate_strength_db=-20*np.log10(self.gate_k),
+                          min_floor_db=20*np.log10(self.floor),
+                          noise_update=self.noise_update, energy_vad_dbfs=self.energy_vad_dbfs)
+
+        # 1) 前級濾波（HP/LP）
+        x = torch.clamp(wav, -1.0, 1.0)
+        x = self._pre_filt(x)
+
+        # 2) STFT
+        X = self._stft(x)                # (1,F,Tc) complex
+        mag = torch.abs(X).squeeze(0)    # (F,Tc)
+        pha = torch.angle(X).squeeze(0)  # (F,Tc)
+
+        # 3) 初始化 / 更新噪音譜（取本片最低 20% 作為噪音候選）
+        with torch.no_grad():
+            mag_np = mag.cpu().numpy()
+            # 每頻帶 20 百分位
+            q = np.percentile(mag_np, 20.0, axis=1)  # (F,)
+            q = np.maximum(q, 1e-8)
+            if self.noise_mag is None:
+                self.noise_mag = q
+            else:
+                # 若本片能量很低（RMS < 門檻），才強化更新；否則以較慢速更新
+                rms = float(torch.sqrt(torch.mean(x**2)).item() + 1e-12)
+                dbfs = 20.0 * np.log10(rms)
+                alpha = self.noise_update * (1.5 if dbfs < self.energy_vad_dbfs else 1.0)
+                self.noise_mag = (1.0 - alpha) * self.noise_mag + alpha * q
+
+        noise = torch.from_numpy(self.noise_mag).to(mag.device)[:, None]  # (F,1)
+
+        # 4) Wiener-like mask：G = max(floor, (|X|^2 - k^2|N|^2)/|X|^2)
+        num = (mag**2 - (self.gate_k * noise)**2).clamp_min(0.0)
+        den = (mag**2 + 1e-8)
+        G = (num / den).sqrt().clamp(min=self.floor, max=1.0)  # (F,Tc)
+
+        Y = G * mag * torch.exp(1j * pha)
+        Y = Y.unsqueeze(0)
+
+        # 5) iSTFT、保險夾限
+        y = self._istft(Y, length=wav.shape[-1])
+        y = torch.clamp(y, -1.0, 1.0)
+        return y
+    
+def _ensure_waveform_2d_cpu_f32(x: torch.Tensor) -> torch.Tensor:
+    # 轉成 torch tensor（避免外部不小心傳 numpy）
+    if not isinstance(x, torch.Tensor):
+        x = torch.tensor(np.asarray(x), dtype=torch.float32)
+
+    x = x.detach().to(dtype=torch.float32)
+    # 攤平成 1D
+    if x.dim() == 2 and 1 in x.shape:
+        x = x.reshape(-1)
+    elif x.dim() > 2:
+        x = x.reshape(-1)
+    # 補成 (1, T)
+    if x.dim() == 1:
+        x = x.unsqueeze(0)
+    # 保證在 CPU、連續記憶體
+    x = x.contiguous().cpu()
+    return x

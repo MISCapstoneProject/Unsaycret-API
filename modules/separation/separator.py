@@ -1128,6 +1128,168 @@ class AudioSeparator:
                 fixed.append((s, e, k))
         return fixed
     
+    def diarize_spans_streaming(
+        self,
+        audio_tensor: torch.Tensor,
+        absolute_start_time=None,
+        min_on: float = 0.50,
+        min_off: float = 0.30,
+        collar: float = 0.10,
+        merge_gap: float = 0.20,
+        emit_overlap_s: float = 0.50,
+        max_speakers: int = 4,          # ← 支援 3–4 人
+        assign_thr: float = 0.75,       # ← 指派門檻（cosine 相似度）
+        ema: float | None = None,       # ← 原型更新權重；None 則用 reset_streaming_state 裡的
+        min_new_spk_dur: float = 0.8,   # 建立新講者的最短段長（秒）
+        min_new_spk_gap_s: float = 2.0, # 兩次建立新講者之間至少間隔（秒，絕對時間）
+    ):
+        """
+        串流 diarization（不落檔）：回傳本片內「單一說話者區段」清單，且
+        透過原型 + 相似度門檻做【跨片段】的穩定講者指派。
+        回傳: List[{'spk': int,'s': float,'e': float,'abs_s': float,'abs_e': float}]
+        """
+        diar_pipe = self._ensure_diar_pipeline()
+
+        wf = audio_tensor
+        if wf.dim() == 2:  # (C,T)
+            wf = wf[0].unsqueeze(0)
+        elif wf.dim() == 1:
+            wf = wf.unsqueeze(0)
+        wf = wf.to(torch.float32).cpu().contiguous()
+        sr = TARGET_RATE
+        dur = wf.shape[-1] / sr
+
+        diar = diar_pipe({"waveform": wf, "sample_rate": sr})
+
+        # 蒐集 turns（先 collar 擴張，再之後 merge_gap 合併）
+        from collections import defaultdict
+        turns = defaultdict(list)  # label -> [(s,e)]
+        for seg, _, lbl in diar.itertracks(yield_label=True):
+            s = max(0.0, float(seg.start) - collar)
+            e = min(dur,  float(seg.end)   + collar)
+            if e > s:
+                turns[lbl].append((s, e))
+
+        def _merge_and_refine(spans):
+            spans = sorted(spans, key=lambda x: x[0])
+            merged = []
+            for s, e in spans:
+                if not merged:
+                    merged.append([s, e]); continue
+                ps, pe = merged[-1]
+                if s - pe <= merge_gap:
+                    merged[-1][1] = max(pe, e)
+                else:
+                    merged.append([s, e])
+            refined = []
+            for s, e in merged:
+                if (e - s) < min_on:
+                    # 丟太短的，或視情況與前一段黏合
+                    if refined and (s - refined[-1][1]) <= min_off:
+                        refined[-1][1] = e
+                    else:
+                        continue
+                refined.append([s, e])
+            return [(round(s,3), round(e,3)) for s,e in refined]
+
+        spans_all = []
+        for lbl, spans in list(turns.items()):
+            if not spans: 
+                continue
+            spans_all.extend(_merge_and_refine(spans))
+        spans_all.sort(key=lambda x: x[0])
+
+        # 沒有句子段就結束
+        if not spans_all:
+            self._stream["last_turns"] = []
+            return []
+
+        # 初始化/取得串流狀態
+        st = self._stream
+        if "protos" not in st: st["protos"] = {}
+        if "spk_count" not in st: st["spk_count"] = 0
+        if "ema" not in st: st["ema"] = 0.10
+        if "last_new_spk_abs_time" not in st: st["last_new_spk_abs_time"] = -1e9
+        if ema is None: ema = st["ema"]
+
+        # 準備 embedding 推論器
+        emb = None
+        try:
+            from pyannote.audio import Model, Inference
+            if not hasattr(self, "_embedder") or self._embedder is None:
+                _model = Model.from_pretrained("pyannote/embedding")
+                _model.to(self.device)
+                self._embedder = Inference(_model, window="whole", device=self.device)
+            emb = []
+            for (s, e) in spans_all:
+                s_i = int(round(s * sr)); e_i = int(round(e * sr))
+                if e_i - s_i <= 0: emb.append(None); continue
+                v = self._embedder(wf[:, s_i:e_i])  # (D,)
+                v = v / (np.linalg.norm(v) + 1e-8)
+                emb.append(v)
+        except Exception:
+            emb = [None] * len(spans_all)
+
+        # 指派到【跨片段】講者 ID（1..max_speakers）
+        results = []
+        for i, (s, e) in enumerate(spans_all):
+            v = emb[i]
+            # 先找與既有原型最像的
+            assigned_spk = None
+            best_sim = -1.0
+            best_spk = None
+            if v is not None and st["protos"]:
+                keys = sorted(st["protos"].keys())
+                P = np.stack([st["protos"][k] for k in keys], axis=0)  # (K,D)
+                sims = P @ v
+                k_best = int(np.argmax(sims))
+                best_sim = float(sims[k_best])
+                best_spk = int(keys[k_best])
+                if best_sim >= assign_thr:
+                    assigned_spk = best_spk
+
+            # 若尚未指派，評估是否可「建立新講者」
+            abs_s = (absolute_start_time.timestamp() + s) if absolute_start_time else 0.0
+            allow_new = (
+                (st["spk_count"] == 0) or
+                ((abs_s - st["last_new_spk_abs_time"]) >= min_new_spk_gap_s and (e - s) >= min_new_spk_dur)
+            )
+
+            if assigned_spk is None:
+                if allow_new and st["spk_count"] < max_speakers and v is not None:
+                    # 建立新講者（穩住：避免連續爆出 spk2/3/4）
+                    st["spk_count"] += 1
+                    assigned_spk = st["spk_count"]
+                    st["protos"][assigned_spk] = v
+                    st["last_new_spk_abs_time"] = abs_s
+                else:
+                    # 不允許建新或沒有 embedding：退而指派到當前最像者，或 1
+                    assigned_spk = best_spk if (v is not None and best_spk is not None) else 1
+
+            # 用 EMA 更新該講者原型
+            if v is not None:
+                p = st["protos"].get(assigned_spk, v)
+                p = (1.0 - ema) * p + ema * v
+                p = p / (np.linalg.norm(p) + 1e-8)
+                st["protos"][assigned_spk] = p
+
+            # 擴張一點兩側，方便組句
+            expand = emit_overlap_s * 0.5
+            s2 = max(0.0, s - expand)
+            e2 = min(dur,  e + expand)
+
+            abs_s = (absolute_start_time.timestamp() + s2) if absolute_start_time else None
+            abs_e = (absolute_start_time.timestamp() + e2) if absolute_start_time else None
+            results.append({"spk": assigned_spk, "s": s2, "e": e2, "abs_s": abs_s, "abs_e": abs_e})
+
+        # 存下本片 turns（供後續邊界修補需要時使用）
+        if absolute_start_time is not None:
+            st["last_turns"] = [(r["abs_s"], r["abs_e"], r["spk"]) for r in results]
+        else:
+            st["last_turns"] = []
+
+        return results
+    
     def _diarize_and_save_streaming(
         self,
         audio_tensor: torch.Tensor,

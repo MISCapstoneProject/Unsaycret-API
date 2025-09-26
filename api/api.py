@@ -16,13 +16,15 @@ from datetime import datetime
 from pipelines.orchestrator import (
     run_pipeline_FILE,
     run_pipeline_STREAM,
-    run_pipeline_DIR,
+    run_pipeline_UTTER_STREAM,
+    run_pipeline_DIR
 )
 from services.data_facade import DataFacade
 import tempfile, shutil, os, zipfile
 from utils.constants import (
     API_DEFAULT_VERIFICATION_THRESHOLD, API_DEFAULT_MAX_RESULTS,
     WEBSOCKET_CHUNK_SECS, WEBSOCKET_TIMEOUT, WEBSOCKET_MAX_WORKERS,
+    SLICE_SECS,
     API_MAX_WORKERS
 )
 from utils.logger import get_logger
@@ -405,12 +407,11 @@ async def ws_stream(ws: WebSocket):
         # ---------------- 背景 thread ---------------- #
         def backend():
             try:
-                run_pipeline_STREAM(
-                    chunk_secs=WEBSOCKET_CHUNK_SECS,
+                run_pipeline_UTTER_STREAM(    # 改成句子驅動模式
+                    slice_secs=SLICE_SECS,    # (0.5~1.0s)
                     max_workers=API_MAX_WORKERS,
-                    record_secs=None,
-                    in_bytes_queue=raw_q,   # ← 改成讀前端送來的 bytes
-                    queue_out=result_q,     # ★ 把結果塞進 result_q
+                    in_bytes_queue=raw_q,
+                    queue_out=result_q,
                     stop_event=stop_evt,
                 )
             except Exception as e:

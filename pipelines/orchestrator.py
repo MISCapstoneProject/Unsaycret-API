@@ -22,6 +22,7 @@ from scipy.signal import resample_poly
 from utils.logger import get_logger
 from utils.constants import DEFAULT_WHISPER_MODEL,DEFAULT_WHISPER_BEAM_SIZE, USE_DIARIZATION_STREAMING
 from utils.env_config import FORCE_CPU, CUDA_DEVICE_INDEX
+from modules.separation.process_before_id import normalize_audio, _ensure_waveform_2d_cpu_f32, OnlineNoiseReducer
 from modules.separation.separator import AudioSeparator
 from modules.identification.VID_identify_v5 import SpeakerIdentifier
 from modules.asr.whisper_asr import WhisperASR
@@ -570,10 +571,325 @@ def run_pipeline_stream(
     )
     return bundle, pretty_bundle
 
+def run_pipeline_utter_stream(
+    slice_secs: float = 0.5,
+    rate: int = 16000,
+    channels: int = 1,
+    frames_per_buffer: int = 1024,
+    max_workers: int = 2,
+    queue_out: "queue.Queue[dict] | None" = None,
+    stop_event: threading.Event | None = None,
+    in_bytes_queue: "queue.Queue[bytes] | None" = None,
+    sep=None, spk=None, asr=None,
+    eos_silence: float = 1.0    # 句尾靜音秒數
+):
+    """
+    Utterance-driven 串流：不以固定秒數產生 segment。
+    只要偵測到「一句話」已經結束，就立即輸出一個 segment 目錄，
+    其中只包含該位說話者的單一句子 .wav。
+    """
+    if sep is None or spk is None or asr is None:
+        sep, spk, asr, _ = init_pipeline_modules()
+
+    total_start = time.perf_counter()
+    out_root = Path("stream_output") / dt.now().strftime("%Y%m%d_%H%M%S")
+    out_root.mkdir(parents=True, exist_ok=True)
+    
+    denoiser = OnlineNoiseReducer(sr=rate,
+                              hp_cut=60.0, lp_cut=7800.0,
+                              frame_len=0.032, hop_len=0.008,
+                              gate_strength_db=9.0, min_floor_db=-18.0,
+                              noise_update=0.05, energy_vad_dbfs=-50.0)
+
+    # 使用台北時區記錄串流開始「絕對時間」
+    taipei_tz = timezone(timedelta(hours=8))
+    stream_start_time = dt.now(taipei_tz)
+
+    # 初始化 separator 的串流狀態（slice_len 改為 slice_secs）
+    try:
+        sep.reset_streaming_state(slice_len=float(slice_secs), cut_margin=0.30, ema=0.10)
+    except Exception:
+        pass
+
+    # --- Rolling 組句狀態 ---
+    # open_utts[spk] = {'abs_start': float, 'buf': [torch.Tensor(1,T_i)], 'last_abs_end': float, 'inactive': int}
+    open_utts: dict[int, dict] = {}
+    spk_utt_counter: dict[int, int] = {}    # 每位說話者的句子計數器
+    patience_slices = 1                     # 連續 1 片未再出現就關段
+    seg_counter = 0
+
+    # 後處理 thread pool
+    executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=max_workers)
+
+    # 將一個完成的「句子」落檔 + 跑 SpkID/ASR + 推結果
+    def _close_and_emit(spk_idx: int):
+        nonlocal seg_counter
+        st = open_utts.pop(spk_idx, None)
+        if not st or not st["buf"]:
+            return
+        wav = torch.cat(st["buf"], dim=-1)
+        abs_s = st["abs_start"]; abs_e = st["last_abs_end"]
+
+        # 正規化音訊
+        wav = normalize_audio(wav, rate)
+
+        t0_rel = abs_s - stream_start_time.timestamp()
+        t1_rel = abs_e - stream_start_time.timestamp()
+
+        # 更新該講者的 utt 計數
+        utt_no = spk_utt_counter.get(spk_idx, 0) + 1
+        spk_utt_counter[spk_idx] = utt_no
+
+        seg_dir = out_root / f"segment_{seg_counter:03d}"
+        seg_dir.mkdir(parents=True, exist_ok=True)
+        # 檔名：speaker{spk}_utt{N}.wav
+        out_path = seg_dir / f"speaker{spk_idx}_utt{utt_no}.wav"
+        torchaudio.save(out_path.as_posix(), wav, rate, bits_per_sample=16)
+
+        res = process_segment(
+            out_path.as_posix(), t0_rel, t1_rel,
+            absolute_timestamp=abs_s,
+            sep=sep, spk=spk, asr=asr
+        )
+        # 在 output.json 我們也保留明確的 spk_id 與 utt_no
+        res["speaker_index"] = spk_idx
+        res["utter_index"] = utt_no
+
+        seg_dict = {
+            "segment": seg_counter,
+            "start": round(t0_rel, 2),
+            "end": round(t1_rel, 2),
+            "sources": [out_path.as_posix()],
+            "speakers": [res],
+        }
+        with open(seg_dir / "output.json", "w", encoding="utf-8") as f:
+            json.dump(seg_dict, f, ensure_ascii=False, indent=2)
+
+        if queue_out is not None:
+            queue_out.put(seg_dict)
+
+        seg_counter += 1
+
+    # --- Bytes → slices 讀取 ---
+    bytes_per_sample = 4 * channels  # float32 mono=4
+    slice_bytes = int(rate * slice_secs) * bytes_per_sample
+
+    q: queue.Queue = queue.Queue()
+    stop_flag = threading.Event()
+
+    def recorder_from_queue():
+        buf = bytearray()
+        idx = 0
+        while not stop_flag.is_set():
+            if stop_event and stop_event.is_set():
+                break
+            try:
+                pkt = in_bytes_queue.get(timeout=0.1)
+            except queue.Empty:
+                continue
+            buf.extend(pkt)
+            while len(buf) >= slice_bytes:
+                raw = bytes(buf[:slice_bytes])
+                buf = buf[slice_bytes:]
+                q.put((raw, idx))
+                idx += 1
+
+    def recorder_from_mic():
+        pa = pyaudio.PyAudio()
+        candidates = [rate, 48000, 44100]
+        stream = None
+        fmt = None
+        actual_sr = None
+        try:
+            # 先試 float32
+            for sr in candidates:
+                try:
+                    stream = pa.open(format=pyaudio.paFloat32, channels=channels, rate=sr,
+                                    input=True, frames_per_buffer=frames_per_buffer)
+                    fmt = "f32"; actual_sr = sr
+                    logger.info(f"🎤 Mic opened at {sr} Hz (float32)")
+                    break
+                except Exception as e:
+                    logger.warning(f"Mic float32 open failed at {sr} Hz: {e}")
+
+            # 再試 int16 後備
+            if stream is None:
+                for sr in candidates:
+                    try:
+                        stream = pa.open(format=pyaudio.paInt16, channels=channels, rate=sr,
+                                        input=True, frames_per_buffer=frames_per_buffer)
+                        fmt = "i16"; actual_sr = sr
+                        logger.info(f"🎤 Mic opened at {sr} Hz (int16)")
+                        break
+                    except Exception as e:
+                        logger.warning(f"Mic int16 open failed at {sr} Hz: {e}")
+
+            if stream is None:
+                raise RuntimeError("無法開啟麥克風（float32/int16 皆失敗）")
+
+            bps = (4 if fmt == "f32" else 2) * channels
+            slice_bytes_local = int(actual_sr * slice_secs) * bps
+
+            buf = bytearray(); idx = 0
+            while not stop_flag.is_set():
+                if stop_event and stop_event.is_set():
+                    break
+                chunk = stream.read(frames_per_buffer, exception_on_overflow=False)
+                buf.extend(chunk)
+                while len(buf) >= slice_bytes_local:
+                    raw = bytes(buf[:slice_bytes_local]); buf = buf[slice_bytes_local:]
+                    q.put((raw, idx, actual_sr))
+                    if idx == 0 or idx % int(max(1, (actual_sr*slice_secs)/(frames_per_buffer))) == 0:
+                        logger.debug(f"🎯 put slice idx={idx} sr={actual_sr}")
+                    idx += 1
+        except Exception as e:
+            logger.error(f"❌ recorder_from_mic 失敗：{e}")
+            stop_flag.set()
+            if stop_event: stop_event.set()
+            raise
+        finally:
+            try:
+                if stream is not None:
+                    stream.stop_stream(); stream.close()
+                pa.terminate()
+            except Exception:
+                pass
+    
+    # 根據是否提供 in_bytes_queue，選擇資料來源
+    if in_bytes_queue is not None:
+        rec_thread = threading.Thread(target=recorder_from_queue, daemon=True)
+    else:
+        rec_thread = threading.Thread(target=recorder_from_mic, daemon=True)
+    
+    rec_thread.start()
+    logger.info("🎙 Utterance-driven 串流開始（%ss slices）...", slice_secs)
+
+    first_packet = False
+    last_slice_wall = time.perf_counter()
+    idle_flush = max(1.5 * slice_secs, 2.0)  # 沒資料多久就把 open 的句子關掉
+
+    def flush_all(reason: str):
+        for spk_idx in list(open_utts.keys()):
+            _close_and_emit(spk_idx)
+        if open_utts:
+            open_utts.clear()
+        logger.info(f"🧺 flush 未結束句子（原因：{reason}）")
+
+    try:
+        while True:
+            if stop_event and stop_event.is_set():
+                break
+            try:
+                pkt = q.get(timeout=0.3)
+            except queue.Empty:
+                # Watchdog：無資料超過 idle_flush 就把目前開著的句子關掉，避免永遠等不到下一包
+                if (time.perf_counter() - last_slice_wall) > idle_flush and open_utts:
+                    flush_all("idle")
+                    last_slice_wall = time.perf_counter()
+                continue
+
+            # 兼容 (raw, idx) 與 (raw, idx, sr)
+            if isinstance(pkt, tuple) and len(pkt) == 3:
+                raw, idx, runtime_sr = pkt
+            elif isinstance(pkt, tuple) and len(pkt) == 2:
+                raw, idx = pkt
+                runtime_sr = rate
+            else:
+                raw, idx, runtime_sr = pkt, 0, rate
+
+            if not first_packet:
+                first_packet = True
+                logger.info("✅ 第一包音訊切片已收到（sr=%s）", runtime_sr)
+            last_slice_wall = time.perf_counter()
+
+            # 計算本 slice 的絕對起點時間
+            slice_abs_start = stream_start_time + timedelta(seconds=idx * slice_secs)
+
+            # bytes → waveform(float32)
+            wf = torch.frombuffer(raw, dtype=torch.float32).view(1, -1)
+            wf = torch.clamp(wf, -1.0, 1.0)
+
+            # 降噪處理
+            wf = denoiser.process(wf, sr=rate)
+            wf = _ensure_waveform_2d_cpu_f32(wf)
+            
+            # 依 slice_secs 推導較穩的 VAD 參數
+            vad_min_on   = max(0.12, slice_secs * 0.35)   # 0.5s 切片 → 約 0.18s
+            vad_min_off  = max(0.08, slice_secs * 0.25)   # 0.5s 切片 → 約 0.125s
+            vad_mergegap = max(0.10, slice_secs * 0.50)
+            vad_collar   = 0.05
+            emit_overlap = min(0.40, slice_secs * 0.8)
+            
+            # 取得本片的說話者區段（不落檔）
+            spans = sep.diarize_spans_streaming(
+                wf, absolute_start_time=slice_abs_start,
+                min_on=vad_min_on, min_off=vad_min_off, collar=vad_collar, merge_gap=vad_mergegap,
+                emit_overlap_s=emit_overlap,
+                max_speakers=4, assign_thr=0.75, ema=0.12,
+                min_new_spk_dur=max(0.6, vad_min_on + 0.2),  # 新說話者至少要有點長度
+                min_new_spk_gap_s=2.0,
+            )
+            # 建一個 set，記錄本片出現過的說話者
+            appeared = set()
+
+            for r in spans:
+                spk_idx = int(r["spk"])
+                appeared.add(spk_idx)
+                s_rel, e_rel = float(r["s"]), float(r["e"])
+                abs_s, abs_e = float(r["abs_s"]), float(r["abs_e"])
+                # 取出此片的聲音片段
+                s_i = max(0, int(round(s_rel * rate)))
+                e_i = min(wf.shape[-1], int(round(e_rel * rate)))
+                if e_i - s_i <= 0: 
+                    continue
+                clip = wf[:, s_i:e_i].contiguous()
+
+                st = open_utts.get(spk_idx)
+                if st is None:
+                    # 開啟一個新句子
+                    open_utts[spk_idx] = {
+                        "abs_start": abs_s,
+                        "last_abs_end": abs_e,
+                        "buf": [clip],
+                        "inactive": 0,
+                    }
+                else:
+                    # 續接同一句
+                    st["buf"].append(clip)
+                    st["last_abs_end"] = abs_e
+                    st["inactive"] = 0
+
+            # 以時間判斷是否到句尾
+            now_abs_end = (slice_abs_start + timedelta(seconds=slice_secs)).timestamp()
+            for spk_idx in list(open_utts.keys()):
+                if spk_idx not in appeared:
+                    last_end = open_utts[spk_idx]["last_abs_end"]
+                    if now_abs_end - last_end >= eos_silence:
+                        _close_and_emit(spk_idx)
+
+        # flush：收尾所有未關閉的句子
+        for spk_idx in list(open_utts.keys()):
+            _close_and_emit(spk_idx)
+    except KeyboardInterrupt:
+        logger.info("🛑 捕捉到 Ctrl-C，先 flush 未結束句子再退出")
+        flush_all("keyboard")
+        if stop_event: stop_event.set()
+        stop_flag.set()
+    finally:
+        stop_flag.set()
+        rec_thread.join(timeout=1.0)
+        executor.shutdown(wait=True)
+
+    logger.info(
+        "🚩 utter-stream 結束，共 %d 段，耗時 %.3fs → %s",
+        seg_counter, time.perf_counter() - total_start, out_root
+    )
+    return seg_counter
 
 # 兼容舊名稱
 run_pipeline_FILE = run_pipeline_file
 run_pipeline_STREAM = run_pipeline_stream
+run_pipeline_UTTER_STREAM = run_pipeline_utter_stream
 run_pipeline_DIR = run_pipeline_dir
 
 # ───────────────────────── CLI ─────────────────────────
@@ -607,12 +923,18 @@ def main():
     p_dir.add_argument("--truth_map", type=str, default="truth_map.txt")
     p_dir.add_argument("--model", type=str, default=DEFAULT_WHISPER_MODEL)
     p_dir.add_argument("--beam", type=int, default=DEFAULT_WHISPER_BEAM_SIZE)
+    
+    # utter_stream
+    p_utter = sub.add_parser("utter_stream", help="utterance-driven live stream from microphone")
+    p_utter.add_argument("--slice_secs", type=float, default=0.5, help="seconds per slice")
+    p_utter.add_argument("--frames_per_buffer", type=int, default=1024)
+    p_utter.add_argument("--max_workers", type=int, default=2)
 
     args = parser.parse_args()
 
     # 用 CLI 覆蓋 ASR 設定
     # 如果命令行 override 模型，就重新拿一个新的 asr
-    asr = WhisperASR(model_name=args.model, gpu=use_gpu, beam=args.beam)
+    # asr = WhisperASR(model_name=args.model, gpu=use_gpu, beam=args.beam)
 
     if args.mode == "file":
         run_pipeline_file(args.path,
@@ -622,7 +944,10 @@ def main():
         run_pipeline_stream(chunk_secs=args.chunk, max_workers=args.workers, sep=sep, spk=spk, asr=asr)
     elif args.mode == "dir":
         run_pipeline_dir(args.path, truth_map_path=args.truth_map, max_workers=args.workers, sep=sep, spk=spk, asr=asr)
-
+    elif args.mode == "utter_stream":
+        run_pipeline_utter_stream(slice_secs=args.slice_secs,
+                                  frames_per_buffer=args.frames_per_buffer, max_workers=args.max_workers,
+                                  sep=sep, spk=spk, asr=asr)
 
 if __name__ == "__main__":
     main()
