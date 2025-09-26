@@ -1093,12 +1093,17 @@ class AudioSeparator:
                     try:
                         speaker_audio = est_ST[i].contiguous()  # 1D [T]
                         final_tensor = speaker_audio.unsqueeze(0).cpu()  # [1, T]
+                        
+                        # 安全頭房 & 夾限（避免 1.0 邊界/算術誤差導致的 clip）
+                        # final_tensor = torch.clamp(final_tensor * 0.98, -1.0, 1.0)
+                        
                         output_file = os.path.join(
                             output_dir,
                             f"speaker{i+1}.wav"
                             # 若要保留動態檔名可改為：f"speaker{i+1}_{timestamp}_{segment_index}.wav"
                         )
-                        torchaudio.save(output_file, final_tensor, TARGET_RATE, bits_per_sample=16)
+                        print("abs max before save:", float(torch.max(torch.abs(final_tensor))))
+                        torchaudio.save(output_file, final_tensor, TARGET_RATE ,bits_per_sample=16)
 
                         absolute_timestamp = absolute_start_time.timestamp() + start_time
                         results.append((output_file, start_time, start_time + seg_duration, absolute_timestamp))
