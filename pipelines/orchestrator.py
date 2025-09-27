@@ -499,7 +499,10 @@ def run_pipeline_stream(
 
     # 錄音/接收執行緒
     q: queue.Queue[tuple[bytes, int]] = queue.Queue(maxsize=max_workers * 2)
-    stop_flag = threading.Event()
+    
+    # 統一使用外部 stop_event，如果沒提供則創建一個
+    if stop_event is None:
+        stop_event = threading.Event()
 
     def recorder_from_queue():
         BYTES_PER_SAMPLE = 4  # Float32
@@ -517,14 +520,15 @@ def run_pipeline_stream(
         calib_t0 = time.time()
         calib_bytes = 0
 
-        while not stop_flag.is_set():
-            if stop_event and stop_event.is_set():
-                break
+        while not stop_event.is_set():
             try:
-                pkt = in_bytes_queue.get(timeout=0.2)
+                pkt = in_bytes_queue.get(timeout=0.1)  # 縮短等待時間提升響應性
             except queue.Empty:
                 if record_secs is not None and time.time() - start_time >= record_secs:
-                    stop_flag.set()
+                    stop_event.set()  # 統一使用 stop_event
+                    break
+                # 每次 timeout 都檢查停止信號，提升響應性
+                if stop_event.is_set():
                     break
                 continue
 
@@ -570,11 +574,9 @@ def run_pipeline_stream(
         idx = 0
         start_time = time.time()
         try:
-            while not stop_flag.is_set():
-                if stop_event and stop_event.is_set():
-                    break
+            while not stop_event.is_set():
                 if record_secs is not None and time.time() - start_time >= record_secs:
-                    stop_flag.set()
+                    stop_event.set()  # 統一使用 stop_event
                     break
                 buf.extend(stream.read(frames_per_buffer, exception_on_overflow=False))
                 if len(buf) // 2 >= frames_needed:
@@ -605,21 +607,28 @@ def run_pipeline_stream(
             try:
                 raw, idx, src_sr = q.get(timeout=0.1)
             except queue.Empty:
-                if stop_flag.is_set():
+                if stop_event.is_set():
                     break
                 continue
             futures.append(executor.submit(process_chunk, raw, idx, src_sr))
     except KeyboardInterrupt:
         logger.info("🛑 Ctrl‑C 偵測到使用者手動停止")
-        if stop_event:
-            stop_event.set()
-        stop_flag.set()
+        stop_event.set()  # 統一使用 stop_event
     finally:
-        stop_flag.set()
+        stop_event.set()  # 確保停止信號被設置
         rec_thread.join(timeout=1)
         executor.shutdown(wait=True)
 
-    bundle = [f.result() for f in futures if f.done() and f.result()]
+    # 等待所有 Future 完成，確保不丟失任何處理結果
+    bundle = []
+    for f in futures:
+        try:
+            result = f.result()  # 等待 Future 完成
+            if result:
+                bundle.append(result)
+        except Exception as e:
+            logger.error(f"❌ Future 處理失敗: {e}")
+    
     bundle.sort(key=lambda x: x["start"])
 
     pretty_bundle: list[dict] = []
