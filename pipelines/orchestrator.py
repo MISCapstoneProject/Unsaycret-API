@@ -16,6 +16,8 @@ os.environ["KMP_DUPLICATE_LIB_OK"] = "TRUE"
 import torch
 import torchaudio
 import pyaudio  # type: ignore
+import numpy as np
+from scipy.signal import resample_poly
 
 from utils.logger import get_logger
 from utils.constants import DEFAULT_WHISPER_MODEL,DEFAULT_WHISPER_BEAM_SIZE
@@ -156,6 +158,22 @@ def run_pipeline_file(raw_wav: str, max_workers: int = 3, sep=None, spk=None, as
     total_start = time.perf_counter()
 
     waveform, sr = torchaudio.load(raw_wav)
+    
+    # 確保單聲道：如果是多聲道，轉為單聲道（取平均）
+    if waveform.shape[0] > 1:
+        logger.info(f"🔄 多聲道音檔 ({waveform.shape[0]} 聲道) → 單聲道")
+        waveform = torch.mean(waveform, dim=0, keepdim=True)
+    
+    # 如果採樣率不等於16000就重採樣（使用高品質 scipy resample_poly）
+    if sr != 16000:
+        logger.info(f"🔄 採樣率 {sr} ≠ 16000，進行重採樣")
+        # 轉換為 numpy 進行高品質重採樣
+        waveform_np = waveform.cpu().numpy()
+        # 此時已確保是單聲道，直接處理
+        resampled = resample_poly(waveform_np.squeeze(), 16000, sr)
+        waveform = torch.from_numpy(resampled).unsqueeze(0)
+        sr = 16000
+    
     # ← 把 waveform 傳到 separator 設定的裝置 (cuda or cpu)
     waveform = waveform.to(sep.device)
     audio_len = waveform.shape[1] / sr
@@ -354,7 +372,7 @@ def run_pipeline_dir(
 
 # ───────────────────────── Stream Mode ─────────────────────────
 def run_pipeline_stream(
-    chunk_secs: float = 6.0,
+    chunk_secs: float = 4.0,
     rate: int = 16000,
     channels: int = 1,
     frames_per_buffer: int = 1024,
@@ -377,98 +395,166 @@ def run_pipeline_stream(
 
     executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=max_workers)
     futures: list[Future] = []
+    
     # 使用台北時間作為串流開始時間 (UTC+8)
     taipei_tz = timezone(timedelta(hours=8))
     stream_start_time = dt.now(taipei_tz)
 
-    def process_chunk(raw_bytes: bytes, idx: int, chunk_start_time: dt = None):
-        t0 = idx * chunk_secs
-        t1 = t0 + chunk_secs
+    def process_chunk(raw_bytes: bytes, idx: int, src_sr: int, chunk_start_time: dt = None):
+        try:
+            t0 = idx * chunk_secs
+            t1 = t0 + chunk_secs
 
-        waveform = torch.frombuffer(raw_bytes, dtype=torch.int16).float() / 32768.0
-        waveform = waveform.view(1, -1)
+            BYTES_PER_SAMPLE = 4
+            if channels <= 0 or chunk_secs <= 0:
+                raise ValueError(f"invalid channels={channels} or chunk_secs={chunk_secs}")
 
-        seg_dir = out_root / f"segment_{idx:03d}"
-        seg_dir.mkdir(parents=True, exist_ok=True)
-        mix_path = seg_dir / "mix.wav"
-        torchaudio.save(mix_path.as_posix(), waveform, rate)
+            # B) decode & 解交錯 → [C, T]
+            n_samples_total = len(raw_bytes) // (BYTES_PER_SAMPLE * channels)
+            if n_samples_total == 0:
+                logger.warning(f"[proc] idx={idx} empty chunk: bytes={len(raw_bytes)}")
+                return None
 
-        # 計算這個 chunk 的絕對開始時間
-        if chunk_start_time is None:
-            chunk_start_time = stream_start_time + timedelta(seconds=t0)
+            waveform = torch.frombuffer(raw_bytes, dtype=torch.float32)
+            waveform = waveform[: n_samples_total * channels].view(channels, n_samples_total)
+            if channels > 1:
+                waveform = waveform.mean(dim=0, keepdim=True)   # [1, T]
+            # channels==1 時已是 [1, T]，不要再 unsqueeze
 
-        segments = sep.separate_and_save(waveform, seg_dir.as_posix(), segment_index=idx, absolute_start_time=chunk_start_time)
-        speaker_paths = sorted(seg_dir.glob("speaker*.wav"))
-        if not speaker_paths:
-            logger.warning("segment %d 無 speaker wav", idx)
+            # C) 重採樣到 16k 給模型
+            MODEL_SR = 16000
+            wave_for_model = waveform
+            if src_sr != MODEL_SR:
+                wave_for_model = torchaudio.transforms.Resample(orig_freq=src_sr, new_freq=MODEL_SR)(waveform)
+
+            # D) 存兩份混音：一份 48k/44.1k 給耳朵聽（不會變慢），一份 16k 給模型檢查
+            seg_dir = out_root / f"segment_{idx:03d}"
+            seg_dir.mkdir(parents=True, exist_ok=True)
+            torchaudio.save((seg_dir / "mix_playback.wav").as_posix(),
+                            torch.clamp(waveform * 0.98, -1, 1), src_sr)
+            torchaudio.save((seg_dir / "mix_16k.wav").as_posix(),
+                            torch.clamp(wave_for_model * 0.98, -1, 1), MODEL_SR)
+            mix_path = seg_dir / "mix.wav"
+            if chunk_start_time is None:
+                chunk_start_time = stream_start_time + timedelta(seconds=t0)
+
+            # F) 分離（吃 16k）
+            segments = sep.separate_and_save(
+                wave_for_model, seg_dir.as_posix(), segment_index=idx, absolute_start_time=chunk_start_time
+            )
+
+            speaker_paths = sorted(seg_dir.glob("speaker*.wav"))
+            if not speaker_paths:
+                logger.warning("segment %d 無 speaker wav", idx)
+                return None
+
+            # --- G) 跑 SpkID + ASR
+            speaker_results: list[dict] = []
+            for sp_idx, wav_path in enumerate(speaker_paths, 1):
+                if segments and len(segments) > sp_idx - 1 and len(segments[sp_idx - 1]) == 4:
+                    absolute_timestamp = segments[sp_idx - 1][3]
+                    res = process_segment(
+                        str(wav_path), t0, t1, absolute_timestamp,
+                        sep=sep, spk=spk, asr=asr
+                    )
+                else:
+                    res = process_segment(
+                        str(wav_path), t0, t1,
+                        sep=sep, spk=spk, asr=asr
+                    )
+
+                if not res["text"].strip() or res["confidence"] < 0.1:
+                    continue
+                res["speaker_index"] = sp_idx
+                speaker_results.append(res)
+
+            # 去重：同 speaker 留最高信心
+            unique: dict[str, dict] = {}
+            for item in speaker_results:
+                n = item["speaker"]
+                if n not in unique or item["confidence"] > unique[n]["confidence"]:
+                    unique[n] = item
+            speaker_results = list(unique.values())
+
+            seg_dict = {
+                "segment": idx,
+                "start": round(t0, 2),
+                "end": round(t1, 2),
+                "mix": mix_path.as_posix(),
+                "sources": [str(p) for p in speaker_paths],
+                "speakers": speaker_results,
+            }
+
+            with open(seg_dir / "output.json", "w", encoding="utf-8") as f:
+                json.dump(seg_dict, f, ensure_ascii=False, indent=2)
+
+            if queue_out is not None:
+                queue_out.put(seg_dict)
+            return seg_dict
+
+        except Exception as e:
+            logger.exception(f"[process_chunk] idx={idx} failed: {e}")
             return None
 
-        speaker_results: list[dict] = []
-        for sp_idx, wav_path in enumerate(speaker_paths, 1):
-            # 如果 segments 包含絕對時間戳，傳遞給 process_segment
-            if segments and len(segments) > sp_idx - 1 and len(segments[sp_idx - 1]) == 4:
-                absolute_timestamp = segments[sp_idx - 1][3]
-                res = process_segment(str(wav_path), t0, t1, absolute_timestamp,
-                                    sep=sep, spk=spk, asr=asr)
-            else:
-                res = process_segment(str(wav_path), t0, t1,
-                                    sep=sep, spk=spk, asr=asr)
-
-            if not res["text"].strip() or res["confidence"] < 0.1:
-                continue
-            res["speaker_index"] = sp_idx
-            speaker_results.append(res)
-
-
-        # 去重：同 speaker 留最高信心
-        unique: dict[str, dict] = {}
-        for item in speaker_results:
-            n = item["speaker"]
-            if n not in unique or item["confidence"] > unique[n]["confidence"]:
-                unique[n] = item
-        speaker_results = list(unique.values())
- 
-        seg_dict = {
-            "segment": idx,
-            "start": round(t0, 2),
-            "end": round(t1, 2),
-            "mix": mix_path.as_posix(),
-            "sources": [str(p) for p in speaker_paths],
-            "speakers": speaker_results,
-        }
-
-        with open(seg_dir / "output.json", "w", encoding="utf-8") as f:
-            json.dump(seg_dict, f, ensure_ascii=False, indent=2)
-
-        if queue_out is not None:
-            queue_out.put(seg_dict)
-        return seg_dict
 
     # 錄音/接收執行緒
     q: queue.Queue[tuple[bytes, int]] = queue.Queue(maxsize=max_workers * 2)
     stop_flag = threading.Event()
 
     def recorder_from_queue():
-        frames_needed = int(rate * chunk_secs) * 2  # bytes
+        BYTES_PER_SAMPLE = 4  # Float32
+        ch = max(1, int(channels))
+
         buf = bytearray()
         idx = 0
         start_time = time.time()
+
+        # 先用參數當暫值；進線 0.3s 後用「牆鐘時間 + 累積 bytes」校準
+        provisional_sr = max(1, int(rate))
+        frames_needed = int(provisional_sr * chunk_secs) * BYTES_PER_SAMPLE * ch
+
+        calibrated = False
+        calib_t0 = time.time()
+        calib_bytes = 0
+
         while not stop_flag.is_set():
             if stop_event and stop_event.is_set():
                 break
             try:
-                pkt = in_bytes_queue.get(timeout=0.1)
+                pkt = in_bytes_queue.get(timeout=0.2)
             except queue.Empty:
                 if record_secs is not None and time.time() - start_time >= record_secs:
                     stop_flag.set()
                     break
                 continue
+
+            calib_bytes += len(pkt)    # 用來估計來源 sr
             buf.extend(pkt)
+
+            # ===== 首包校準：用 bytes/sec 估計真實來源 sr，一次到位 =====
+            if not calibrated:
+                elapsed = max(1e-3, time.time() - calib_t0)
+                if elapsed >= 0.30 and calib_bytes >= BYTES_PER_SAMPLE * ch * 4000:  # 至少 ~0.25s@16k 的量
+                    bps = calib_bytes / elapsed
+                    est_sr = bps / (BYTES_PER_SAMPLE * ch)   # ≈ 真實 sr
+                    # 就近對齊到常見取樣率
+                    candidates = [48000, 44100, 32000, 24000, 22050, 16000]
+                    src_sr = min(candidates, key=lambda s: abs(s - est_sr))
+                    frames_needed = int(src_sr * chunk_secs) * BYTES_PER_SAMPLE * ch
+                    calibrated = True
+                    logger.info(f"[calib] est≈{est_sr:.1f} → use {src_sr}, ch={ch}, frames_needed={frames_needed}")
+
+            # ===== 切塊：校準完成後才切，確保每塊恰好是 chunk_secs 的「真實時間」 =====
+            if not calibrated:
+                continue  # 等校準完成再切，避免一開始就用錯的 16k 尺寸
+
             while len(buf) >= frames_needed:
                 raw = bytes(buf[:frames_needed])
-                buf = buf[frames_needed:]
-                q.put((raw, idx))
+                del buf[:frames_needed]
+                # 把「校準得到的來源 sr」一併傳下去
+                q.put((raw, idx, src_sr))
                 idx += 1
+
 
     def recorder_from_mic():
         pa = pyaudio.PyAudio()
@@ -517,12 +603,12 @@ def run_pipeline_stream(
             if stop_event and stop_event.is_set():
                 break
             try:
-                raw, idx = q.get(timeout=0.1)
+                raw, idx, src_sr = q.get(timeout=0.1)
             except queue.Empty:
                 if stop_flag.is_set():
                     break
                 continue
-            futures.append(executor.submit(process_chunk, raw, idx))
+            futures.append(executor.submit(process_chunk, raw, idx, src_sr))
     except KeyboardInterrupt:
         logger.info("🛑 Ctrl‑C 偵測到使用者手動停止")
         if stop_event:
@@ -570,8 +656,8 @@ def main():
 
     # stream
     p_stream = sub.add_parser("stream", help="live stream from microphone")
-    p_stream.add_argument("--chunk", type=float, default=6.0, help="seconds per chunk")
-    p_stream.add_argument("--workers", type=int, default=2)
+    p_stream.add_argument("--chunk", type=float, default=4.0, help="seconds per chunk")
+    p_stream.add_argument("--workers", type=int, default=2) 
     p_stream.add_argument("--record_secs", type=float, default=18.0,
                           help="total recording time in seconds (None for infinite)")
     p_stream.add_argument("--model", type=str, default=DEFAULT_WHISPER_MODEL)

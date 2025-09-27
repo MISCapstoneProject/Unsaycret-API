@@ -17,7 +17,7 @@ WHISPER_MODEL_CACHE_DIR = "models/faster-whisper"
 # 預設模型配置 (經過測試的穩定版本)
 DEFAULT_WHISPER_MODEL = "medium"
 DEFAULT_WHISPER_BEAM_SIZE = 5
-DEFAULT_SEPARATION_MODEL = "sepformer_3speaker"
+DEFAULT_SEPARATION_MODEL = "sepformer_2speaker"
 
 # 模型名稱常數 (固定的 HuggingFace 模型ID)
 # 如想更改語者辨識模型，要去 modules/identification/VID_identify_v5.py 改設置
@@ -36,7 +36,7 @@ WHISPER_MODEL_MAP = {
 }
 
 # WebSocket 處理參數
-WEBSOCKET_CHUNK_SECS = 6
+WEBSOCKET_CHUNK_SECS = 4
 WEBSOCKET_TIMEOUT = 0.05
 WEBSOCKET_MAX_WORKERS = 2
 
@@ -44,7 +44,7 @@ WEBSOCKET_MAX_WORKERS = 2
 AUDIO_MIN_ENERGY_THRESHOLD = 0.001
 AUDIO_MAX_BUFFER_MINUTES = 5
 AUDIO_CHUNK_SIZE = 1024
-AUDIO_WINDOW_SIZE = 6
+AUDIO_WINDOW_SIZE = 4
 AUDIO_OVERLAP = 0.5
 
 # 音訊分離處理參數 (RSS_3_v1)
