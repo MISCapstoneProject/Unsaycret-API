@@ -386,7 +386,7 @@ class DatabaseService:
             results = (
                 self.client.collections.get(self.SPEAKER_CLASS)
                 .query.fetch_objects(
-                    where=Filter.by_property("speaker_id").equal(speaker_id),
+                    filters=Filter.by_property("speaker_id").equal(speaker_id),
                     limit=1
                 )
             )
@@ -1653,7 +1653,7 @@ class DatabaseService:
                 results = (
                     self.client.collections.get(self.SESSION_CLASS)
                     .query.fetch_objects(
-                        where=Filter.by_property("session_id").equal(session_id),
+                        filters=Filter.by_property("session_id").equal(session_id),
                         limit=1,
                         return_references=QueryReference(link_on="participants", return_properties=["uuid"])
                     )
@@ -1716,7 +1716,7 @@ class DatabaseService:
                 results = (
                     self.client.collections.get(self.SESSION_CLASS)
                     .query.fetch_objects(
-                        where=Filter.by_property("session_id").equal(session_id),
+                        filters=Filter.by_property("session_id").equal(session_id),
                         limit=1
                     )
                 )
@@ -1793,7 +1793,7 @@ class DatabaseService:
                 results = (
                     self.client.collections.get(self.SESSION_CLASS)
                     .query.fetch_objects(
-                        where=Filter.by_property("session_id").equal(session_id),
+                        filters=Filter.by_property("session_id").equal(session_id),
                         limit=1
                     )
                 )
@@ -2175,27 +2175,22 @@ class DatabaseService:
             list: SessionInfo 列表
         """
         try:
-            # 查詢 participants 陣列包含該 speaker_id 的 Session
-            sessions = self.client.collections.get(self.SESSION_CLASS).query.fetch_objects(
-                where=weaviate.classes.query.Filter.by_property("participants").contains_any([speaker_id])
-            )
+            # 由於 Weaviate v4 引用查詢語法複雜，暫時使用獲取所有 Session 然後篩選的方法
+            all_sessions = self.list_sessions()
             
+            # 篩選出包含指定 Speaker 的 Session
             result = []
-            for obj in sessions.objects:
-                session_info = {
-                    "uuid": str(obj.uuid),
-                    "session_id": obj.properties.get("session_id"),
-                    "session_type": obj.properties.get("session_type"),
-                    "title": obj.properties.get("title"),
-                    "start_time": obj.properties.get("start_time"),
-                    "end_time": obj.properties.get("end_time"),
-                    "summary": obj.properties.get("summary"),
-                    "participants": obj.properties.get("participants", [])
-                }
-                result.append(session_info)
+            for session in all_sessions:
+                participants = session.get("participants", [])
+                if speaker_id in participants:
+                    result.append(session)
             
             logger.info(f"找到 {len(result)} 個 Session 包含 Speaker {speaker_id}")
             return result
+            
+        except Exception as e:
+            logger.error(f"查詢 Speaker 的 Session 時發生錯誤: {e}")
+            return []
             
         except Exception as e:
             logger.error(f"查詢 Speaker 的 Session 時發生錯誤: {e}")
