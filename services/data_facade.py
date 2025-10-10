@@ -402,6 +402,99 @@ class DataFacade:
                 detail=f"伺服器內部錯誤：{str(e)}"
             )
     
+    def create_speaker_with_voice(
+        self,
+        audio_file_path: str,
+        full_name: Optional[str] = None,
+        nickname: Optional[str] = None,
+        gender: Optional[str] = None
+    ) -> Dict[str, Any]:
+        """
+        手動建立新語者並加入聲紋特徵
+        
+        Args:
+            audio_file_path: 音檔的暫存路徑
+            full_name: 語者全名，若為None則自動生成
+            nickname: 語者暱稱
+            gender: 語者性別
+            
+        Returns:
+            Dict[str, Any]: 包含建立結果的字典
+            
+        Raises:
+            HTTPException: 當操作失敗時拋出相應的 HTTP 異常
+        """
+        try:
+            # 1. 驗證音檔是否存在
+            import os
+            if not os.path.exists(audio_file_path):
+                raise HTTPException(status_code=400, detail="音檔不存在")
+            
+            # 2. 提取聲紋特徵
+            logger.info(f"開始提取音檔聲紋特徵: {audio_file_path}")
+            embedding = self.audio_processor.extract_embedding(audio_file_path)
+            if embedding is None:
+                raise HTTPException(status_code=400, detail="無法從音檔提取聲紋特徵，請確認音檔品質")
+            
+            # 3. 建立新語者
+            logger.info(f"建立新語者: full_name={full_name}, nickname={nickname}, gender={gender}")
+            speaker_uuid = self.database.create_speaker(
+                full_name=full_name,
+                nickname=nickname,
+                gender=gender,
+                first_audio=os.path.basename(audio_file_path)
+            )
+            
+            if not speaker_uuid:
+                raise HTTPException(status_code=500, detail="建立語者失敗")
+            
+            # 4. 建立聲紋記錄
+            logger.info(f"為語者 {speaker_uuid} 建立聲紋記錄")
+            voiceprint_uuid = self.database.create_voiceprint(
+                speaker_uuid=speaker_uuid,
+                embedding=embedding,
+                audio_source=os.path.basename(audio_file_path)
+            )
+            
+            if not voiceprint_uuid:
+                # 如果聲紋建立失敗，回滾語者建立
+                try:
+                    self.database.delete_speaker(speaker_uuid)
+                except Exception:
+                    pass  # 忽略回滾錯誤
+                raise HTTPException(status_code=500, detail="建立聲紋失敗")
+            
+            # 5. 獲取完整的語者資訊
+            speaker_obj = self.database.get_speaker(speaker_uuid)
+            if not speaker_obj:
+                raise HTTPException(status_code=500, detail="無法獲取新建立的語者資訊")
+            
+            props = speaker_obj.properties
+            logger.info(f"成功建立語者 {speaker_uuid} 及聲紋 {voiceprint_uuid}")
+            
+            return {
+                "success": True,
+                "message": f"成功建立語者 '{props.get('full_name')}' 並加入聲紋特徵",
+                "data": {
+                    "speaker_uuid": speaker_uuid,
+                    "speaker_id": props.get('speaker_id'),
+                    "full_name": props.get('full_name'),
+                    "nickname": props.get('nickname'),
+                    "gender": props.get('gender'),
+                    "voiceprint_uuid": voiceprint_uuid,
+                    "voiceprint_count": 1
+                }
+            }
+            
+        except HTTPException:
+            raise
+        except Exception as e:
+            logger.error(f"建立語者時發生未預期錯誤：{str(e)}")
+            raise HTTPException(
+                status_code=500, 
+                detail=f"建立語者失敗：{str(e)}"
+            )
+
     def verify_speaker_voice(
         self, 
         audio_file_path: str,

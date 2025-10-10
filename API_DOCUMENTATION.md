@@ -14,6 +14,7 @@
 
 ### 🔧 語者操作 API (Speaker Actions)
 - `POST /speakers/verify` - 語音驗證識別
+- `POST /speakers/create` - 手動建立語者（上傳音檔建檔）
 - `POST /speakers/transfer` - 聲紋轉移
 
 ### 📅 會議管理 API (Sessions)
@@ -191,7 +192,41 @@
 }
 ```
 
-#### 3.2 聲紋轉移
+#### 3.2 手動建立語者
+
+**端點**: `POST /speakers/create`
+
+**功能**: 上傳音檔手動建立新語者並建檔（10秒錄音建檔）
+
+**請求格式**: `multipart/form-data`
+- **file** (required): 語者音檔（WAV 格式）
+- **full_name** (required): 語者全名（最多50字元）
+- **nickname** (optional): 語者暱稱（最多30字元）
+- **gender** (optional): 語者性別（不限制選項，可填任何值）
+
+**回應格式**:
+```json
+{
+  "success": true,
+  "message": "成功建立語者 '王小明' 並加入聲紋特徵",
+  "data": {
+    "speaker_uuid": "speaker-uuid",
+    "speaker_id": 15,
+    "full_name": "王小明",
+    "nickname": "小明",
+    "gender": "男性",
+    "voiceprint_uuid": "voiceprint-uuid",
+    "voiceprint_count": 1
+  }
+}
+```
+
+**使用場景**:
+- 前端用戶想要快速建立新語者檔案
+- 避免透過即時錄音功能來新增語者
+- 專門用於手動建檔的短音檔（建議10秒左右）
+
+#### 3.3 聲紋轉移
 
 **端點**: `POST /speakers/transfer`
 

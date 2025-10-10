@@ -123,6 +123,16 @@ class SpeakerUpdateRequest(BaseModel):
     meet_count: Optional[int] = None
     meet_days: Optional[int] = None
 
+class SpeakerCreateResponse(BaseModel):
+    """手動建立語者的回應模型"""
+    speaker_uuid: str
+    speaker_id: int
+    full_name: str
+    nickname: Optional[str] = None
+    gender: Optional[str] = None
+    voiceprint_uuid: str
+    voiceprint_count: int
+
 class ApiResponse(BaseModel):
     """統一API回應模型"""
     success: bool
@@ -890,6 +900,67 @@ async def transfer_voiceprints(request: SpeakerTransferRequest):
         target_speaker_name=request.target_speaker_name
     )
     return ApiResponse(**result)
+
+@app.post("/speakers/create", response_model=ApiResponse)
+async def create_speaker_with_voice(
+    file: UploadFile = File(...),
+    full_name: str = Form(...),  # 必填
+    nickname: Optional[str] = Form(None),
+    gender: Optional[str] = Form(None)
+):
+    """手動建立語者 - 上傳音檔並建立新語者檔案"""
+    # 1. 驗證檔案類型（僅支援 WAV）
+    if not file.filename or not file.filename.lower().endswith('.wav'):
+        raise HTTPException(
+            status_code=400, 
+            detail="不支援的音檔格式，請使用 WAV 格式"
+        )
+    
+    # 2. 驗證全名（必填且不能為空）
+    if not full_name or not full_name.strip():
+        raise HTTPException(
+            status_code=400, 
+            detail="語者全名為必填欄位，不能為空"
+        )
+    
+    if len(full_name.strip()) > 50:
+        raise HTTPException(
+            status_code=400, 
+            detail="語者全名不能超過50個字元"
+        )
+    
+    # 3. 驗證暱稱長度（選填）
+    if nickname and len(nickname.strip()) > 30:
+        raise HTTPException(
+            status_code=400, 
+            detail="語者暱稱不能超過30個字元"
+        )
+    
+    # 4. 性別不做限制，可以是任何值或空值
+    # 4. 性別不做限制，可以是任何值或空值
+    
+    # 5. 儲存暫存檔案
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+        shutil.copyfileobj(file.file, tmp_file)
+        tmp_path = tmp_file.name
+    
+    try:
+        # 6. 執行建立語者邏輯
+        result = data_facade.create_speaker_with_voice(
+            audio_file_path=tmp_path,
+            full_name=full_name.strip(),  # 必填，已驗證不為空
+            nickname=nickname.strip() if nickname else None,
+            gender=gender.strip() if gender else None
+        )
+        
+        return ApiResponse(**result)
+        
+    finally:
+        # 7. 清理暫存檔案
+        try:
+            os.remove(tmp_path)
+        except:
+            pass  # 忽略刪除暫存檔案的錯誤
 
 # ----------------------------------------------------------------------------
 # Nested Resource APIs - 巢狀資源查詢
