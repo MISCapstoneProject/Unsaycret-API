@@ -12,11 +12,14 @@ from typing import Optional, List
 from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
 import asyncio, threading, queue, json
-from datetime import datetime
+import numpy as np
+from datetime import datetime as dt, timezone, timedelta
 from pipelines.orchestrator import (
     run_pipeline_FILE,
     run_pipeline_STREAM,
     run_pipeline_DIR,
+    init_pipeline_modules,
+    process_segment
 )
 from services.data_facade import DataFacade
 import tempfile, shutil, os, zipfile
@@ -144,7 +147,7 @@ async def health_check():
     return {
         "status": "healthy",
         "message": "Unsaycret API is running",
-        "timestamp": datetime.now().isoformat()
+        "timestamp": dt.now().isoformat()
     }
 
 # ----------------------------------------------------------------------------
@@ -383,75 +386,132 @@ async def transcribe_dir(path: str = Form(None), zip_file: UploadFile = File(Non
 
 @app.websocket("/ws/stream")
 async def ws_stream(ws: WebSocket):
-    """WebSocket即時語音處理"""
-    raw_q = queue.Queue()   # 前端上送的音訊
-    result_q = queue.Queue()   # 後端要推給前端的結果
+    """WebSocket 即時語音處理（VAD 驅動斷句）"""
+    raw_q = queue.Queue()
+    result_q = queue.Queue()
     stop_evt = threading.Event()
     backend_thread = None
 
-    # 讀取並驗證 Session UUID
     session_uuid = ws.query_params.get("session")
     if not session_uuid or not UUID_PATTERN.match(session_uuid):
         await ws.close(code=1008, reason="Missing or invalid session UUID")
         return
 
-    # 取得 Session 既有參與者
     session_info = data_facade.get_session_info(session_uuid) or {}
     session_participants = set(session_info.get("participants") or [])
 
     try:
         await ws.accept()
 
-        # ---------------- 背景 thread ---------------- #
+        # 🆕 初始化模組與 VAD 狀態
+        sep, spk, asr, _ = init_pipeline_modules()
+        sep.reset_streaming_state(
+            silence_threshold=0.8,
+            max_buffer_duration=15.0,
+            vad_threshold=0.02
+        )
+
+        # 背景處理執行緒
         def backend():
             try:
-                run_pipeline_STREAM(
-                    chunk_secs=WEBSOCKET_CHUNK_SECS,
-                    max_workers=API_MAX_WORKERS,
-                    record_secs=None,
-                    in_bytes_queue=raw_q,   # ← 改成讀前端送來的 bytes
-                    queue_out=result_q,     # ★ 把結果塞進 result_q
-                    stop_event=stop_evt,
+                chunk_idx = 0
+                while not stop_evt.is_set():
+                    try:
+                        raw_bytes = raw_q.get(timeout=0.1)
+                    except queue.Empty:
+                        continue
+                    
+                    # 轉為 numpy
+                    audio_data = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
+                    
+                    # VAD 驅動處理
+                    results = sep.process_audio_chunk_streaming(
+                        audio_chunk=audio_data,
+                        output_dir="stream_output/websocket",
+                        absolute_time=dt.now(timezone(timedelta(hours=8)))
+                    )
+                    
+                    # 如果有結果（觸發了斷句）
+                    if results:
+                        speaker_results = []
+                        for path, start_rel, end_rel, abs_ts in results:
+                            try:
+                                res = process_segment(
+                                    str(path), start_rel, end_rel, abs_ts,
+                                    sep=sep, spk=spk, asr=asr
+                                )
+                                
+                                if res["text"].strip() and res["confidence"] >= 0.1:
+                                    speaker_results.append(res)
+                            except Exception as e:
+                                logger.error(f"處理音檔失敗: {e}")
+                        
+                        if speaker_results:
+                            seg_dict = {
+                                "chunk": chunk_idx,
+                                "timestamp": dt.now(timezone(timedelta(hours=8))).isoformat(),
+                                "speakers": speaker_results
+                            }
+                            result_q.put(seg_dict)
+                    
+                    chunk_idx += 1
+                
+                # 🆕 處理剩餘緩衝區
+                final_results = sep.force_process_buffer(
+                    output_dir="stream_output/websocket",
+                    absolute_time=dt.now(timezone(timedelta(hours=8)))
                 )
+                
+                if final_results:
+                    speaker_results = []
+                    for path, start_rel, end_rel, abs_ts in final_results:
+                        try:
+                            res = process_segment(str(path), start_rel, end_rel, abs_ts,
+                                                sep=sep, spk=spk, asr=asr)
+                            if res["text"].strip() and res["confidence"] >= 0.1:
+                                speaker_results.append(res)
+                        except Exception as e:
+                            logger.error(f"處理最終音檔失敗: {e}")
+                    
+                    if speaker_results:
+                        result_q.put({
+                            "chunk": "final",
+                            "timestamp": dt.now(timezone(timedelta(hours=8))).isoformat(),
+                            "speakers": speaker_results
+                        })
+                
             except Exception as e:
-                logger.error(f"WebSocket背景處理發生錯誤: {e}")
+                logger.error(f"背景處理錯誤: {e}")
             finally:
-                result_q.put(None)          # 通知主線程「我結束了」
+                result_q.put(None)
 
         backend_thread = threading.Thread(target=backend, daemon=True)
         backend_thread.start()
 
-        # -------------- 主收/發 loop -------------- #
+        # 主收發 loop
         processing_complete = False
         
         while True:
-            # 1) 處理後端產生的結果
+            # 處理後端結果
             try:
-                # 使用較短的超時時間，避免阻塞太久
                 seg = result_q.get(timeout=0.1)
                 
-                if seg is None:          # backend 完成
+                if seg is None:
                     processing_complete = True
                     logger.info("pipeline 處理完成")
                     break
 
-                logger.info(f"收到 pipeline 結果: segment {seg.get('segment', 'N/A')}")
+                logger.info(f"收到 pipeline 結果: chunk {seg.get('chunk', 'N/A')}")
 
-                # 儲存 SpeechLog 並更新 Session 參與者
-                speechlog_created = False
+                # 儲存 SpeechLog
                 for sp in seg.get("speakers", []):
                     speaker_id = sp.get("speaker_id")
                     if speaker_id:
-                        # 使用語音分離的絕對時間戳
-                        absolute_start_time = sp.get("absolute_start_time")
-                        start_time = seg.get("start", 0)
-                        end_time = seg.get("end", 0)
-                        
                         sl_req = SpeechLogCreateRequest(
                             content=sp.get("text"),
                             confidence=sp.get("confidence"),
-                            timestamp=absolute_start_time,
-                            duration=(end_time - start_time),
+                            timestamp=sp.get("absolute_start_time"),
+                            duration=(sp.get("end", 0) - sp.get("start", 0)),
                             speaker=speaker_id,
                             session=session_uuid,
                         )
@@ -459,12 +519,9 @@ async def ws_stream(ws: WebSocket):
                         try:
                             result = data_facade.create_speechlog(sl_req)
                             if result.get("success"):
-                                logger.info(f"成功建立 SpeechLog: {speaker_id} - {sp.get('text', 'N/A')}")
-                                speechlog_created = True
-                            else:
-                                logger.error(f"建立 SpeechLog 失敗: {result.get('message')}")
+                                logger.info(f"成功建立 SpeechLog: {speaker_id}")
                         except Exception as e:
-                            logger.error(f"建立 SpeechLog 時發生錯誤: {e}")
+                            logger.error(f"建立 SpeechLog 錯誤: {e}")
 
                         if speaker_id not in session_participants:
                             session_participants.add(speaker_id)
@@ -473,34 +530,27 @@ async def ws_stream(ws: WebSocket):
                                     session_uuid,
                                     {"participants": list(session_participants)},
                                 )
-                                logger.info(f"更新 Session 參與者: {speaker_id}")
                             except Exception as e:
                                 logger.error(f"更新 Session 參與者失敗: {e}")
-
-                if not speechlog_created and seg.get("speakers"):
-                    logger.warning(f"segment {seg.get('segment')} 未能建立任何 SpeechLog")
 
                 await ws.send_text(json.dumps(seg, ensure_ascii=False))
                 
             except queue.Empty:
-                # 佇列為空，檢查是否還有音訊資料要處理
                 pass
             except Exception as e:
-                logger.error(f"處理 pipeline 結果時發生錯誤: {e}")
+                logger.error(f"處理 pipeline 結果錯誤: {e}")
 
-            # 2) 接收前端的音訊資料
+            # 接收前端音訊
             try:
                 data = await asyncio.wait_for(ws.receive(), timeout=0.1)
                 
                 if "bytes" in data:
-                    raw_q.put(data["bytes"])                 # 給後端
+                    raw_q.put(data["bytes"])
                 elif "text" in data and data["text"] == "stop":
                     logger.info("收到停止信號")
                     stop_evt.set()
-                    # 不要立即 break，等待 pipeline 完成處理
                     
             except asyncio.TimeoutError:
-                # 檢查是否應該結束
                 if stop_evt.is_set() and processing_complete:
                     break
                 continue
@@ -508,11 +558,11 @@ async def ws_stream(ws: WebSocket):
                 logger.info("客戶端主動斷線")
                 break
             except Exception as e:
-                logger.warning(f"接收訊息時發生錯誤: {e}")
+                logger.warning(f"接收訊息錯誤: {e}")
                 break
-                
-        # 確保處理完所有剩餘結果
-        logger.info("主迴圈結束，檢查是否有剩餘結果...")
+        
+        # 處理剩餘結果
+        logger.info("主迴圈結束，檢查剩餘結果...")
         remaining_results = 0
         try:
             while True:
@@ -520,31 +570,23 @@ async def ws_stream(ws: WebSocket):
                 if seg is None:
                     break
                 remaining_results += 1
-                logger.info(f"處理剩餘結果 {remaining_results}: segment {seg.get('segment', 'N/A')}")
                 
-                # 處理剩餘的 SpeechLog
                 for sp in seg.get("speakers", []):
                     speaker_id = sp.get("speaker_id")
                     if speaker_id:
-                        absolute_start_time = sp.get("absolute_start_time")
-                        start_time = seg.get("start", 0)
-                        end_time = seg.get("end", 0)
-                        
                         sl_req = SpeechLogCreateRequest(
                             content=sp.get("text"),
                             confidence=sp.get("confidence"),
-                            timestamp=absolute_start_time,
-                            duration=(end_time - start_time),
+                            timestamp=sp.get("absolute_start_time"),
+                            duration=(sp.get("end", 0) - sp.get("start", 0)),
                             speaker=speaker_id,
                             session=session_uuid,
                         )
                         
                         try:
-                            result = data_facade.create_speechlog(sl_req)
-                            if result.get("success"):
-                                logger.info(f"建立剩餘 SpeechLog: {speaker_id} - {sp.get('text', 'N/A')}")
+                            data_facade.create_speechlog(sl_req)
                         except Exception as e:
-                            logger.error(f"建立剩餘 SpeechLog 時發生錯誤: {e}")
+                            logger.error(f"建立剩餘 SpeechLog 錯誤: {e}")
         except queue.Empty:
             pass
         
@@ -552,42 +594,33 @@ async def ws_stream(ws: WebSocket):
             logger.info(f"處理了 {remaining_results} 個剩餘結果")
 
     except WebSocketDisconnect:
-        logger.info("WebSocket客戶端斷線")
+        logger.info("WebSocket 客戶端斷線")
     except Exception as e:
-        logger.error(f"WebSocket處理發生錯誤: {e}")
+        logger.error(f"WebSocket 處理錯誤: {e}")
     finally:
-        # 確保資源清理
         stop_evt.set()
         
-        # 等待背景線程結束
         if backend_thread and backend_thread.is_alive():
-            backend_thread.join(timeout=5)  # 最多等5秒
-            
+            backend_thread.join(timeout=5)
+        
         # 清空佇列
         try:
             while not raw_q.empty():
                 raw_q.get_nowait()
-        except:
-            pass
-            
-        try:
             while not result_q.empty():
                 result_q.get_nowait()
         except:
             pass
         
-        # WebSocket 連線結束時自動更新 Session 時間範圍
+        # 更新 Session 時間範圍
         try:
-            logger.info(f"WebSocket 連線結束，開始重新計算 Session {session_uuid} 的時間範圍")
+            logger.info(f"更新 Session {session_uuid} 時間範圍")
             result = data_facade.recalculate_session_timerange(session_uuid)
             if result.get("success"):
-                logger.info(f"Session {session_uuid} 時間範圍更新成功")
-            else:
-                logger.warning(f"Session {session_uuid} 時間範圍更新失敗: {result.get('message')}")
+                logger.info(f"Session 時間範圍更新成功")
         except Exception as e:
-            logger.error(f"WebSocket 結束時更新 Session 時間範圍失敗: {e}")
+            logger.error(f"更新 Session 時間範圍失敗: {e}")
         
-        # 關閉WebSocket連接
         try:
             await ws.close()
         except:

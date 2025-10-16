@@ -57,7 +57,6 @@ def init_pipeline_modules():
     logger.info(f"🚀 使用設備: {'cuda:' + str(current_cuda_device) if use_gpu else 'cpu'}")
 
     sep = AudioSeparator()
-    if USE_DIARIZATION_STREAMING: sep.reset_streaming_state(slice_len=4.0, cut_margin=0.5, ema=0.1)
     spk = SpeakerIdentifier()
     asr = WhisperASR(model_name=DEFAULT_WHISPER_MODEL, gpu=use_gpu, beam=DEFAULT_WHISPER_BEAM_SIZE)
 
@@ -122,10 +121,56 @@ def process_segment(seg_path: str, t0: float, t1: float, absolute_timestamp: flo
     # 如果有絕對時間戳，加入到結果中
     if absolute_timestamp is not None:
         result["absolute_timestamp"] = absolute_timestamp
-        # 使用台北時間戳轉換 (UTC+8)
         taipei_tz = timezone(timedelta(hours=8))
         result["absolute_start_time"] = dt.fromtimestamp(absolute_timestamp, tz=taipei_tz).isoformat()
         result["absolute_end_time"] = dt.fromtimestamp(absolute_timestamp + (t1 - t0), tz=taipei_tz).isoformat()
+    
+    # 🆕 更新 output.json（加入 ASR 結果）
+    try:
+        segment_dir = os.path.dirname(seg_path)
+        json_path = os.path.join(segment_dir, "output.json")
+        
+        if os.path.exists(json_path):
+            # 讀取現有 metadata
+            with open(json_path, "r", encoding="utf-8") as f:
+                segment_meta = json.load(f)
+            
+            # 🆕 加入 ASR 和識別結果
+            segment_meta.update({
+                "speaker_id": speaker_id,
+                "speaker_name": name,
+                "speaker_distance": round(float(dist), 3),
+                "transcription": {
+                    "text": text,
+                    "confidence": round(conf, 2),
+                    "language": "zh",  # 可以從 ASR 取得
+                    "words": [
+                        {
+                            "word": w["word"],
+                            "start": round(w["start"], 3),
+                            "end": round(w["end"], 3),
+                            "probability": round(w.get("probability", 0.0), 3)
+                        }
+                        for w in adjusted_words
+                    ]
+                },
+                "processing_time": {
+                    "speaker_id_seconds": round(spk_time, 3),
+                    "asr_seconds": round(asr_time, 3),
+                    "total_seconds": round(total, 3)
+                }
+            })
+            
+            # 寫回檔案
+            with open(json_path, "w", encoding="utf-8") as f:
+                json.dump(segment_meta, f, ensure_ascii=False, indent=2)
+            
+            logger.debug(f"已更新 {json_path} 加入 ASR 結果")
+        else:
+            logger.warning(f"找不到 output.json: {json_path}")
+            
+    except Exception as e:
+        logger.error(f"更新 output.json 失敗: {e}")
     
     return result
 
@@ -373,7 +418,7 @@ def run_pipeline_dir(
 
 # ───────────────────────── Stream Mode ─────────────────────────
 def run_pipeline_stream(
-    chunk_secs: float = 4.0,
+    chunk_secs: float = None,
     rate: int = 16000,
     channels: int = 1,
     frames_per_buffer: int = 1024,
@@ -390,6 +435,13 @@ def run_pipeline_stream(
     if sep is None or spk is None or asr is None:
         sep, spk, asr, _ = init_pipeline_modules()
 
+    # 初始化 VAD 驅動的串流狀態
+    sep.reset_streaming_state(
+        silence_threshold=2,      # 靜音 0.8 秒觸發處理
+        max_buffer_duration=15.0,   # 最長 15 秒強制處理
+        vad_threshold=0.02          # VAD 能量閾值
+    )
+    
     total_start = time.perf_counter()
     out_root = Path("stream_output") / dt.now().strftime("%Y%m%d_%H%M%S")
     out_root.mkdir(parents=True, exist_ok=True)
@@ -400,98 +452,79 @@ def run_pipeline_stream(
     taipei_tz = timezone(timedelta(hours=8))
     stream_start_time = dt.now(taipei_tz)
 
-    def process_chunk(raw_bytes: bytes, idx: int, chunk_start_time: dt = None):
-        t0 = idx * chunk_secs
-        t1 = t0 + chunk_secs
+    all_results = []  # 累積所有處理結果
 
-        waveform = torch.frombuffer(raw_bytes, dtype=torch.int16).float() / 32768.0
-        waveform = waveform.view(1, -1)
-
-        seg_dir = out_root / f"segment_{idx:03d}"
-        seg_dir.mkdir(parents=True, exist_ok=True)
-        mix_path = seg_dir / "mix.wav"
-        torchaudio.save(mix_path.as_posix(), waveform, rate)
-
-        # 計算這個 chunk 的絕對開始時間
-        if chunk_start_time is None:
-            chunk_start_time = stream_start_time + timedelta(seconds=t0)
-
-        if USE_DIARIZATION_STREAMING:
-            segments = sep._diarize_and_save_streaming(waveform, seg_dir.as_posix(), segment_index=idx, absolute_start_time=chunk_start_time)
-        else:
-            segments = sep.separate_and_save(waveform, seg_dir.as_posix(), segment_index=idx, absolute_start_time=chunk_start_time)
+    def process_chunk_vad(raw_bytes: bytes, chunk_idx: int, chunk_time: dt):
+        """處理單個音訊 chunk（VAD 驅動）"""
+        audio_data = np.frombuffer(raw_bytes, dtype=np.int16).astype(np.float32) / 32768.0
         
-        speaker_paths = sorted(seg_dir.glob("speaker*.wav"))
-        if not speaker_paths:
-            logger.warning("segment %d 無 speaker wav", idx)
-            return None
+        # 呼叫 VAD 驅動的處理方法
+        results = sep.process_audio_chunk_streaming(
+            audio_chunk=audio_data,
+            output_dir=str(out_root),
+            absolute_time=chunk_time
+        )
+        
+        # 如果觸發了處理（有結果）
+        if results:
+            speaker_results = []
+            for path, start_rel, end_rel, abs_ts in results:
+                try:
+                    # 🆕 讀取對應的 output.json
+                    segment_dir = os.path.dirname(path)
+                    json_path = os.path.join(segment_dir, "output.json")
+                    
+                    segment_meta = {}
+                    if os.path.exists(json_path):
+                        with open(json_path, "r", encoding="utf-8") as f:
+                            segment_meta = json.load(f)
+                    
+                    # 執行 Speaker ID + ASR
+                    res = process_segment(
+                        str(path), 
+                        start_rel, 
+                        end_rel, 
+                        abs_ts,
+                        sep=sep, spk=spk, asr=asr
+                    )
+                    
+                    if res["text"].strip() and res["confidence"] >= 0.1:
+                        # 🆕 合併 metadata
+                        res.update({
+                            "segment_index": segment_meta.get("segment_index"),
+                            "speaker_label": segment_meta.get("speaker_label"),
+                            "audio_file": os.path.basename(path),
+                            "segment_dir": os.path.basename(segment_dir),
+                        })
+                        speaker_results.append(res)
+                        
+                except Exception as e:
+                    logger.error(f"處理音檔 {path} 失敗: {e}")
+            
+            # 去重（同 speaker 保留最高信心）
+            unique = {}
+            for item in speaker_results:
+                name = item["speaker"]
+                if name not in unique or item["confidence"] > unique[name]["confidence"]:
+                    unique[name] = item
+            
+            if unique:
+                seg_dict = {
+                    "chunk_index": chunk_idx,
+                    "timestamp": chunk_time.isoformat(),
+                    "speakers": list(unique.values()),
+                }
+                
+                if queue_out is not None:
+                    queue_out.put(seg_dict)
+                
+                return seg_dict
+        
+        return None
 
-        speaker_results: list[dict] = []
-        for sp_idx, wav_path in enumerate(speaker_paths, 1):
-            # 如果 segments 包含絕對時間戳，傳遞給 process_segment
-            if segments and len(segments) > sp_idx - 1 and len(segments[sp_idx - 1]) == 4:
-                absolute_timestamp = segments[sp_idx - 1][3]
-                res = process_segment(str(wav_path), t0, t1, absolute_timestamp,
-                                    sep=sep, spk=spk, asr=asr)
-            else:
-                res = process_segment(str(wav_path), t0, t1,
-                                    sep=sep, spk=spk, asr=asr)
-
-            if not res["text"].strip() or res["confidence"] < 0.1:
-                continue
-            res["speaker_index"] = sp_idx
-            speaker_results.append(res)
-
-
-        # 去重：同 speaker 留最高信心
-        unique: dict[str, dict] = {}
-        for item in speaker_results:
-            n = item["speaker"]
-            if n not in unique or item["confidence"] > unique[n]["confidence"]:
-                unique[n] = item
-        speaker_results = list(unique.values())
- 
-        seg_dict = {
-            "segment": idx,
-            "start": round(t0, 2),
-            "end": round(t1, 2),
-            "mix": mix_path.as_posix(),
-            "sources": [str(p) for p in speaker_paths],
-            "speakers": speaker_results,
-        }
-
-        with open(seg_dir / "output.json", "w", encoding="utf-8") as f:
-            json.dump(seg_dict, f, ensure_ascii=False, indent=2)
-
-        if queue_out is not None:
-            queue_out.put(seg_dict)
-        return seg_dict
-
-    # 錄音/接收執行緒
-    q: queue.Queue[tuple[bytes, int]] = queue.Queue(maxsize=max_workers * 2)
+    # 錄音執行緒（逐 chunk 處理）
+    q = queue.Queue(maxsize=max_workers * 2)
     stop_flag = threading.Event()
-
-    def recorder_from_queue():
-        frames_needed = int(rate * chunk_secs) * 2  # bytes
-        buf = bytearray()
-        idx = 0
-        start_time = time.time()
-        while not stop_flag.is_set():
-            if stop_event and stop_event.is_set():
-                break
-            try:
-                pkt = in_bytes_queue.get(timeout=0.1)
-            except queue.Empty:
-                if record_secs is not None and time.time() - start_time >= record_secs:
-                    stop_flag.set()
-                    break
-                continue
-            buf.extend(pkt)
-            while len(buf) >= frames_needed:
-                raw = bytes(buf[:frames_needed])
-                buf = buf[frames_needed:]
-                q.put((raw, idx))
-                idx += 1
 
     def recorder_from_mic():
         pa = pyaudio.PyAudio()
@@ -502,10 +535,10 @@ def run_pipeline_stream(
             input=True,
             frames_per_buffer=frames_per_buffer,
         )
-        frames_needed = int(rate * chunk_secs)
-        buf = bytearray()
-        idx = 0
+        
+        chunk_idx = 0
         start_time = time.time()
+        
         try:
             while not stop_flag.is_set():
                 if stop_event and stop_event.is_set():
@@ -513,62 +546,91 @@ def run_pipeline_stream(
                 if record_secs is not None and time.time() - start_time >= record_secs:
                     stop_flag.set()
                     break
-                buf.extend(stream.read(frames_per_buffer, exception_on_overflow=False))
-                if len(buf) // 2 >= frames_needed:
-                    raw = bytes(buf[: frames_needed * 2])
-                    buf = buf[frames_needed * 2 :]
-                    q.put((raw, idx))
-                    idx += 1
+                
+                raw = stream.read(frames_per_buffer, exception_on_overflow=False)
+                chunk_time = dt.now(taipei_tz)
+                q.put((raw, chunk_idx, chunk_time))
+                chunk_idx += 1
+                
         finally:
             stream.stop_stream()
             stream.close()
             pa.terminate()
 
-    rec_thread = threading.Thread(
-        target=recorder_from_queue if in_bytes_queue else recorder_from_mic,
-        daemon=True,
-    )
+    rec_thread = threading.Thread(target=recorder_from_mic, daemon=True)
     rec_thread.start()
 
-    logger.info(
-        "🎙 開始錄音/接收 (%s) ...",
-        "外部 bytes" if in_bytes_queue else ("Ctrl‑C" if record_secs is None else f"{record_secs}s"),
-    )
+    logger.info("🎙 開始錄音（VAD 驅動斷句模式）...")
 
     try:
         while True:
             if stop_event and stop_event.is_set():
                 break
             try:
-                raw, idx = q.get(timeout=0.1)
+                raw, idx, chunk_time = q.get(timeout=0.1)
             except queue.Empty:
                 if stop_flag.is_set():
                     break
                 continue
-            futures.append(executor.submit(process_chunk, raw, idx))
+            
+            result = process_chunk_vad(raw, idx, chunk_time)
+            if result:
+                all_results.append(result)
+                
     except KeyboardInterrupt:
-        logger.info("🛑 Ctrl‑C 偵測到使用者手動停止")
+        logger.info("🛑 Ctrl-C 偵測到使用者手動停止")
         if stop_event:
             stop_event.set()
         stop_flag.set()
     finally:
         stop_flag.set()
         rec_thread.join(timeout=1)
-        executor.shutdown(wait=True)
+        
+        # 🆕 強制處理剩餘緩衝區
+        logger.info("處理剩餘緩衝區...")
+        final_results = sep.force_process_buffer(
+            output_dir=str(out_root),
+            absolute_time=dt.now(taipei_tz)
+        )
 
-    bundle = [f.result() for f in futures if f.done() and f.result()]
-    bundle.sort(key=lambda x: x["start"])
-
-    pretty_bundle: list[dict] = []
-    for seg in bundle:
-        for sp in seg["speakers"]:
-            pretty_bundle.append(make_pretty(sp))
-
+        if final_results:
+            speaker_results = []
+            for path, start_rel, end_rel, abs_ts in final_results:
+                try:
+                    # 🆕 讀取並更新 output.json
+                    segment_dir = os.path.dirname(path)
+                    json_path = os.path.join(segment_dir, "output.json")
+                    
+                    res = process_segment(str(path), start_rel, end_rel, abs_ts,
+                                        sep=sep, spk=spk, asr=asr)
+                    
+                    if res["text"].strip() and res["confidence"] >= 0.1:
+                        speaker_results.append(res)
+                        
+                except Exception as e:
+                    logger.error(f"處理最終音檔 {path} 失敗: {e}")
+            
+            if speaker_results:
+                final_dict = {
+                    "chunk_index": "final",
+                    "timestamp": dt.now(taipei_tz).isoformat(),
+                    "speakers": speaker_results,
+                }
+                all_results.append(final_dict)
+                if queue_out is not None:
+                    queue_out.put(final_dict)
+    
     logger.info(
-        "🚩 stream 結束，共 %d 段，耗時 %.3fs → %s",
-        len(bundle), time.perf_counter() - total_start, out_root
+        f"串流結束，共處理 {len(all_results)} 個片段，耗時 {time.perf_counter() - total_start:.3f}s → {out_root}"
     )
-    return bundle, pretty_bundle
+    
+    # 生成統一格式的回傳
+    pretty_bundle = []
+    for result in all_results:
+        for sp in result.get("speakers", []):
+            pretty_bundle.append(make_pretty(sp))
+    
+    return all_results, pretty_bundle
 
 
 # 兼容舊名稱
