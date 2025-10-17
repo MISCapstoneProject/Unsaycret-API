@@ -372,7 +372,7 @@ def run_pipeline_dir(
 
 # ───────────────────────── Stream Mode ─────────────────────────
 def run_pipeline_stream(
-    chunk_secs: float = 4.0,
+    chunk_secs: float = 6.0,
     rate: int = 16000,
     channels: int = 1,
     frames_per_buffer: int = 1024,
@@ -665,7 +665,7 @@ def main():
 
     # stream
     p_stream = sub.add_parser("stream", help="live stream from microphone")
-    p_stream.add_argument("--chunk", type=float, default=4.0, help="seconds per chunk")
+    p_stream.add_argument("--chunk", type=float, default=6.0, help="seconds per chunk")
     p_stream.add_argument("--workers", type=int, default=2) 
     p_stream.add_argument("--record_secs", type=float, default=18.0,
                           help="total recording time in seconds (None for infinite)")

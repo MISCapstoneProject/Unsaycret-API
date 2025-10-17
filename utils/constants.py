@@ -5,8 +5,8 @@
 
 # 語者識別閾值 (演算法核心參數，經過實驗調校)
 THRESHOLD_LOW = 0.1      # 低於此閾值表示過於相似，不更新向量
-THRESHOLD_UPDATE = 0.28   # 低於此閾值更新向量，進行加權平均，高於此閾值則新增一筆聲紋至同一語者
-THRESHOLD_NEW = 0.38     # 超過此值視為新語者
+THRESHOLD_UPDATE = 0.31   # 低於此閾值更新向量，進行加權平均，高於此閾值則新增一筆聲紋至同一語者
+THRESHOLD_NEW = 0.4     # 超過此值視為新語者
 
 # 音訊處理固定參數 (技術規格要求)
 AUDIO_SAMPLE_RATE = 16000    # SpeechBrain 模型要求的取樣率
@@ -36,7 +36,7 @@ WHISPER_MODEL_MAP = {
 }
 
 # WebSocket 處理參數
-WEBSOCKET_CHUNK_SECS = 4
+WEBSOCKET_CHUNK_SECS = 6
 WEBSOCKET_TIMEOUT = 0.05
 WEBSOCKET_MAX_WORKERS = 2
 
@@ -44,7 +44,7 @@ WEBSOCKET_MAX_WORKERS = 2
 AUDIO_MIN_ENERGY_THRESHOLD = 0.001
 AUDIO_MAX_BUFFER_MINUTES = 5
 AUDIO_CHUNK_SIZE = 1024
-AUDIO_WINDOW_SIZE = 4
+AUDIO_WINDOW_SIZE = 6
 AUDIO_OVERLAP = 0.5
 
 # 音訊分離處理參數 (RSS_3_v1)

@@ -9,6 +9,15 @@ import torchaudio
 from .asr_model import load_model
 from .text_utils import merge_char_to_word
 
+
+# ==== simplified -> Traditional (TW) support ====
+try:
+    from opencc import OpenCC
+    _OPENCC = OpenCC('s2twp') # Simplified Chinese to Traditional Chinese (Taiwan Standard)
+except ImportError:
+    _OPENCC = None
+    
+    
 logger = get_logger(__name__)
 
 class WhisperASR:
@@ -34,6 +43,7 @@ class WhisperASR:
         
         device_str = "cuda" if self.gpu else "cpu"
         logger.info(f"🧠 Whisper running on device: {device_str} (model: {model_name})")
+        self.cc = _OPENCC
 
     def transcribe(self, wav_path: str) -> tuple[str, float, list[dict]]:
         """
@@ -84,6 +94,19 @@ class WhisperASR:
 
         # Clear GPU cache to avoid fragmentation
         torch.cuda.empty_cache()
+        
+        # ---- Global Simplified to Traditional conversion ----
+        do_conv = (self.cc is not None) and (
+            self.lang in (None, "zh", "auto") or str(self.lang).startswith("zh")
+        )
+        
+        if do_conv:
+            if full_txt:
+                full_txt = self.cc.convert(full_txt)
+                if word_info:
+                    for wi in word_info:
+                        if "word" in wi and isinstance(wi["word"], str):
+                            wi["word"] = self.cc.convert(wi["word"])
 
         self.last_infer_time = infer_end - infer_start
         self.last_total_time = time.perf_counter() - total_start
