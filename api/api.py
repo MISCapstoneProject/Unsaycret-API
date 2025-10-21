@@ -123,6 +123,16 @@ class SpeakerUpdateRequest(BaseModel):
     meet_count: Optional[int] = None
     meet_days: Optional[int] = None
 
+class SpeakerCreateResponse(BaseModel):
+    """手動建立語者的回應模型"""
+    speaker_uuid: str
+    speaker_id: int
+    full_name: str
+    nickname: Optional[str] = None
+    gender: Optional[str] = None
+    voiceprint_uuid: str
+    voiceprint_count: int
+
 class ApiResponse(BaseModel):
     """統一API回應模型"""
     success: bool
@@ -381,217 +391,393 @@ async def transcribe_dir(path: str = Form(None), zip_file: UploadFile = File(Non
 
     return {"summary_tsv": summary_path}
 
+# ============================================================================
+# 即時串流 WebSocket API - 詳細註釋版本
+# 根據 realtime_stream_new_protocol.md 規格實作
+# ============================================================================
+
 @app.websocket("/ws/stream")
 async def ws_stream(ws: WebSocket):
-    """WebSocket即時語音處理"""
-    raw_q = queue.Queue()   # 前端上送的音訊
-    result_q = queue.Queue()   # 後端要推給前端的結果
-    stop_evt = threading.Event()
-    backend_thread = None
-
-    # 讀取並驗證 Session UUID
+    """
+    WebSocket 即時語音處理 - 雙向通訊
+    
+    📝 功能說明:
+    - 前端持續發送音訊片段
+    - 後端即時轉換成文字並識別語者
+    - 自動儲存 SpeechLog 到資料庫
+    - 更新 Session 參與者清單
+    
+    🔄 訊息格式規格:
+    前端 → 後端:
+    - WebSocket bytes: 原始音訊 bytes 資料
+    - WebSocket text: "stop" (停止信號)
+    
+    後端 → 前端:
+    - {"type": "subtitle", "segmentId": "seg_1", "speakerId": "uuid", "speakerName": "n1", "distance": 0.2, "text": "今天心情很好", "isFinal": true}
+    """
+    
+    # ========== 初始化階段 ==========
+    logger.info("開始 WebSocket 連線建立程序")
+    
+    # 建立雙向通訊佇列
+    raw_q = queue.Queue()       # 📥 前端→後端: 儲存音訊片段等待處理
+    result_q = queue.Queue()    # 📤 後端→前端: 儲存轉錄結果等待發送
+    stop_evt = threading.Event()  # 🛑 停止信號: 協調主線程與背景線程
+    backend_thread = None       # 🔧 背景處理線程引用
+    
+    # ========== Session 驗證階段 ==========
+    logger.info("驗證 Session UUID")
     session_uuid = ws.query_params.get("session")
     if not session_uuid or not UUID_PATTERN.match(session_uuid):
+        logger.error(f"Session UUID 無效或缺失: {session_uuid}")
         await ws.close(code=1008, reason="Missing or invalid session UUID")
         return
-
-    # 取得 Session 既有參與者
+    
+    logger.info(f"Session UUID 驗證通過: {session_uuid}")
+    
+    # ========== Session 參與者管理初始化 ==========
+    logger.info("載入 Session 既有參與者清單")
     session_info = data_facade.get_session_info(session_uuid) or {}
     session_participants = set(session_info.get("participants") or [])
+    logger.info(f"既有參與者數量: {len(session_participants)}")
 
     try:
+        # ========== WebSocket 連線建立 ==========
         await ws.accept()
+        logger.info(f"✅ WebSocket 連線成功建立: {session_uuid}")
 
-        # ---------------- 背景 thread ---------------- #
+        # ========== 背景處理線程啟動 ==========
         def backend():
+            """
+            🔧 背景處理線程 - 負責音訊轉文字的核心工作
+            
+            工作流程:
+            1. 從 raw_q 讀取音訊片段
+            2. 執行 STT (語音轉文字) 處理
+            3. 執行語者辨識 (Speaker Identification)
+            4. 將結果放入 result_q 供主線程發送
+            5. 收到停止信號時優雅結束
+            """
+            logger.info("🚀 背景處理線程啟動")
             try:
                 run_pipeline_STREAM(
-                    chunk_secs=WEBSOCKET_CHUNK_SECS,
-                    max_workers=API_MAX_WORKERS,
-                    record_secs=None,
-                    in_bytes_queue=raw_q,   # ← 改成讀前端送來的 bytes
-                    queue_out=result_q,     # ★ 把結果塞進 result_q
-                    stop_event=stop_evt,
+                    chunk_secs=WEBSOCKET_CHUNK_SECS,        # 音訊切片長度
+                    max_workers=API_MAX_WORKERS,             # 最大併發處理數
+                    in_bytes_queue=raw_q,                    # 📥 輸入: 音訊佇列
+                    queue_out=result_q,                      # 📤 輸出: 結果佇列
+                    stop_event=stop_evt,                     # 🛑 停止信號
                 )
+                logger.info("✅ STT pipeline 正常結束")
             except Exception as e:
-                logger.error(f"WebSocket背景處理發生錯誤: {e}")
+                logger.error(f"❌ STT pipeline 發生錯誤: {e}")
             finally:
-                result_q.put(None)          # 通知主線程「我結束了」
+                # 🏁 無論成功或失敗都要通知主線程結束
+                result_q.put(None)
+                logger.info("📡 已發送結束信號給主線程")
 
+        # 啟動背景處理線程
         backend_thread = threading.Thread(target=backend, daemon=True)
         backend_thread.start()
+        logger.info("🔄 背景處理線程已啟動")
 
-        # -------------- 主收/發 loop -------------- #
-        processing_complete = False
-        
+        # 處理狀態標誌
+        processing_complete = False  # 📊 追蹤背景處理是否完成
+        frontend_connected = True    # 📡 追蹤前端連線狀態
+        websocket_broken = False     # 🔌 WebSocket 連線是否已斷開
+
+        # ========== 主處理迴圈 - 雙向通訊核心 ==========
+        logger.info("🔄 進入主處理迴圈 - 開始雙向通訊")
         while True:
-            # 1) 處理後端產生的結果
+            
+            # ========== 步驟 1: 處理背景結果 (字幕發送) ==========
             try:
-                # 使用較短的超時時間，避免阻塞太久
+                # 📥 從結果佇列取得處理完的語音片段 (短暫等待避免阻塞)
                 seg = result_q.get(timeout=0.1)
-                
-                if seg is None:          # backend 完成
+
+                # 🏁 檢查是否為結束信號
+                if seg is None:
                     processing_complete = True
-                    logger.info("pipeline 處理完成")
+                    logger.info("✅ 背景處理完全結束，準備關閉連線")
                     break
 
-                logger.info(f"收到 pipeline 結果: segment {seg.get('segment', 'N/A')}")
+                segment_id = seg.get('segment', 'unknown')
+                logger.info(f"📝 收到新的轉錄結果: segment {segment_id}")
 
-                # 儲存 SpeechLog 並更新 Session 參與者
+                # ========== 資料庫儲存階段 (SpeechLog 管理) ==========
+                logger.info(f"💾 開始處理 segment {segment_id} 的資料庫儲存")
                 speechlog_created = False
-                for sp in seg.get("speakers", []):
+                
+                # 遍歷此音訊片段中的所有識別到的語者
+                speakers = seg.get("speakers", [])
+                logger.info(f"👥 此片段識別到 {len(speakers)} 個語者")
+                
+                for speaker_idx, sp in enumerate(speakers):
                     speaker_id = sp.get("speaker_id")
-                    if speaker_id:
-                        # 使用語音分離的絕對時間戳
+                    speaker_text = sp.get("text", "")
+                    
+                    if speaker_id and speaker_text.strip():
+                        logger.info(f"🗣️  處理語者 {speaker_idx + 1}: {speaker_id}")
+                        
+                        # 📅 時間戳處理 - 使用絕對時間而非相對時間
                         absolute_start_time = sp.get("absolute_start_time")
                         start_time = seg.get("start", 0)
                         end_time = seg.get("end", 0)
+                        duration = end_time - start_time
                         
+                        logger.info(f"⏰ 時間資訊: {absolute_start_time}, 長度: {duration:.2f}秒")
+                        
+                        # 🏗️  建立 SpeechLog 記錄
                         sl_req = SpeechLogCreateRequest(
-                            content=sp.get("text"),
+                            content=speaker_text,
                             confidence=sp.get("confidence"),
                             timestamp=absolute_start_time,
-                            duration=(end_time - start_time),
+                            duration=duration,
                             speaker=speaker_id,
                             session=session_uuid,
                         )
                         
+                        # 💾 嘗試儲存到資料庫
                         try:
                             result = data_facade.create_speechlog(sl_req)
                             if result.get("success"):
-                                logger.info(f"成功建立 SpeechLog: {speaker_id} - {sp.get('text', 'N/A')}")
+                                logger.info(f"✅ SpeechLog 儲存成功: {speaker_id} - \"{speaker_text[:50]}...\"")
                                 speechlog_created = True
                             else:
-                                logger.error(f"建立 SpeechLog 失敗: {result.get('message')}")
+                                logger.error(f"❌ SpeechLog 儲存失敗: {result.get('message')}")
                         except Exception as e:
-                            logger.error(f"建立 SpeechLog 時發生錯誤: {e}")
+                            logger.error(f"💥 SpeechLog 儲存異常: {e}")
 
+                        # 👥 Session 參與者管理 - 新語者自動加入
                         if speaker_id not in session_participants:
+                            logger.info(f"🆕 發現新參與者: {speaker_id}")
                             session_participants.add(speaker_id)
                             try:
                                 data_facade.update_session(
                                     session_uuid,
                                     {"participants": list(session_participants)},
                                 )
-                                logger.info(f"更新 Session 參與者: {speaker_id}")
+                                logger.info(f"✅ Session 參與者更新成功: {speaker_id}")
                             except Exception as e:
-                                logger.error(f"更新 Session 參與者失敗: {e}")
+                                logger.error(f"❌ Session 參與者更新失敗: {e}")
+                    else:
+                        logger.debug(f"⏭️  跳過空白語者資料: speaker_id={speaker_id}, text=\"{speaker_text}\"")
 
-                if not speechlog_created and seg.get("speakers"):
-                    logger.warning(f"segment {seg.get('segment')} 未能建立任何 SpeechLog")
+                # 📊 儲存結果統計
+                if not speechlog_created and speakers:
+                    logger.warning(f"⚠️  segment {segment_id} 有語者資料但未能儲存任何 SpeechLog")
+                elif speechlog_created:
+                    logger.info(f"📊 segment {segment_id} 成功儲存 SpeechLog")
 
-                await ws.send_text(json.dumps(seg, ensure_ascii=False))
+                # ========== 前端通訊階段 (多語者 subtitle 格式) ==========
+                # 📡 根據 realtime_stream_new_protocol.md 規格轉換格式
+                logger.info(f"📡 準備發送 subtitle 訊息給前端")
                 
-            except queue.Empty:
-                # 佇列為空，檢查是否還有音訊資料要處理
-                pass
-            except Exception as e:
-                logger.error(f"處理 pipeline 結果時發生錯誤: {e}")
-
-            # 2) 接收前端的音訊資料
-            try:
-                data = await asyncio.wait_for(ws.receive(), timeout=0.1)
+                # 🎯 為每個語者發送獨立的字幕訊息
+                # 📋 說明：每個語者都會收到獨立的字幕訊息，前端可以選擇如何顯示
+                speakers = seg.get("speakers", [])
+                total_speakers = len(speakers)
                 
-                if "bytes" in data:
-                    raw_q.put(data["bytes"])                 # 給後端
-                elif "text" in data and data["text"] == "stop":
-                    logger.info("收到停止信號")
-                    stop_evt.set()
-                    # 不要立即 break，等待 pipeline 完成處理
+                if speakers and frontend_connected:
+                    logger.info(f"👥 此片段有 {total_speakers} 個語者，將分別發送字幕")
                     
-            except asyncio.TimeoutError:
-                # 檢查是否應該結束
-                if stop_evt.is_set() and processing_complete:
-                    break
-                continue
-            except WebSocketDisconnect:
-                logger.info("客戶端主動斷線")
-                break
-            except Exception as e:
-                logger.warning(f"接收訊息時發生錯誤: {e}")
-                break
-                
-        # 確保處理完所有剩餘結果
-        logger.info("主迴圈結束，檢查是否有剩餘結果...")
-        remaining_results = 0
-        try:
-            while True:
-                seg = result_q.get_nowait()
-                if seg is None:
-                    break
-                remaining_results += 1
-                logger.info(f"處理剩餘結果 {remaining_results}: segment {seg.get('segment', 'N/A')}")
-                
-                # 處理剩餘的 SpeechLog
-                for sp in seg.get("speakers", []):
-                    speaker_id = sp.get("speaker_id")
-                    if speaker_id:
-                        absolute_start_time = sp.get("absolute_start_time")
-                        start_time = seg.get("start", 0)
-                        end_time = seg.get("end", 0)
-                        
-                        sl_req = SpeechLogCreateRequest(
-                            content=sp.get("text"),
-                            confidence=sp.get("confidence"),
-                            timestamp=absolute_start_time,
-                            duration=(end_time - start_time),
-                            speaker=speaker_id,
-                            session=session_uuid,
-                        )
-                        
-                        try:
-                            result = data_facade.create_speechlog(sl_req)
-                            if result.get("success"):
-                                logger.info(f"建立剩餘 SpeechLog: {speaker_id} - {sp.get('text', 'N/A')}")
-                        except Exception as e:
-                            logger.error(f"建立剩餘 SpeechLog 時發生錯誤: {e}")
-        except queue.Empty:
-            pass
-        
-        if remaining_results > 0:
-            logger.info(f"處理了 {remaining_results} 個剩餘結果")
+                    for speaker_idx, speaker in enumerate(speakers):
+                        # 只發送有文字內容的語者
+                        if not speaker.get("text", "").strip():
+                            logger.debug(f"⏭️  跳過空白文字的語者: {speaker.get('speaker_id', 'unknown')}")
+                            continue
+                            
+                        # 🏗️  組裝標準 subtitle 訊息格式 (含完整時間資訊)
+                        subtitle_msg = {
+                            "type": "subtitle",                                    # 🏷️  訊息類型標識
+                            "segmentId": seg.get("segment", "unknown"),           # 🆔 片段唯一識別碼
+                            "speakerId": speaker.get("speaker_id", "unknown"),    # 👤 語者 UUID
+                            "speakerName": speaker.get("speaker", "Unknown"),     # 📛 語者顯示名稱
+                            "distance": speaker.get("distance", None),           # 📏 識別信心距離
+                            "text": speaker.get("text", ""),                     # 💬 轉錄文字內容
+                            "confidence": speaker.get("confidence", None),       # 🎯 ASR 信心度
+                            "startTime": speaker.get("start", None),             # ⏰ 語者開始時間 (相對)
+                            "endTime": speaker.get("end", None),                 # ⏰ 語者結束時間 (相對)
+                            "absoluteStartTime": speaker.get("absolute_start_time", None),  # 📅 絕對開始時間
+                            "absoluteEndTime": speaker.get("absolute_end_time", None),      # 📅 絕對結束時間
+                            "isFinal": True,                                      # ✅ 串流模式都是最終版本
+                            "segment": {                                          # � 片段資訊
+                                "totalSpeakers": total_speakers,                 # 👥 此片段總語者數
+                                "speakerIndex": speaker_idx,                     # 📍 當前語者在片段中的索引
+                                "segmentStart": seg.get("start", None),          # ⏰ 片段開始時間
+                                "segmentEnd": seg.get("end", None)               # ⏰ 片段結束時間
+                            }
+                        }
 
+                        # 📤 發送 JSON 訊息給前端
+                        try:
+                            await ws.send_text(json.dumps(subtitle_msg, ensure_ascii=False))
+                            logger.info(f"✅ 已發送字幕 [{speaker_idx+1}/{total_speakers}]: segment={segment_id}, speaker={speaker.get('speaker_id', 'unknown')}, text=\"{speaker.get('text', '')[:30]}...\"")
+                        except Exception as send_error:
+                            logger.warning(f"⚠️  發送字幕時發生錯誤: {send_error}")
+                            frontend_connected = False  # 標記前端已斷線
+                            break  # 停止發送剩餘字幕
+                
+                elif not speakers:
+                    logger.warning(f"⚠️  segment {segment_id} 沒有識別到任何語者")
+                elif not frontend_connected:
+                    logger.info(f"📝 前端已斷線，僅儲存不發送: segment={segment_id}")
+
+            except queue.Empty:
+                # 😴 結果佇列暫時為空，繼續等待
+                pass
+
+            # ========== 步驟 2: 接收前端訊息 (音訊輸入處理) ==========
+            # 🔌 如果 WebSocket 已斷開，跳過接收步驟，只處理剩餘結果
+            if websocket_broken:
+                continue
+                
+            try:
+                # 📥 等待前端發送訊息 (原始 bytes/text 格式，增加超時時間避免錯過信號)
+                msg = await asyncio.wait_for(ws.receive(), timeout=0.5)
+
+                mtype = msg.get("type")
+                if mtype == "websocket.receive":
+                    t = msg.get("text")
+                    b = msg.get("bytes")
+
+                    # 先處理文字，確保 "stop" 不會被 bytes 分支吃掉
+                    if t is not None:
+                        logger.info(f"📝 收到文字訊息: {t!r}")
+                        if t == "stop":
+                            logger.info("🛑 收到停止信號，開始優雅關閉")
+                            stop_evt.set()
+                            # 喚醒 pipeline（若有可能在 raw_q.get() 阻塞）
+                            try:
+                                raw_q.put_nowait(b"")  # 或 None，依你的 pipeline 規格
+                            except Exception:
+                                pass
+                            frontend_connected = False
+                            # 回 ACK，讓前端知道收到
+                            try:
+                                await ws.send_text(json.dumps({"type": "status", "event": "stopping"}))
+                            except Exception:
+                                pass
+
+                    elif b is not None:
+                        if len(b) == 0:
+                            logger.debug("🔕 空 bytes（可能哨兵），忽略")
+                        else:
+                            raw_q.put(b)
+                            logger.debug(f"🎤 收到音訊片段: {len(b)} bytes")
+
+                    else:
+                        logger.warning(f"❓ websocket.receive 但 text/bytes 皆為 None: {msg}")
+
+                elif mtype == "websocket.disconnect":
+                    code = msg.get("code")
+                    logger.info(f"🔌 客戶端斷線，code={code}")
+                    frontend_connected = False
+                    websocket_broken = True
+                    stop_evt.set()
+
+                else:
+                    logger.warning(f"❓ 未知訊息: {msg}")
+
+            except asyncio.TimeoutError:
+                # 😴 前端暫時沒有發送資料 - 檢查是否該結束
+                if processing_complete:
+                    # ✅ 背景處理已完成，可以安全結束
+                    logger.info("🏁 背景處理完成，準備結束 WebSocket 連線")
+                    break
+                elif stop_evt.is_set():
+                    # ⏳ 已收到停止信號，但背景處理尚未完成，繼續等待
+                    logger.info("⏳ 已收到停止信號，等待背景處理完成中...")
+                    # 檢查結果佇列是否還有資料
+                    queue_size = result_q.qsize()
+                    if queue_size > 0:
+                        logger.info(f"📊 結果佇列還有 {queue_size} 個待處理項目")
+                # 否則繼續等待
+                continue
+                
+            except WebSocketDisconnect:
+                # 🔌 前端主動斷線 - 但不立即結束，先完成背景處理
+                logger.info("🔌 前端主動斷線，但繼續完成背景處理以避免資料遺失")
+                frontend_connected = False  # 標記前端已斷線
+                websocket_broken = True     # 標記 WebSocket 已斷開
+                stop_evt.set()  # 通知背景線程停止接收新音訊
+                # 不 break，讓主循環繼續處理 result_q 中的剩餘結果
+                
+            except Exception as e:
+                # 💥 前端通訊錯誤 - 檢查是否為斷線相關錯誤
+                error_msg = str(e)
+                if "disconnect" in error_msg.lower() or "receive" in error_msg.lower():
+                    # 🔌 斷線相關錯誤，標記前端已斷線
+                    logger.info("🔌 檢測到前端斷線，停止接收新音訊")
+                    frontend_connected = False
+                    websocket_broken = True
+                    stop_evt.set()
+                else:
+                    # 💥 其他通訊錯誤
+                    logger.warning(f"💥 前端通訊錯誤: {e}")
+                    stop_evt.set()  # 停止接收新音訊，但完成已有的處理
+
+
+                    # 否則繼續等待
+                continue
+
+        # ========== 最後檢查 - 僅作為調試驗證 ==========
+        logger.info("🔍 主循環結束，驗證佇列狀態")
+        try:
+            remaining_result = result_q.get_nowait()
+            if remaining_result is not None:
+                logger.warning(f"⚠️  發現未處理的結果，這可能表示程式邏輯有問題: {remaining_result.get('segment', 'unknown')}")
+                # 不處理，只記錄警告
+            else:
+                logger.debug("佇列中只有結束信號，正常")
+        except queue.Empty:
+            logger.info("✅ 結果佇列已清空，正常結束")
+        
+        logger.info("主循環處理完畢")
+
+    # ========== 異常處理區塊 ==========
     except WebSocketDisconnect:
-        logger.info("WebSocket客戶端斷線")
+        logger.info("🔌 WebSocket 客戶端主動斷線")
     except Exception as e:
-        logger.error(f"WebSocket處理發生錯誤: {e}")
+        logger.error(f"💥 WebSocket 處理過程發生未預期錯誤: {e}")
+        
+    # ========== 資源清理階段 (無論成功或失敗都會執行) ==========
     finally:
-        # 確保資源清理
+        logger.info("🧹 開始資源清理程序")
+        
+        # 🛑 確保停止信號被設置 (防止背景線程繼續運行)
         stop_evt.set()
+        logger.info("📡 已設置停止信號")
         
-        # 等待背景線程結束
+        # ⏳ 等待背景線程優雅結束
         if backend_thread and backend_thread.is_alive():
-            backend_thread.join(timeout=5)  # 最多等5秒
-            
-        # 清空佇列
+            logger.info("⏳ 等待背景處理線程結束...")
+            backend_thread.join(timeout=5)  # 最多等待 5 秒
+            if backend_thread.is_alive():
+                logger.warning("⚠️  背景線程未在時限內結束")
+            else:
+                logger.info("✅ 背景處理線程已正常結束")
+
+        # 📅 Session 時間範圍自動更新 (重要！)
+        logger.info("📅 開始更新 Session 時間範圍")
         try:
-            while not raw_q.empty():
-                raw_q.get_nowait()
-        except:
-            pass
-            
-        try:
-            while not result_q.empty():
-                result_q.get_nowait()
-        except:
-            pass
-        
-        # WebSocket 連線結束時自動更新 Session 時間範圍
-        try:
-            logger.info(f"WebSocket 連線結束，開始重新計算 Session {session_uuid} 的時間範圍")
+            logger.info(f"🔄 重新計算 Session {session_uuid} 的時間範圍...")
             result = data_facade.recalculate_session_timerange(session_uuid)
             if result.get("success"):
-                logger.info(f"Session {session_uuid} 時間範圍更新成功")
+                logger.info(f"✅ Session {session_uuid} 時間範圍更新成功")
             else:
-                logger.warning(f"Session {session_uuid} 時間範圍更新失敗: {result.get('message')}")
+                logger.warning(f"⚠️  Session {session_uuid} 時間範圍更新失敗: {result.get('message')}")
         except Exception as e:
-            logger.error(f"WebSocket 結束時更新 Session 時間範圍失敗: {e}")
-        
-        # 關閉WebSocket連接
+            logger.error(f"💥 更新 Session 時間範圍時發生錯誤: {e}")
+
+        # 🔌 關閉 WebSocket 連線
         try:
+            logger.info("🔌 關閉 WebSocket 連線")
             await ws.close()
-        except:
-            pass
+        except Exception as e:
+            logger.debug(f"關閉 WebSocket 時的輕微錯誤: {e}")
+            pass  # 忽略關閉時的錯誤
+            
+        logger.info(f"🏁 WebSocket 會話 {session_uuid} 完全結束")
 
 # ----------------------------------------------------------------------------
 # Speakers API - 語者管理
@@ -714,6 +900,67 @@ async def transfer_voiceprints(request: SpeakerTransferRequest):
         target_speaker_name=request.target_speaker_name
     )
     return ApiResponse(**result)
+
+@app.post("/speakers/create", response_model=ApiResponse)
+async def create_speaker_with_voice(
+    file: UploadFile = File(...),
+    full_name: str = Form(...),  # 必填
+    nickname: Optional[str] = Form(None),
+    gender: Optional[str] = Form(None)
+):
+    """手動建立語者 - 上傳音檔並建立新語者檔案"""
+    # 1. 驗證檔案類型（僅支援 WAV）
+    if not file.filename or not file.filename.lower().endswith('.wav'):
+        raise HTTPException(
+            status_code=400, 
+            detail="不支援的音檔格式，請使用 WAV 格式"
+        )
+    
+    # 2. 驗證全名（必填且不能為空）
+    if not full_name or not full_name.strip():
+        raise HTTPException(
+            status_code=400, 
+            detail="語者全名為必填欄位，不能為空"
+        )
+    
+    if len(full_name.strip()) > 50:
+        raise HTTPException(
+            status_code=400, 
+            detail="語者全名不能超過50個字元"
+        )
+    
+    # 3. 驗證暱稱長度（選填）
+    if nickname and len(nickname.strip()) > 30:
+        raise HTTPException(
+            status_code=400, 
+            detail="語者暱稱不能超過30個字元"
+        )
+    
+    # 4. 性別不做限制，可以是任何值或空值
+    # 4. 性別不做限制，可以是任何值或空值
+    
+    # 5. 儲存暫存檔案
+    with tempfile.NamedTemporaryFile(delete=False, suffix=".wav") as tmp_file:
+        shutil.copyfileobj(file.file, tmp_file)
+        tmp_path = tmp_file.name
+    
+    try:
+        # 6. 執行建立語者邏輯
+        result = data_facade.create_speaker_with_voice(
+            audio_file_path=tmp_path,
+            full_name=full_name.strip(),  # 必填，已驗證不為空
+            nickname=nickname.strip() if nickname else None,
+            gender=gender.strip() if gender else None
+        )
+        
+        return ApiResponse(**result)
+        
+    finally:
+        # 7. 清理暫存檔案
+        try:
+            os.remove(tmp_path)
+        except:
+            pass  # 忽略刪除暫存檔案的錯誤
 
 # ----------------------------------------------------------------------------
 # Nested Resource APIs - 巢狀資源查詢

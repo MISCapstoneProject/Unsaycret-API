@@ -56,6 +56,7 @@ if __name__ == "__main__":
         print("     ✏️  PATCH  /speakers/{id}      - 更新語者資料")
         print("     🗑️  DELETE /speakers/{id}      - 刪除語者")
         print("     🔍 POST   /speakers/verify    - 語音驗證（識別語者身份）")
+        print("     ➕ POST   /speakers/create    - 手動建立語者（上傳音檔）")
         print("     � POST   /speakers/transfer  - 聲紋轉移")
         print("")
         print("  📅 會議管理 API:")
