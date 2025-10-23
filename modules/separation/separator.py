@@ -177,8 +177,7 @@ from utils.constants import (
 from .dynamic_model_manager import (
     SeparationModel,
     MODEL_CONFIGS,
-    create_dynamic_model_manager,
-    get_available_models
+    create_dynamic_model_manager
 )
 
 # 導入語者計數器
@@ -186,9 +185,6 @@ from .speaker_counter import SpeakerCounter
 
 # 導入單人選路器
 from .best_speaker_selector import SingleSpeakerSelector
-
-from .assess_quality import assess_audio_quality
-from .process_before_id import _gentle_blend, _hf_hiss_suppress, _prep_id_audio, _soft_spectral_floor, _tpdf_dither, crosstalk_suppress, fade_io, framewise_dominance_gate, stft_wiener_refine, tf_mask_refine
 
 # 基本錄音參數（從配置讀取）
 CHUNK = AUDIO_CHUNK_SIZE
@@ -542,173 +538,6 @@ class AudioSeparator:
         else:
             # 固定模型模式
             return self.model, self.current_model_type
-
-    def estimate_snr(self, signal):
-        """估算信號雜訊比"""
-        try:
-            signal_power = np.mean(signal ** 2)
-            if len(signal) > 1000:
-                noise_estimate = np.std(signal[-1000:]) ** 2
-            else:
-                noise_estimate = np.std(signal) ** 2 * 0.1
-            noise_estimate = max(noise_estimate, 1e-10)
-            snr = 10 * np.log10(signal_power / noise_estimate)
-            return snr
-        except:
-            return 0
-
-    def wiener_filter(self, audio_signal):
-        """維納濾波器 - 更溫和的處理"""
-        try:
-            f, t, stft = signal.stft(audio_signal, fs=TARGET_RATE, nperseg=512, noverlap=256)
-            
-            # 使用更溫和的雜訊估計
-            quiet_samples = min(int(TARGET_RATE * 0.05), len(audio_signal) // 8)
-            noise_sample = audio_signal[:quiet_samples]
-            _, _, noise_stft = signal.stft(noise_sample, fs=TARGET_RATE, nperseg=512, noverlap=256)
-            noise_power = np.mean(np.abs(noise_stft) ** 2, axis=1, keepdims=True)
-            
-            signal_power = np.abs(stft) ** 2
-            wiener_gain = signal_power / (signal_power + WIENER_FILTER_STRENGTH * noise_power)
-            
-            # 限制增益範圍以避免過度處理
-            wiener_gain = np.clip(wiener_gain, 0.1, 1.0)
-            
-            filtered_stft = stft * wiener_gain
-            _, filtered_audio = signal.istft(filtered_stft, fs=TARGET_RATE)
-            
-            return filtered_audio[:len(audio_signal)]
-        except:
-            return audio_signal
-
-    def smooth_audio(self, audio_signal):
-        """音訊平滑處理"""
-        try:
-            # 移除突然的跳疊
-            diff = np.diff(audio_signal)
-            threshold = np.std(diff) * 3  # 更寬鬆的閾值
-            artifact_indices = np.where(np.abs(diff) > threshold)[0]
-            
-            for idx in artifact_indices[:20]:  # 限制處理數量
-                if 0 < idx < len(audio_signal) - 1:
-                    audio_signal[idx] = (audio_signal[idx-1] + audio_signal[idx+1]) / 2
-            
-            # 輕微平滑
-            audio_signal = uniform_filter1d(audio_signal, size=3)
-            
-            # 輕微低通濾波
-            audio_signal = signal.sosfilt(self.lowpass_filter, audio_signal)
-            
-            return audio_signal
-        except:
-            return audio_signal
-
-    def dynamic_range_compression(self, audio_signal):
-        """動態範圍壓縮"""
-        try:
-            # 軟限制器
-            threshold = 0.8
-            ratio = DYNAMIC_RANGE_COMPRESSION
-            
-            # 計算絕對值
-            abs_signal = np.abs(audio_signal)
-            
-            # 對超過閾值的部分進行壓縮
-            mask = abs_signal > threshold
-            compressed = np.copy(audio_signal)
-            
-            if np.any(mask):
-                over_threshold = abs_signal[mask]
-                compressed_magnitude = threshold + (over_threshold - threshold) * ratio
-                compressed[mask] = np.sign(audio_signal[mask]) * compressed_magnitude
-            
-            return compressed
-        except:
-            return audio_signal
-
-    def spectral_gating(self, audio):
-        """改良的頻譜閘控降噪"""
-        try:
-            noise_sample_length = max(int(TARGET_RATE * 0.05), 1)
-            noise_sample = audio[:noise_sample_length]
-            
-            return nr.reduce_noise(
-                y=audio,
-                y_noise=noise_sample,
-                sr=TARGET_RATE,
-                prop_decrease=NOISE_REDUCE_STRENGTH,
-                stationary=False,  # 非穩態雜訊處理
-                n_jobs=1
-            )
-        except:
-            return audio
-
-    def enhance_separation(self, separated_signals):
-        """增強分離效果 - 改善音質"""
-        if not self.enable_noise_reduction:
-            return separated_signals
-        
-        # SpeechBrain 模型輸出格式處理
-        if len(separated_signals.shape) == 3:
-            # 格式通常為 [batch, time, speakers]
-            enhanced_signals = torch.zeros_like(separated_signals)
-            speaker_dim = 2
-            time_dim = 1
-        else:
-            separated_signals = separated_signals.unsqueeze(0)
-            enhanced_signals = torch.zeros_like(separated_signals)
-            speaker_dim = 2
-            time_dim = 1
-        
-        num_speakers = separated_signals.shape[speaker_dim]
-        
-        for i in range(min(num_speakers, self.num_speakers)):
-            if speaker_dim == 2:
-                current_signal = separated_signals[0, :, i].cpu().numpy()
-            else:
-                current_signal = separated_signals[0, :, i].cpu().numpy()
-            
-            # 多階段音質改善
-            processed_signal = current_signal
-            
-            # 1. 維納濾波
-            signal_snr = self.estimate_snr(current_signal)
-            if signal_snr < self.snr_threshold + 3:
-                processed_signal = self.wiener_filter(processed_signal)
-            
-            # 2. 傳統降噪（僅在必要時）
-            if signal_snr < self.snr_threshold:
-                processed_signal = self.spectral_gating(processed_signal)
-            
-            # 3. 音訊平滑和修復
-            processed_signal = self.smooth_audio(processed_signal)
-            
-            # 4. 動態範圍壓縮
-            processed_signal = self.dynamic_range_compression(processed_signal)
-            
-            # 5. 最終正規化
-            max_val = np.max(np.abs(processed_signal))
-            if max_val > 0:
-                processed_signal = processed_signal / max_val * 0.95
-            
-            length = min(len(processed_signal), separated_signals.shape[time_dim])
-            
-            if speaker_dim == 2:
-                enhanced_signals[0, :length, i] = torch.from_numpy(processed_signal[:length]).to(self.device)
-            else:
-                enhanced_signals[0, :length, i] = torch.from_numpy(processed_signal[:length]).to(self.device)
-        
-        return enhanced_signals
-        
-    def set_save_audio_files(self, save: bool) -> None:
-        """
-        設定是否儲存分離後的音訊檔案
-        
-        Args:
-            save: True 表示儲存音訊檔案，False 表示不儲存
-        """
-        self.save_audio_files = save
-        logger.info(f"音訊檔案儲存設定：{'已啟用' if save else '已停用'}")
 
     def process_audio(self, audio_data: np.ndarray) -> torch.Tensor:
         """處理音訊格式：將原始錄音資料轉換為模型可用的格式"""
@@ -1219,42 +1048,3 @@ def check_weaviate_connection() -> bool:
         logger.error(f"Weaviate 連線失敗：{e}")
         return False
     
-def run_realtime(output_dir: str = OUTPUT_DIR, model_type: SeparationModel = None, model_name: str = None, enable_dynamic_model: bool = True) -> str:
-    """方便外部呼叫的錄音處理函式，支援模型選擇和動態模型 - 使用快取"""
-    if enable_dynamic_model:
-        separator = get_cached_separator(model_type=DEFAULT_MODEL, enable_dynamic_model=True)
-    elif model_name:
-        # 轉換 model_name 為 model_type
-        if model_name == "sepformer_2speaker":
-            model_type = SeparationModel.SEPFORMER_2SPEAKER
-        elif model_name == "sepformer_3speaker":
-            model_type = SeparationModel.SEPFORMER_3SPEAKER
-        else:
-            raise ValueError(f"不支援的模型: {model_name}")
-        separator = get_cached_separator(model_type=model_type, enable_dynamic_model=False)
-    elif model_type:
-        separator = get_cached_separator(model_type=model_type, enable_dynamic_model=False)
-    else:
-        separator = get_cached_separator(model_type=DEFAULT_MODEL, enable_dynamic_model=False)
-    return separator.record_and_process(output_dir)
-
-def run_offline(file_path: str, output_dir: str = OUTPUT_DIR, save_files: bool = True, 
-                model_type: SeparationModel = None, model_name: str = None, enable_dynamic_model: bool = True) -> None:
-    """方便外部呼叫的離線音檔處理函式，支援模型選擇和動態模型 - 使用快取"""
-    if enable_dynamic_model:
-        separator = get_cached_separator(model_type=DEFAULT_MODEL, enable_dynamic_model=True)
-    elif model_name:
-        # 轉換 model_name 為 model_type
-        if model_name == "sepformer_2speaker":
-            model_type = SeparationModel.SEPFORMER_2SPEAKER
-        elif model_name == "sepformer_3speaker":
-            model_type = SeparationModel.SEPFORMER_3SPEAKER
-        else:
-            raise ValueError(f"不支援的模型: {model_name}")
-        separator = get_cached_separator(model_type=model_type, enable_dynamic_model=False)
-    elif model_type:
-        separator = get_cached_separator(model_type=model_type, enable_dynamic_model=False)
-    else:
-        separator = get_cached_separator(model_type=DEFAULT_MODEL, enable_dynamic_model=False)
-    separator.set_save_audio_files(save_files)
-    separator.process_audio_file(file_path, output_dir)
