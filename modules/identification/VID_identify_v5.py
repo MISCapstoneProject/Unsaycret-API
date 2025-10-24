@@ -108,6 +108,8 @@ from weaviate.classes.query import QueryReference # type: ignore
 from contextvars import ContextVar
 from itertools import count
 from utils.path_utils import format_process_prefix
+import platform
+from huggingface_hub import snapshot_download
 
 # 控制輸出的全局變數
 _ENABLE_OUTPUT =True  # 預設為 True，即輸出詳細訊息
@@ -194,7 +196,7 @@ logging.getLogger("speechbrain").setLevel(logging.ERROR)
 # 導入日誌模組
 from utils.logger import get_logger
 from utils.env_config import WEAVIATE_HOST, WEAVIATE_PORT, get_model_save_dir, HF_ACCESS_TOKEN
-from utils.constants import THRESHOLD_LOW, THRESHOLD_UPDATE, THRESHOLD_NEW, SPEECHBRAIN_SPEAKER_MODEL,PYANNOTE_SPEAKER_MODEL, AUDIO_TARGET_RATE
+from utils.constants import THRESHOLD_LOW, THRESHOLD_UPDATE, THRESHOLD_NEW, SPEECHBRAIN_SPEAKER_MODEL, PYANNOTE_SPEAKER_MODEL, WESPEAKER_SPEAKER_MODEL, SPEAKER_MODEL_TYPE, AUDIO_TARGET_RATE
 
 # 創建模組專屬日誌器
 logger = get_logger(__name__)
@@ -213,14 +215,21 @@ class AudioProcessor:
     def __init__(self) -> None:
         """
         初始化模型
-        想切換模型時，直接改下面的 self.model_type
-        可選值: "speechbrain" 或 "pyannote"
+        初始化語者嵌入模型，根據配置選擇不同的模型類型
         """
-        # ====== 這裡改模型類型 ======
-        self.model_type = "speechbrain"
+        # =========================
+        self.model_type = SPEAKER_MODEL_TYPE  # "speechbrain" / "pyannote" / "wespeaker"
         # =========================
 
-        self.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+
+        if torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif platform.system() == "Darwin" and getattr(torch.backends, "mps", None) and torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
+
+        print(f"🖥 (Speaker Identification) Using device: {self.device}")
 
         if self.model_type == "speechbrain":
             from speechbrain.inference import SpeakerRecognition
@@ -229,6 +238,17 @@ class AudioProcessor:
                 savedir=get_model_save_dir("speechbrain_recognition")
             )
             logger.info("已載入 SpeechBrain ECAPA-TDNN 模型")
+
+        elif self.model_type == "wespeaker":
+            import wespeaker
+            try:
+                model_dir = snapshot_download(repo_id=WESPEAKER_SPEAKER_MODEL)
+                self.model = wespeaker.load_model(model_dir)
+            except Exception as e:
+                logger.error(f"Wespeaker 模型載入失敗：{e}")
+                raise
+
+            logger.info(f"✅ 已載入 Wespeaker 模型: {WESPEAKER_SPEAKER_MODEL}")
 
         elif self.model_type == "pyannote":
             from pyannote.audio import Inference
@@ -250,7 +270,17 @@ class AudioProcessor:
             raise ValueError(f"不支援的模型類型: {self.model_type}")
 
     def resample_audio(self, signal: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-        """使用 scipy 進行高品質重新採樣"""
+        """
+        使用 scipy 進行高品質重新採樣
+        
+        Args:
+            signal: 原始音訊信號
+            orig_sr: 原始取樣率
+            target_sr: 目標取樣率
+            
+        Returns:
+            np.ndarray: 重新採樣後的音訊信號
+        """
         return resample_poly(signal, target_sr, orig_sr)
 
     def extract_embedding_from_stream(self, signal: np.ndarray, sr: int) -> np.ndarray:
@@ -269,6 +299,9 @@ class AudioProcessor:
 
             if self.model_type == "speechbrain":
                 embedding = self.model.encode_batch(signal_tensor).squeeze().cpu().numpy()
+            
+            # elif self.model_type == "wespeaker":
+            # 沒有實作音流版本的 Wespeaker，改用檔案版本
 
             elif self.model_type == "pyannote":
                 # pyannote 的 Inference 需要從文件中讀取，所以我們需要創建臨時文件
@@ -289,7 +322,6 @@ class AudioProcessor:
                     embedding = embedding / np.linalg.norm(embedding)  # 正規化
                 finally:
                     # 清理臨時文件
-                    import os
                     if os.path.exists(temp_path):
                         os.unlink(temp_path)
 
@@ -298,21 +330,6 @@ class AudioProcessor:
         except Exception as e:
             logger.error(f"提取嵌入向量時發生錯誤: {e}")
             raise
-
-    
-    def resample_audio(self, signal: np.ndarray, orig_sr: int, target_sr: int) -> np.ndarray:
-        """
-        使用 scipy 進行高品質重新採樣
-        
-        Args:
-            signal: 原始音訊信號
-            orig_sr: 原始取樣率
-            target_sr: 目標取樣率
-            
-        Returns:
-            np.ndarray: 重新採樣後的音訊信號
-        """
-        return resample_poly(signal, target_sr, orig_sr)
     
     def extract_embedding(self, audio_path: str) -> np.ndarray:
         """
@@ -331,8 +348,12 @@ class AudioProcessor:
             4. 其他取樣率，則重新採樣到 16kHz
         """
         try:
+            if self.model_type == "wespeaker":
+                embedding = self.model.extract_embedding(audio_path)
+                return np.array(embedding).squeeze()
+            
             # 對於 pyannote 模型，直接使用文件路徑更高效
-            if self.model_type == "pyannote":
+            elif self.model_type == "pyannote":
                 # 獲取音頻文件信息
                 signal, sr = sf.read(audio_path)
                 
@@ -359,7 +380,6 @@ class AudioProcessor:
                         embedding = embedding / np.linalg.norm(embedding)
                     finally:
                         # 清理臨時文件
-                        import os
                         if os.path.exists(temp_path):
                             os.unlink(temp_path)
                 else:
@@ -1090,11 +1110,11 @@ class SpeakerIdentifier:
                 self.simplified_print(f"音檔 {audio_file} 不存在，取消處理。", self.verbose)
                 return None
 
-            # 讀取音檔獲取 signal 和 sr
-            signal, sr = sf.read(audio_file)
-
             # 直接使用完整路徑，統一轉換為正斜線格式
             audio_source = audio_file.replace('\\', '/')
+
+            # 讀取音檔獲取 signal 和 sr
+            signal, sr = sf.read(audio_file)
 
             return self.process_audio_stream(signal, sr, audio_source=audio_source)
 
@@ -1107,7 +1127,7 @@ class SpeakerIdentifier:
 
     def process_audio_stream(self, signal: np.ndarray, sr: int, audio_source: str = "無", timestamp: Optional[datetime] = None) -> Optional[Tuple[str, str, float]]:
         """
-        處理音訊流 (NumPy 陣列) 並進行語者識別
+        處理音訊並進行語者識別
 
         Args:
             signal: 音訊信號 (NumPy 陣列)
@@ -1127,7 +1147,8 @@ class SpeakerIdentifier:
             self.simplified_print(f"\n處理來源: {audio_source}", self.verbose)
 
             # 提取嵌入向量
-            new_embedding = self.audio_processor.extract_embedding_from_stream(signal, sr)
+            # new_embedding = self.audio_processor.extract_embedding_from_stream(signal, sr)
+            new_embedding = self.audio_processor.extract_embedding(audio_source)
 
             # 與 Weaviate 中的嵌入向量比對
             best_id, best_name, best_distance, all_distances = self.database.compare_embedding(new_embedding)

@@ -5,8 +5,8 @@
 
 # 語者識別閾值 (演算法核心參數，經過實驗調校)
 THRESHOLD_LOW = 0.1      # 低於此閾值表示過於相似，不更新向量
-THRESHOLD_UPDATE = 0.28   # 低於此閾值更新向量，進行加權平均，高於此閾值則新增一筆聲紋至同一語者
-THRESHOLD_NEW = 0.38     # 超過此值視為新語者
+THRESHOLD_UPDATE = 0.2   # 低於此閾值更新向量，進行加權平均，高於此閾值則新增一筆聲紋至同一語者
+THRESHOLD_NEW = 0.39     # 超過此值視為新語者
 
 # 音訊處理固定參數 (技術規格要求)
 AUDIO_SAMPLE_RATE = 16000    # SpeechBrain 模型要求的取樣率
@@ -23,7 +23,11 @@ DEFAULT_SEPARATION_MODEL = "sepformer_2speaker"
 # 如想更改語者辨識模型，要去 modules/identification/VID_identify_v5.py 改設置
 SPEECHBRAIN_SPEAKER_MODEL = "speechbrain/spkrec-ecapa-voxceleb"
 PYANNOTE_SPEAKER_MODEL = "pyannote/embedding"
+WESPEAKER_SPEAKER_MODEL = "Wespeaker/wespeaker-voxceleb-resnet293-LM"
 SPEECHBRAIN_SEPARATOR_MODEL = "speechbrain/sepformer-whamr16k"
+
+# 語者嵌入模型設定，可選：speechbrain / pyannote / wespeaker
+SPEAKER_MODEL_TYPE= "wespeaker"
 
 # Whisper 模型對照表
 WHISPER_MODEL_MAP = {

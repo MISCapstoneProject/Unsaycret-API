@@ -1551,7 +1551,7 @@ class DatabaseService:
                     if valid_uuid(participant_uuid) and self.get_speaker(participant_uuid):
                         valid_participants.append(participant_uuid)
                     else:
-                        logger.warning(f"參與者 UUID {participant_uuid} 無效或不存在，已跳過")
+                        logger.warning(f"(e1) 參與者 UUID {participant_uuid} 無效或不存在，已跳過")
                 
                 if valid_participants:
                     references["participants"] = valid_participants
@@ -1917,7 +1917,7 @@ class DatabaseService:
             if speaker_uuid and valid_uuid(speaker_uuid) and self.get_speaker(speaker_uuid):
                 references["speaker"] = [speaker_uuid]
             elif speaker_uuid:
-                logger.warning(f"語者 UUID {speaker_uuid} 無效或不存在，已跳過")
+                logger.warning(f"(e2) 語者 UUID {speaker_uuid} 無效或不存在，已跳過")
             
             # 處理 Session 引用
             session_uuid = getattr(request, 'session', None)
@@ -2089,7 +2089,7 @@ class DatabaseService:
                     if value and valid_uuid(value) and self.get_speaker(value):
                         references_to_update["speaker"] = [value]
                     elif value:
-                        logger.warning(f"語者 UUID {value} 無效或不存在，已跳過")
+                        logger.warning(f"(e3) 語者 UUID {value} 無效或不存在，已跳過")
                 elif key == "session":
                     if value and valid_uuid(value):
                         session_obj = self.client.collections.get(self.SESSION_CLASS).query.fetch_object_by_id(uuid=value)
