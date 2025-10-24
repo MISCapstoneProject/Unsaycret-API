@@ -186,6 +186,12 @@ from .speaker_counter import SpeakerCounter
 # 導入單人選路器
 from .best_speaker_selector import SingleSpeakerSelector
 
+# 導入自適應降噪模組
+from .adaptive_denoiser import (
+    AdaptiveDenoiserEnhanced as AdaptiveDenoiser,
+    get_adaptive_denoiser_enhanced as get_adaptive_denoiser
+)
+
 # 基本錄音參數（從配置讀取）
 CHUNK = AUDIO_CHUNK_SIZE
 FORMAT = pyaudio.paFloat32
@@ -375,6 +381,17 @@ class AudioSeparator:
             logger=logger
         )
         logger.info("語者計數器初始化完成")
+        
+        # 初始化自適應降噪器
+        self.denoiser = get_adaptive_denoiser(
+            device=self.device,
+            aggressive_mode=False,         # 標準模式
+            enable_hiss_removal=True,      # 去除嘶嘶聲
+            enable_rumble_filter=True,     # 去除低頻
+            enable_dereverb=False,         # 可選：去混響（較慢）
+            hiss_threshold=0.15            # 敏感度
+        )
+        logger.info("自適應降噪器初始化完成")
         
         self._last_single_route_idx = None
         self._last_single_route_score = None
@@ -921,10 +938,15 @@ class AudioSeparator:
                 for i in range(effective_speakers):
                     try:
                         speaker_audio = est_ST[i].contiguous()  # 1D [T]
-                        final_tensor = speaker_audio.unsqueeze(0).cpu()  # [1, T]
-                        
-                        # 安全頭房 & 夾限（避免 1.0 邊界/算術誤差導致的 clip）
-                        # final_tensor = torch.clamp(final_tensor * 0.98, -1.0, 1.0)
+                        denoised_audio = self.denoiser.denoise(
+                            audio=speaker_audio,  # 1D 張量
+                            sample_rate=TARGET_RATE
+                        )
+
+                        final_tensor = denoised_audio.unsqueeze(0).cpu()  # [1, T]
+
+                        # 峰值正規化並限制在 -1.0 到 1.0 之間
+                        final_tensor = torch.clamp(final_tensor * 0.98, -1.0, 1.0)
                         
                         output_file = os.path.join(
                             output_dir,
@@ -1025,6 +1047,14 @@ def clear_separator_cache():
             logger.info("已清理語者計數管線快取")
         except Exception as e:
             logger.warning(f"清理語者計數管線快取時發生錯誤: {e}")
+            
+    # 清理降噪器快取
+    try:
+        from .adaptive_denoiser import clear_denoiser_cache
+        clear_denoiser_cache()
+        logger.info("已清理降噪器快取")
+    except Exception as e:
+        logger.warning(f"清理降噪器快取時發生錯誤: {e}")
 
 def check_weaviate_connection() -> bool:
     """
