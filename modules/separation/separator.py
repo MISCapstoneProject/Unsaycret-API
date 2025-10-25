@@ -5,7 +5,7 @@
 
 版本：v3.0.0
 作者：EvanLo62
-最後更新：2025-08-24
+最後更新：2025-10-25
 
 模組概要：
 -----------
@@ -186,8 +186,8 @@ from .speaker_counter import SpeakerCounter
 # 導入單人選路器
 from .best_speaker_selector import SingleSpeakerSelector
 
-# 導入自適應降噪模組
-from .adaptive_denoiser import (
+# 導入自適應後降噪模組
+from .post_adaptive_denoiser import (
     AdaptiveDenoiserEnhanced as AdaptiveDenoiser,
     get_adaptive_denoiser_enhanced as get_adaptive_denoiser
 )
@@ -200,7 +200,7 @@ RATE = AUDIO_RATE
 TARGET_RATE = AUDIO_TARGET_RATE
 WINDOW_SIZE = AUDIO_WINDOW_SIZE
 OVERLAP = AUDIO_OVERLAP
-DEVICE_INDEX = None
+DEVICE_INDEX = None  # 使用預設錄音設備
 
 # 處理參數（從配置讀取）
 MIN_ENERGY_THRESHOLD = AUDIO_MIN_ENERGY_THRESHOLD
@@ -1050,7 +1050,7 @@ def clear_separator_cache():
             
     # 清理降噪器快取
     try:
-        from .adaptive_denoiser import clear_denoiser_cache
+        from .post_adaptive_denoiser import clear_denoiser_cache
         clear_denoiser_cache()
         logger.info("已清理降噪器快取")
     except Exception as e:
