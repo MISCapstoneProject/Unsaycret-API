@@ -36,7 +36,7 @@ from utils.logger import get_logger
 logger = get_logger(__name__)
 
 
-class AdaptiveDenoiserEnhanced:
+class AdaptiveDenoiser:
     """
     增強版自適應降噪器 - 專門針對電子雜訊優化
     
@@ -687,19 +687,19 @@ class AdaptiveDenoiserEnhanced:
 
 
 # 全域快取
-_GLOBAL_DENOISER_ENHANCED_CACHE: Optional[AdaptiveDenoiserEnhanced] = None
+_GLOBAL_DENOISER_ENHANCED_CACHE: Optional[AdaptiveDenoiser] = None
 
 
-def get_adaptive_denoiser_enhanced(
+def get_adaptive_denoiser(
     device: str = 'cpu',
     force_new: bool = False,
     **kwargs
-) -> AdaptiveDenoiserEnhanced:
+) -> AdaptiveDenoiser:
     """取得增強版降噪器實例（單例模式）"""
     global _GLOBAL_DENOISER_ENHANCED_CACHE
     
     if force_new or _GLOBAL_DENOISER_ENHANCED_CACHE is None:
-        _GLOBAL_DENOISER_ENHANCED_CACHE = AdaptiveDenoiserEnhanced(device=device, **kwargs)
+        _GLOBAL_DENOISER_ENHANCED_CACHE = AdaptiveDenoiser(device=device, **kwargs)
         logger.info("建立新的 AdaptiveDenoiserEnhanced 實例")
     
     return _GLOBAL_DENOISER_ENHANCED_CACHE
