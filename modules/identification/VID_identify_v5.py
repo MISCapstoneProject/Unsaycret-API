@@ -242,8 +242,23 @@ class AudioProcessor:
         elif self.model_type == "wespeaker":
             import wespeaker
             try:
-                model_dir = snapshot_download(repo_id=WESPEAKER_SPEAKER_MODEL)
+                # 確保下載目錄存在並且模型文件完整
+                model_dir = snapshot_download(
+                    repo_id=WESPEAKER_SPEAKER_MODEL,
+                    cache_dir=get_model_save_dir("wespeaker"),
+                    force_download=False,  # 避免重複下載
+                    resume_download=True   # 支援斷點續傳
+                )
+                
+                # 檢查模型文件是否存在
+                import glob
+                model_files = glob.glob(os.path.join(model_dir, "*.onnx")) + glob.glob(os.path.join(model_dir, "*.pt"))
+                if not model_files:
+                    raise FileNotFoundError(f"模型文件未在 {model_dir} 中找到")
+                
                 self.model = wespeaker.load_model(model_dir)
+                logger.info(f"✅ 已載入 Wespeaker 模型: {WESPEAKER_SPEAKER_MODEL}")
+                
             except Exception as e:
                 logger.error(f"Wespeaker 模型載入失敗：{e}")
                 raise
