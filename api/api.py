@@ -279,7 +279,10 @@ class SpeechLogInfo(BaseModel):
     confidence: Optional[float] = None
     duration: Optional[float] = None
     language: Optional[str] = None
-    speaker: Optional[str] = None
+    speaker: Optional[str] = None  # Speaker UUID (保留相容性)
+    # ✅ 新增欄位: Speaker 的名字和暱稱
+    speaker_name: Optional[str] = None      # Speaker 的全名
+    speaker_nickname: Optional[str] = None  # Speaker 的暱稱
     session: Optional[str] = None
 
 @app.post("/speechlogs", response_model=ApiResponse)

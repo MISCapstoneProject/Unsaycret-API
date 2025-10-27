@@ -1,14 +1,20 @@
 # Database Module (Weaviate V2)
 
-**版本**：v0.4.0  
+**版本**：v0.5.0  
 **作者**：CYouuu  
 **最後更新者**：CYouuu  
-**最後更新**：2025-07-21
+**最後更新**：2025-10-28
 
 ⚠️ **重要變更** ⚠️  
 本版本已升級為 Weaviate V2 資料庫結構，與 V1 版本不相容！
 
 ## 🚀 V2 版本重大更新
+
+### 2025-10-28 更新
+- **SpeechLog API 增強**: `list_speechlogs()` 和相關查詢方法現在自動附加語者資訊
+  - 新增 `speaker_name` (語者全名)
+  - 新增 `speaker_nickname` (語者暱稱)
+  - 前端無需額外查詢,直接使用回傳的語者資訊
 
 ### Speaker 集合新增欄位
 - `speaker_id` (INT): 從 1 開始遞增的序號 ID
@@ -116,9 +122,15 @@ docker-compose up -d
     "duration": float,           # 語音長度(秒)
     "language": str,             # 語言類型
     "speaker": Reference,        # 發言語者 (關聯到Speaker)
-    "session": Reference         # 所屬會議 (關聯到Session)
+    "session": Reference,        # 所屬會議 (關聯到Session)
+    # API 自動附加欄位 (不存於資料庫,僅於回傳時生成)
+    "speaker_name": str,         # 語者全名 (從 Speaker JOIN 取得)
+    "speaker_nickname": str      # 語者暱稱 (從 Speaker JOIN 取得)
 }
 ```
+
+> **📝 注意**: `speaker_name` 和 `speaker_nickname` 是由 API 層動態生成的欄位,
+> 透過 JOIN Speaker 表自動填充,前端無需額外查詢語者資訊。
 
 ## 💾 DatabaseService V2 核心類別
 
@@ -216,8 +228,23 @@ speechlog_uuid: str = db.create_speechlog(
     session_uuid="session_uuid"
 )
 
-# 查詢語音記錄
+# 查詢語音記錄 (包含語者資訊)
 speechlog: Optional[Dict] = db.get_speechlog(speechlog_uuid)
+# 回傳範例:
+# {
+#   "uuid": "...",
+#   "content": "這是一段語音轉錄內容",
+#   "speaker": "speaker_uuid",
+#   "speaker_name": "王小明",       # 自動附加
+#   "speaker_nickname": "小明",     # 自動附加
+#   ...
+# }
+
+# 查詢語者的所有發言 (包含語者資訊)
+speechlogs: List[Dict] = db.get_speechlogs_by_speaker(speaker_uuid)
+
+# 查詢會議的所有發言 (包含語者資訊)
+speechlogs: List[Dict] = db.get_speechlogs_by_session(session_uuid)
 
 # 語意搜尋語音內容
 results: List[Dict] = db.search_speech_content("關鍵字搜尋", limit=10)
