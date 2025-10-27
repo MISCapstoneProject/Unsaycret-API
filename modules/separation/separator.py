@@ -221,12 +221,14 @@ DYNAMIC_RANGE_COMPRESSION = 0.7  # 動態範圍壓縮
 DEFAULT_MODEL = DEFAULT_SEPARATION_MODEL
 
 # 修正 DEFAULT_MODEL 的賦值
-if DEFAULT_SEPARATION_MODEL == "sepformer_2speaker":
+if DEFAULT_SEPARATION_MODEL == "tiger_2speaker":
+    DEFAULT_MODEL = SeparationModel.TIGER_2SPEAKER
+elif DEFAULT_SEPARATION_MODEL == "sepformer_2speaker":
     DEFAULT_MODEL = SeparationModel.SEPFORMER_2SPEAKER
 elif DEFAULT_SEPARATION_MODEL == "sepformer_3speaker":
     DEFAULT_MODEL = SeparationModel.SEPFORMER_3SPEAKER
 else:
-    DEFAULT_MODEL = SeparationModel.SEPFORMER_3SPEAKER  # 預設值改為您的模型
+    DEFAULT_MODEL = SeparationModel.TIGER_2SPEAKER  # 預設值改為您的模型
 
 MODEL_NAME = MODEL_CONFIGS[DEFAULT_MODEL]["model_name"]
 NUM_SPEAKERS = MODEL_CONFIGS[DEFAULT_MODEL]["num_speakers"]
@@ -538,6 +540,90 @@ class AudioSeparator:
         peak = est.abs().amax(dim=t_ax, keepdim=True).clamp_min(1e-8)
         return est / peak, layout, s_ax, t_ax
 
+    def _normalize_audio_energy(
+        self, 
+        audio: torch.Tensor, 
+        segment_index: int,
+        target_peak: float = 0.7,
+        min_peak_threshold: float = 0.05,
+        noise_floor: float = 0.001
+    ) -> torch.Tensor | None:
+        """
+        正規化音訊能量，確保足夠的訊號強度供後續處理。
+        
+        策略：
+        1. 如果峰值 < min_peak_threshold：正規化到 target_peak
+        2. 如果峰值 >= min_peak_threshold：保持原樣（已經夠大聲）
+        3. 如果整體能量過低（< noise_floor）：視為純噪音，返回 None
+        
+        Args:
+            audio: 輸入音訊張量 [C, T] 或 [B, C, T]
+            segment_index: 片段索引（用於日誌）
+            target_peak: 目標峰值（預設 0.7，為正常對話音量）
+            min_peak_threshold: 低於此值才需要正規化（預設 0.05）
+            noise_floor: 噪音底限，低於此值視為無效音訊（預設 0.001）
+        
+        Returns:
+            正規化後的音訊張量，或 None（如果音訊無效）
+        """
+        if audio is None or audio.numel() == 0:
+            return None
+        
+        # 計算當前峰值
+        current_peak = float(audio.abs().max())
+        
+        # 計算 RMS 能量
+        current_rms = float(audio.pow(2).mean().sqrt())
+        
+        # 檢查是否為純噪音或靜音
+        if current_rms < noise_floor:
+            logger.debug(
+                f"片段 {segment_index} - 音訊能量過低 "
+                f"(RMS={current_rms:.6f} < {noise_floor})，視為噪音"
+            )
+            return None
+        
+        # 判斷是否需要正規化
+        if current_peak < min_peak_threshold:
+            # 計算增益係數
+            gain = target_peak / max(current_peak, 1e-8)
+            
+            # 限制最大增益（避免過度放大噪音）
+            max_gain = 20.0  # 最多放大 20 倍（約 26dB）
+            if gain > max_gain:
+                logger.warning(
+                    f"片段 {segment_index} - 計算增益過大 ({gain:.1f}x)，"
+                    f"限制為 {max_gain}x"
+                )
+                gain = max_gain
+            
+            # 應用增益
+            normalized = audio * gain
+            
+            # 防止削波（clipping）
+            normalized_peak = float(normalized.abs().max())
+            if normalized_peak > 1.0:
+                # 如果超過 1.0，縮減到 0.95
+                normalized = normalized * (0.95 / normalized_peak)
+                logger.debug(
+                    f"片段 {segment_index} - 偵測到削波，調整峰值到 0.95"
+                )
+            
+            logger.info(
+                f"片段 {segment_index} - 音訊正規化: "
+                f"peak {current_peak:.4f}→{float(normalized.abs().max()):.4f} "
+                f"(增益 {gain:.2f}x)"
+            )
+            
+            return normalized
+        else:
+            # 峰值已經足夠，不需要正規化
+            logger.debug(
+                f"片段 {segment_index} - 音訊峰值正常 "
+                f"(peak={current_peak:.4f})，跳過正規化"
+            )
+            return audio
+    
     def _get_appropriate_model(self, num_speakers: int) -> tuple[separator, SeparationModel]:
         """
         取得適當的模型實例
@@ -819,6 +905,12 @@ class AudioSeparator:
         流程：語者計數 → 動態模型選擇 → 分離 → 儲存
         """
         try:
+            # 音訊正規化
+            audio_tensor = self._normalize_audio_energy(audio_tensor, segment_index)
+            if audio_tensor is None:
+                logger.warning(f"片段 {segment_index} - 音訊正規化失敗，跳過")
+                return []
+            
             # 1) 語者數量偵測（維持原邏輯）
             detected_speakers = self.spk_counter.count_with_refine(
                 audio=audio_tensor,
@@ -833,11 +925,32 @@ class AudioSeparator:
 
             if detected_speakers == 0:
                 ok, m = self.spk_counter._has_voice(audio_tensor, TARGET_RATE, return_metrics=True)
-                strong_voice = ok and (m["voiced_ratio"] >= 0.12) and (m["voiced_union"] >= 0.50) and (m.get("loud_frac", 0.0) >= 0.05)
+                
+                # 根據音訊峰值動態調整閾值
+                audio_peak = float(audio_tensor.abs().max())
+                
+                if audio_peak < 0.1:  # 低能量音訊
+                    # 使用更寬鬆的閾值
+                    voiced_ratio_thresh = 0.10
+                    voiced_union_thresh = 0.40
+                    loud_frac_thresh = 0.02
+                    logger.debug(f"偵測到低能量音訊 (peak={audio_peak:.4f})，使用寬鬆閾值")
+                else:  # 正常能量
+                    # 使用標準閾值
+                    voiced_ratio_thresh = 0.12
+                    voiced_union_thresh = 0.50
+                    loud_frac_thresh = 0.05
+                
+                strong_voice = ok and \
+                            (m["voiced_ratio"] >= voiced_ratio_thresh) and \
+                            (m["voiced_union"] >= voiced_union_thresh) and \
+                            (m.get("loud_frac", 0.0) >= loud_frac_thresh)
+                
                 if not strong_voice:
                     logger.info(
                         f"片段 {segment_index} - 無語音/過短（ratio={m['voiced_ratio']:.3f}, "
-                        f"union={m['voiced_union']:.2f}s, loud={m.get('loud_frac',0.0):.3f}），跳過"
+                        f"union={m['voiced_union']:.2f}s, loud={m.get('loud_frac',0.0):.3f}, "
+                        f"peak={audio_peak:.4f}, thresh=[{voiced_ratio_thresh:.2f}, {voiced_union_thresh:.2f}, {loud_frac_thresh:.2f}]），跳過"
                     )
                     return []
                 logger.warning(f"片段 {segment_index} - 第一次偵測 0，但語音跡象偏強，嘗試 1–2 人重試")
@@ -872,11 +985,39 @@ class AudioSeparator:
                     audio_tensor = audio_tensor.squeeze(1)
 
                 # 5) 做「原始分離」
-                separated = current_model.separate_batch(audio_tensor)
+                if current_model_type == SeparationModel.TIGER_2SPEAKER:
+                    # TIGER 期望輸入為 [B, C, T] 或 [B, T]
+                    if audio_tensor.dim() == 2:  # [B, T]
+                        audio_tensor_input = audio_tensor.unsqueeze(1)  # [B, 1, T]
+                    else:
+                        audio_tensor_input = audio_tensor
+                    
+                    logger.debug(f"Tiger 輸入形狀: {audio_tensor_input.shape}")
+                    separated = current_model(audio_tensor_input)
+                    logger.debug(f"Tiger 原始輸出形狀: {separated.shape}")
+                    
+                    # Tiger 模型可能輸出 [B, S, T] 格式，需要確保正確處理
+                    if separated.dim() == 2:
+                        # 如果是 [B, T]，轉換為 [B, 1, T]
+                        separated = separated.unsqueeze(1)
+                        logger.debug(f"Tiger 輸出調整後形狀: {separated.shape}")
+                    elif separated.dim() == 3:
+                        # 確認是 [B, S, T] 還是 [B, T, S]
+                        if separated.shape[1] > separated.shape[2] and separated.shape[2] <= 4:
+                            # 可能是 [B, T, S]，需要轉置
+                            separated = separated.transpose(1, 2)
+                            logger.debug(f"Tiger 輸出轉置後形狀: {separated.shape}")
+                else:
+                    # SepFormer 使用 separate_batch 方法
+                    logger.debug(f"SepFormer 輸入形狀: {audio_tensor.shape}")
+                    separated = current_model.separate_batch(audio_tensor)
+                    logger.debug(f"SepFormer 原始輸出形狀: {separated.shape}")
+                
 
                 # 6) 僅做固定比例的「峰值正規化」以統一尺度（維持原 _normalize_estimates）
                 #    不做任何音質增強/濾波/投影回混音等後處理
                 separated, layout, spk_axis, time_axis = self._normalize_estimates(separated)
+                logger.debug(f"正規化後 - 形狀: {separated.shape}, layout: {layout}, spk_axis: {spk_axis}, time_axis: {time_axis}")
 
                 # 7) 依 layout 取出候選，保留單人情境的選路邏輯（但仍輸出原始分離結果）
                 raw_for_select = separated
@@ -903,16 +1044,21 @@ class AudioSeparator:
                         best_idx, _, _ = self.single_selector.select(candidates, audio_tensor[0].detach().cpu(), return_stats=True)
                         enhanced_separated = _get_final(best_idx).unsqueeze(0).unsqueeze(-1).to(self.device)  # [1, T, 1]
                         model_output_speakers = 1
+                        layout = "BTS"
                     except Exception:
                         logger.exception("單人選路失敗，改用 speaker1 作為保守輸出")
                         enhanced_separated = _get_final(0).unsqueeze(0).unsqueeze(-1).to(self.device)
                         model_output_speakers = 1
+                        layout = "BTS"
 
-                # 8) 統一成 [S, T]（不再做任何投影回混音、維納濾波或 frame gate）
-                if enhanced_separated.ndim == 3:   # [B, T, S]
-                    est_ST = enhanced_separated[0].transpose(0, 1).detach().cpu()  # [S, T]
+                # 8) 統一成 [S, T] - 根據 layout 決定是否轉置
+                if enhanced_separated.ndim == 3:
+                    if layout == "BST":  # [B, S, T] - Tiger 雙人原始輸出
+                        est_ST = enhanced_separated[0].detach().cpu()
+                    else:  # layout == "BTS" - 單人重構或其他
+                        est_ST = enhanced_separated[0].transpose(0, 1).detach().cpu()
                 else:
-                    est_ST = enhanced_separated.detach().cpu().unsqueeze(0)        # [1, T]
+                    est_ST = enhanced_separated.detach().cpu().unsqueeze(0)
 
                 if detected_speakers == 1 and est_ST.shape[0] >= 2:
                     # 只保留被選中的那一路
@@ -936,17 +1082,30 @@ class AudioSeparator:
                 for i in range(effective_speakers):
                     try:
                         speaker_audio = est_ST[i].contiguous()  # 1D [T]
+                        logger.debug(f"語者 {i+1} 原始音訊 - 形狀: {speaker_audio.shape}, 樣本數: {speaker_audio.shape[0]}, 持續時間: {speaker_audio.shape[0]/TARGET_RATE:.3f}秒")
+                        
+                        # 檢查音訊長度是否足夠
+                        min_samples = int(0.5 * TARGET_RATE)  # 至少 0.5 秒
+                        if speaker_audio.shape[0] < min_samples:
+                            logger.warning(f"語者 {i+1} 音訊太短 ({speaker_audio.shape[0]} 樣本, {speaker_audio.shape[0]/TARGET_RATE:.3f}秒)，跳過")
+                            continue
                         
                         if self.enable_post_denoiser and self.denoiser is not None:
                             # 使用自適應降噪器進行降噪
-                            denoised_audio = self.denoiser.denoise(
-                                audio=speaker_audio,  # 1D 張量
-                                sample_rate=TARGET_RATE
-                            )
+                            try:
+                                denoised_audio = self.denoiser.denoise(
+                                    audio=speaker_audio,  # 1D 張量
+                                    sample_rate=TARGET_RATE
+                                )
+                                logger.debug(f"語者 {i+1} 降噪後 - 形狀: {denoised_audio.shape}")
+                            except Exception as denoise_error:
+                                logger.warning(f"語者 {i+1} 降噪失敗: {denoise_error}，使用原始音訊")
+                                denoised_audio = speaker_audio
                         else:
                             denoised_audio = speaker_audio
 
                         final_tensor = denoised_audio.unsqueeze(0).cpu()  # [1, T]
+                        logger.debug(f"語者 {i+1} 最終張量 - 形狀: {final_tensor.shape}, 持續時間: {final_tensor.shape[1]/TARGET_RATE:.3f}秒")
 
                         # 峰值正規化並限制在 -1.0 到 1.0 之間
                         final_tensor = torch.clamp(final_tensor * 0.98, -1.0, 1.0)

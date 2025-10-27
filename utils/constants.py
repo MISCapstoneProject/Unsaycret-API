@@ -17,7 +17,7 @@ WHISPER_MODEL_CACHE_DIR = "models/faster-whisper"
 # 預設模型配置 (經過測試的穩定版本)
 DEFAULT_WHISPER_MODEL = "large-v3"
 DEFAULT_WHISPER_BEAM_SIZE = 3
-DEFAULT_SEPARATION_MODEL = "sepformer_2speaker"
+DEFAULT_SEPARATION_MODEL = "TIGER_2speaker"
 
 # 模型名稱常數 (固定的 HuggingFace 模型ID)
 # 如想更改語者辨識模型，要去 modules/identification/VID_identify_v5.py 改設置
@@ -25,6 +25,7 @@ SPEECHBRAIN_SPEAKER_MODEL = "speechbrain/spkrec-ecapa-voxceleb"
 PYANNOTE_SPEAKER_MODEL = "pyannote/embedding"
 WESPEAKER_SPEAKER_MODEL = "Wespeaker/wespeaker-voxceleb-resnet293-LM"
 SPEECHBRAIN_SEPARATOR_MODEL = "speechbrain/sepformer-whamr16k"
+USE_TIGER = True  # 是否啟用 Tiger 模型選項
 
 # 語者嵌入模型設定，可選：speechbrain / pyannote / wespeaker
 SPEAKER_MODEL_TYPE= "wespeaker"

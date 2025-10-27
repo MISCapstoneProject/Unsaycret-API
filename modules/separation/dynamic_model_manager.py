@@ -27,6 +27,7 @@
 📊 支援模型：
 -----------
  • SepFormer 2人語者分離模型（預訓練）
+ • Tiger 2人語者分離模型（預訓練）
  • SepFormer 3人語者分離模型（自訓練）
 
 ===============================================================================
@@ -36,12 +37,13 @@ import os
 import torch
 from speechbrain.inference import SepformerSeparation as separator
 from enum import Enum
+import modules.look2hear.model
 
 # 導入日誌模組
 from utils.logger import get_logger
 
 # 導入常數
-from utils.constants import AUDIO_SAMPLE_RATE
+from utils.constants import AUDIO_SAMPLE_RATE, USE_TIGER
 
 # 初始化日誌
 logger = get_logger(__name__)
@@ -49,6 +51,7 @@ logger = get_logger(__name__)
 # 模型類型枚舉
 class SeparationModel(Enum):
     SEPFORMER_2SPEAKER = "sepformer_2speaker"    # SepFormer 2人語者分離模型（預訓練）
+    TIGER_2SPEAKER = "tiger_2speaker"          # Tiger 2人語者分離模型（預訓練）
     SEPFORMER_3SPEAKER = "sepformer_3speaker"    # SepFormer 3人語者分離模型（自訓練）
 
 # 模型配置
@@ -56,6 +59,11 @@ MODEL_CONFIGS = {
     SeparationModel.SEPFORMER_2SPEAKER: {
         "model_name": "speechbrain/sepformer-whamr16k",
         "num_speakers": 2,
+        "sample_rate": AUDIO_SAMPLE_RATE
+    },
+    SeparationModel.TIGER_2SPEAKER: {
+        "num_speakers": 2,
+        "model_name": "JusperLee/TIGER-speech",
         "sample_rate": AUDIO_SAMPLE_RATE
     },
     SeparationModel.SEPFORMER_3SPEAKER: {
@@ -91,7 +99,9 @@ class DynamicModelManager:
             tuple: (模型實例, 模型類型)
         """
         # 決定使用哪個模型
-        if num_speakers <= 2:
+        if num_speakers <= 2 and USE_TIGER:
+            target_model_type = SeparationModel.TIGER_2SPEAKER
+        elif num_speakers <= 2:
             target_model_type = SeparationModel.SEPFORMER_2SPEAKER
         else:
             target_model_type = SeparationModel.SEPFORMER_3SPEAKER
@@ -127,8 +137,9 @@ class DynamicModelManager:
             
             # 檢查本地模型目錄
             local_model_path = os.path.abspath(f"models/{model_type.value}")
+            
+            # 檢查是否有無效的符號連結
             if os.path.exists(local_model_path):
-                # 檢查是否有無效的符號連結
                 hyperparams_file = os.path.join(local_model_path, "hyperparams.yaml")
                 if os.path.exists(hyperparams_file):
                     try:
@@ -139,17 +150,35 @@ class DynamicModelManager:
                         import shutil
                         shutil.rmtree(local_model_path, ignore_errors=True)
             
-            # 載入模型
-            model = separator.from_hparams(
-                source=model_name,
-                savedir=local_model_path,
-                run_opts={"device": self.device}
-            )
+            # 載入模型 (無論本地路徑是否存在,都會嘗試載入)
+            if model_type.value == "tiger_2speaker":
+                # 使用 Look2Hear 載入 Tiger 模型
+                logger.info("使用 Look2Hear 載入 Tiger 模型")
+                model = modules.look2hear.model.TIGER.from_pretrained(
+                    model_name,
+                    cache_dir=local_model_path
+                )
+                model.to(self.device)
+                model.eval()
+            else:
+                # 載入 SepFormer 模型
+                logger.info(f"使用 SpeechBrain 載入模型: {model_name}")
+                model = separator.from_hparams(
+                    source=model_name,
+                    savedir=local_model_path,
+                    run_opts={"device": self.device}
+                )
             
             # 測試模型
             with torch.no_grad():
-                test_audio = torch.randn(1, AUDIO_SAMPLE_RATE).to(self.device)
-                _ = model.separate_batch(test_audio)
+                if model_type.value == "tiger_2speaker":
+                    # Tiger 模型使用直接調用
+                    test_audio = torch.randn(1, AUDIO_SAMPLE_RATE).to(self.device)
+                    _ = model(test_audio)
+                else:
+                    # SepFormer 模型使用 separate_batch
+                    test_audio = torch.randn(1, AUDIO_SAMPLE_RATE).to(self.device)
+                    _ = model.separate_batch(test_audio)
             
             self.loaded_models[model_type] = model
             logger.info(f"模型 {model_type.value} 載入並測試完成")
@@ -240,6 +269,7 @@ def get_available_models() -> dict[str, str]:
     """
     return {
         "sepformer_2speaker": "SepFormer 2人語者分離模型（預訓練）",
+        "tiger_2speaker": "Tiger 2人語者分離模型（預訓練）",
         "sepformer_3speaker": "SepFormer 3人語者分離模型（自訓練）"
     }
 
