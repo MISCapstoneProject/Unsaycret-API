@@ -11,10 +11,10 @@ Unsaycret-API 是一套模組化的語音處理系統，整合語音分離、說
 
 - 🎙 **語者分離**：採用 SpeechBrain Sepformer (2人) / ConvTasNet (3人)，支援多人語音分離
 - 🧠 **語音辨識（ASR）**：Faster-Whisper，支援 GPU/CPU 動態切換，逐詞時間戳與信心值
-- 🗣 **說話人辨識**：提供雙模型使用 (正在測試哪一個更優)
-  - SpeechBrain ECAPA-TDNN
-  - PyAnnote Embedding
-  - 支援聲紋自動更新與多聲紋映射
+- 🗣 **語者識別**：Wespeaker wespeaker-voxceleb-resnet293-LM 模型
+  - 向量維度 192，支援高精度聲紋比對
+  - 自動聲紋更新與加權移動平均
+  - 支援多聲紋映射（一人多種聲音環境）
 - 🛜 **API 服務**：FastAPI 提供完整的 RESTful 與 WebSocket 介面
 - 🧠 **Weaviate V2 整合**：語音向量與辨識結果存入 Weaviate V2，支援高效語者搜尋與比對
 - ⚙️ **分層配置**：環境變數(.env) 與應用常數(constants.py) 分離管理
@@ -44,7 +44,7 @@ Unsaycret-API/
 │   ├── database/            # Weaviate V2 資料庫操作
 │   │   ├── database.py
 │   │   └── init_v2_collections.py
-│   ├── identification/      # 語者識別 (ECAPA-TDNN / PyAnnote Embedding)
+│   ├── identification/      # 語者識別 (Wespeaker wespeaker-voxceleb-resnet293-LM)
 │   ├── management/          # 語者管理
 │   └── separation/          # 語者分離 (Sepformer/ConvTasNet)
 ├── pipelines/               # 處理流程編排
@@ -187,15 +187,15 @@ MODELS_BASE_DIR=./models
 ### 應用程式常數 (constants.py)
 演算法固定核心參數，經過實驗調校：
 ```python
-# 語者識別閾值
-THRESHOLD_LOW = 0.26      # 過於相似，不更新向量
-THRESHOLD_UPDATE = 0.34   # 相似度足夠，更新向量  
-THRESHOLD_NEW = 0.385     # 超過此值視為新語者
+# 語者識別閾值（Wespeaker 優化版）
+THRESHOLD_LOW = 0.11      # 過於相似，不更新向量
+THRESHOLD_UPDATE = 0.22   # 相似度足夠，更新向量  
+THRESHOLD_NEW = 0.39      # 超過此值視為新語者
 
 # 模型配置
 DEFAULT_WHISPER_MODEL = "medium"
-SPEECHBRAIN_SPEAKER_MODEL = "speechbrain/spkrec-ecapa-voxceleb"
-PYANNOTE_SPEAKER_MODEL = "pyannote/embedding"
+WESPEAKER_SPEAKER_MODEL = "wespeaker/wespeaker-voxceleb-resnet293-LM"
+SPEAKER_MODEL_TYPE = "wespeaker"  # 可選: "wespeaker" / "speechbrain" / "pyannote"
 ```
 
 ## 🔧 開發指南

@@ -3,15 +3,9 @@
 語者與聲紋資料庫接口 (Speaker and Voiceprint Database Interface) V2
 ===============================================================================
 
-版本：v2.0.1
+版本：v2.1.0
 作者：CYouuu  
-最後更新：2025-07-28
-
-⚠️ 重要變更 ⚠️
-本版本已升級為V2資料庫結構，與V1版本不相容！
-- Speaker: 新增speaker_id (INT)、full_name、nickname、gender、meet_count、meet_days
-- VoicePrint V2: sample_count (預留欄位，可為空值)、quality_score (可為None)
-- 時間欄位重命名: create_time -> created_at, updated_time -> updated_at
+最後更新：2025-10-28
 
 主要功能接口：
 -----------
@@ -1952,16 +1946,17 @@ class DatabaseService:
     
     def list_speechlogs(self) -> list:
         """
-        列出所有 SpeechLog
+        列出所有 SpeechLog (包含語者資訊)
         Returns:
-            list: SpeechLogInfo 列表
+            list: SpeechLogInfo 列表 (包含 speaker_name, speaker_nickname)
         """
         try:
             results = (
                 self.client.collections.get(self.SPEECHLOG_CLASS)
                 .query.fetch_objects(
                     return_references=[
-                        QueryReference(link_on="speaker", return_properties=["uuid"]),
+                        # ✅ JOIN Speaker: 一次性取得 full_name 和 nickname
+                        QueryReference(link_on="speaker", return_properties=["uuid", "full_name", "nickname"]),
                         QueryReference(link_on="session", return_properties=["uuid"])
                     ]
                 )
@@ -1971,11 +1966,17 @@ class DatabaseService:
             for obj in results.objects:
                 # 處理引用
                 speaker_uuid = None
+                speaker_name = None
+                speaker_nickname = None
                 session_uuid = None
                 
                 if obj.references:
+                    # ✅ 從引用中取得 Speaker 的名字和暱稱
                     if obj.references.get("speaker") and obj.references["speaker"].objects:
-                        speaker_uuid = str(obj.references["speaker"].objects[0].uuid)
+                        speaker_obj = obj.references["speaker"].objects[0]
+                        speaker_uuid = str(speaker_obj.uuid)
+                        speaker_name = speaker_obj.properties.get("full_name")
+                        speaker_nickname = speaker_obj.properties.get("nickname")
                     if obj.references.get("session") and obj.references["session"].objects:
                         session_uuid = str(obj.references["session"].objects[0].uuid)
                 
@@ -1992,6 +1993,9 @@ class DatabaseService:
                     "duration": obj.properties.get("duration"),
                     "language": obj.properties.get("language"),
                     "speaker": speaker_uuid,
+                    # ✅ 新增欄位: 直接回傳 Speaker 的名字和暱稱
+                    "speaker_name": speaker_name,
+                    "speaker_nickname": speaker_nickname,
                     "session": session_uuid
                 })
             
@@ -2198,17 +2202,16 @@ class DatabaseService:
 
     def get_speechlogs_by_speaker(self, speaker_id: str) -> list:
         """
-        透過 Speaker 取得相關的 SpeechLog 列表
+        透過 Speaker 取得相關的 SpeechLog 列表 (包含語者資訊)
         
         Args:
             speaker_id: 語者 UUID
             
         Returns:
-            list: SpeechLogInfo 列表
+            list: SpeechLogInfo 列表 (包含 speaker_name, speaker_nickname)
         """
         try:
-            # 暫時使用獲取所有 SpeechLog 然後篩選的方法
-            # 因為 by_ref 查詢語法在當前 Weaviate 版本中可能有問題
+            # 使用優化後的 list_speechlogs (已包含 Speaker JOIN)
             all_speechlogs = self.list_speechlogs()
             
             # 篩選出屬於指定 Speaker 的 SpeechLog
@@ -2223,17 +2226,16 @@ class DatabaseService:
 
     def get_speechlogs_by_session(self, session_id: str) -> list:
         """
-        透過 Session 取得相關的 SpeechLog 列表
+        透過 Session 取得相關的 SpeechLog 列表 (包含語者資訊)
         
         Args:
             session_id: Session UUID
             
         Returns:
-            list: SpeechLogInfo 列表
+            list: SpeechLogInfo 列表 (包含 speaker_name, speaker_nickname)
         """
         try:
-            # 暫時使用獲取所有 SpeechLog 然後篩選的方法
-            # 因為 by_ref 查詢語法在當前 Weaviate 版本中可能有問題
+            # 使用優化後的 list_speechlogs (已包含 Speaker JOIN)
             all_speechlogs = self.list_speechlogs()
             
             # 篩選出屬於指定 Session 的 SpeechLog

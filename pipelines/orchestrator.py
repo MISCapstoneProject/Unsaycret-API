@@ -574,12 +574,13 @@ def run_pipeline_stream(
     def recorder_from_mic():
         pa = pyaudio.PyAudio()
         stream = pa.open(
-            format=pyaudio.paInt16,
+            format=pyaudio.paFloat32,        # ← 改成 Float32
             channels=channels,
             rate=rate,
             input=True,
             frames_per_buffer=frames_per_buffer,
         )
+        BYTES_PER_SAMPLE = 4               # ← 與 process_chunk 一致
         frames_needed = int(rate * chunk_secs)
         buf = bytearray()
         idx = 0
@@ -587,18 +588,21 @@ def run_pipeline_stream(
         try:
             while not stop_event.is_set():
                 if record_secs is not None and time.time() - start_time >= record_secs:
-                    stop_event.set()  # 統一使用 stop_event
+                    stop_event.set()
                     break
                 buf.extend(stream.read(frames_per_buffer, exception_on_overflow=False))
-                if len(buf) // 2 >= frames_needed:
-                    raw = bytes(buf[: frames_needed * 2])
-                    buf = buf[frames_needed * 2 :]
-                    q.put((raw, idx))
+                # Float32: 每樣本 4 bytes
+                if len(buf) // BYTES_PER_SAMPLE >= frames_needed:
+                    need_bytes = frames_needed * BYTES_PER_SAMPLE
+                    raw = bytes(buf[:need_bytes])
+                    buf = buf[need_bytes:]
+                    q.put((raw, idx, rate))     # ← 一次放三個值 (raw, idx, src_sr)
                     idx += 1
         finally:
             stream.stop_stream()
             stream.close()
             pa.terminate()
+
 
     rec_thread = threading.Thread(
         target=recorder_from_queue if in_bytes_queue else recorder_from_mic,

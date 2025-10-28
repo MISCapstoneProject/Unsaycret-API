@@ -1,31 +1,39 @@
-﻿import argparse
-import glob
+import argparse
 import json
-import logging
-import math
 import os
-import queue
-import tempfile
-import threading
 import time
-from collections import deque
-from concurrent.futures import Future, ThreadPoolExecutor
-from dataclasses import dataclass, field
+import queue
+import threading
+from concurrent.futures import ThreadPoolExecutor, Future
+from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
-import torch
-import torchaudio
-from scipy.signal import resample_poly
 
+# optional mic deps
 try:
     import pyaudio  # type: ignore
-except ImportError:  # pragma: no cover - optional dependency
-    pyaudio = None
+except ImportError:
+    pyaudio = None  # we'll just disable stream mode mic if not available
 
-# Align numeric behaviour with v1 orchestrator.
+# heavy deps
+try:
+    import torch
+    import torchaudio
+    import torch.nn.functional as F
+    _HAS_TORCH = True
+except ImportError:
+    _HAS_TORCH = False
+    torch = None  # type: ignore
+    torchaudio = None  # type: ignore
+    F = None  # type: ignore
+
+from scipy.optimize import linear_sum_assignment
+from scipy.signal import resample_poly
+
+# env / local modules
 os.environ.setdefault("MKL_DISABLE_FAST_MM", "1")
 os.environ.setdefault("KMP_DUPLICATE_LIB_OK", "TRUE")
 
@@ -35,1195 +43,1346 @@ from utils.env_config import CUDA_DEVICE_INDEX, FORCE_CPU
 
 from modules.separation.separator import (
     AudioSeparator,
-    MIN_ENERGY_THRESHOLD,
     TARGET_RATE,
 )
 from modules.identification.VID_identify_v5 import SpeakerIdentifier
-from modules.identification.matching_hungarian import HungarianAB
 from modules.asr.whisper_asr import WhisperASR
+from pipelines.fast_aggregator import FastAggregator, AggregatorCLIConfig
 
 
 logger = get_logger(__name__)
 
+# -----------------------------
+# Tunables / heuristics
+# -----------------------------
+
+# 4 秒窗, 每 1 秒往前推 (和 sample 一致)
+DEFAULT_WINDOW_LEN = 4.0
+DEFAULT_STRIDE = 1.0
+
+# 語言相關 (句子切分)
+CJK_LANGS = {"zh", "ja", "ko"}
+SENTENCE_GAP = 0.3  # 如果兩詞之間斷太久，就視為句子邊界
+
+# 匈牙利追蹤
+EMBED_WEIGHT = 1.0
+TIME_DECAY = 0.05         # 隔越久成本越高，避免把一年前的人誤綁現在
+NEW_TRACK_THRESHOLD = 0.85  # 低成本才會沿用舊 track，否則新 track
+TRACK_TTL = 12.0            # 超過多久沒出現就回收 track
+
+# RTF 監控 (只是 log 給你看，不做節流)
+RTF_EMA_ALPHA = 0.2
+
+# -----------------------------
+# Data structures
+# -----------------------------
+
 
 @dataclass
-class SeparationThresholds:
-    min_voiced: float
-    min_rms_db: float
-    min_duration: float
+class SentenceFragment:
+    """一小段語句 (已經組好，不是逐字)"""
+    text: str
+    start: float   # 絕對時間 (全局，而不是片段內)
+    end: float
 
 
 @dataclass
-class AsrGateConfig:
-    min_voiced: float
-    min_rms_db: float
+class RawSourceResult:
+    """
+    單一 source (某位可能的講者) 在本 window 的辨識結果
+    - embedding: 用來給匈牙利追蹤
+    - sentences: 斷句後的句子 (CJK 合併好)
+    - asr_segments: [{text, confidence, start, end}] 給 UI / summary
+    - id_info: (speaker_id, speaker_name, distance) 來自 SpeakerIdentifier
+               不參與 track 決策，只是 metadata
+    """
+    embedding: np.ndarray
+    sentences: List[SentenceFragment]
+    asr_segments: List[dict]
+    id_info: Optional[Tuple[str, str, float]]
+    # 新增：保存「全域時間」的 word 級結果（供 FAST 使用）
+    words: List[dict]
+
+@dataclass
+class WindowRawResult:
+    """
+    單一視窗 4s/1s 的完整成果 (還沒做匈牙利指派 track_id)
+    """
+    window_index: int
+    t_start: float
+    t_end: float
+    sources: List[RawSourceResult]
+    rtf: float
+    seg_dir: Path       # segment_0000/ 這個資料夾路徑
+    error: Optional[str] = None
 
 
 @dataclass
-class AsrRuntimeConfig:
-    language: str = "zh"
-    beam_size: int = 5
-    best_of: int = 5
-    temperature: float = 0.0
-    task: str = "transcribe"
-    condition_on_previous_text: bool = False
-    vad_filter: bool = True
-    vad_parameters: dict = field(default_factory=lambda: {"min_silence_duration_ms": 200})
-    no_speech_threshold: float = 0.5
-    compression_ratio_threshold: float = 2.4
-    log_prob_threshold: float = -1.0
-    suppress_tokens: str = "-1"
+class TrackState:
+    """
+    匈牙利追蹤器裡面維護的 track 狀態
+    - embedding: 此 track 的代表向量（單位向量）
+    - last_seen: 這個 track 最後一次出現 (秒，window 的 end)
+    - ema_alpha: 更新代表向量的平滑係數
+    - sticky_hits: 單一來源黏著命中的次數（僅供觀察/調參）
+    """
+    track_id: int
+    embedding: np.ndarray
+    last_seen: float
+    ema_alpha: float = 0.15
+    sticky_hits: int = 0
+
+
+
+# -----------------------------
+# 小工具 / 輔助函式
+# -----------------------------
+
+
+class SummaryWriter:
+    """
+    把每個 window 的摘要行寫進 <stem>_summary.jsonl
+    """
+    def __init__(self, path: Path) -> None:
+        self._path = path
+        self._path.parent.mkdir(parents=True, exist_ok=True)
+        self._lock = threading.Lock()
+        self._fh = path.open("w", encoding="utf-8")
+
+    def write_line(self, payload: dict) -> None:
+        line = json.dumps(payload, ensure_ascii=False)
+        with self._lock:
+            self._fh.write(line + "\n")
+            self._fh.flush()
+
+    def close(self) -> None:
+        with self._lock:
+            try:
+                self._fh.close()
+            except Exception:
+                pass
+
+
+def _cosine_distance(a: np.ndarray, b: np.ndarray) -> float:
+    """
+    餘弦距離：1 - cos_sim，越小越像
+    若輸入非單位向量，仍做一次安全除法。
+    """
+    dot = float(np.dot(a, b))
+    na = float(np.linalg.norm(a))
+    nb = float(np.linalg.norm(b))
+    if na > 0 and nb > 0:
+        return 1.0 - (dot / (na * nb))
+    # 回退：至少不會炸
+    return 1.0 - dot
+
+
+
+def _merge_cjk_sentences(
+    words: List[dict],
+    fallback_text: str,
+    window_start: float,
+    window_end: float,
+) -> List[SentenceFragment]:
+    """
+    中文/日文/韓文的情況下，句子以停頓(SENTENCE_GAP)或句尾標點切。
+    words: whisper 回傳的逐詞 (我們已經把時間全域對齊了)
+    """
+    if not words:
+        clean = fallback_text.strip()
+        if not clean:
+            return []
+        return [SentenceFragment(text=clean, start=window_start, end=window_end)]
+
+    out: List[SentenceFragment] = []
+    buf: List[str] = []
+    seg_start: Optional[float] = None
+    prev_end: Optional[float] = None
+
+    for w in words:
+        token = (w.get("word") or w.get("text") or "").strip()
+        if not token:
+            continue
+        start = float(w.get("start") or 0.0)
+        end = float(w.get("end") or start)
+
+        # 句開始
+        if seg_start is None:
+            seg_start = start
+
+        # 停頓太久 → 先收一段
+        if prev_end is not None and (start - prev_end > SENTENCE_GAP) and buf:
+            out.append(SentenceFragment("".join(buf), seg_start, prev_end))
+            buf = []
+            seg_start = start
+
+        buf.append(token)
+        prev_end = end
+
+        # 碰到句尾標點就收
+        if token.endswith(("。", "！", "？", ".", "!", "?")):
+            out.append(SentenceFragment("".join(buf), seg_start, end))
+            buf = []
+            seg_start = None
+            prev_end = None
+
+    # 收尾
+    if buf and seg_start is not None and prev_end is not None:
+        out.append(SentenceFragment("".join(buf), seg_start, prev_end))
+
+    return out
+
+
+def _merge_default_sentence(
+    words: List[dict],
+    fallback_text: str,
+    window_start: float,
+    window_end: float,
+) -> List[SentenceFragment]:
+    """
+    英文等：就把每個 word 用空白接成一句，當成一個 fragment
+    """
+    if words:
+        toks = [
+            (w.get("word") or w.get("text") or "").strip()
+            for w in words
+            if (w.get("word") or w.get("text"))
+        ]
+        clean = " ".join([t for t in toks if t]).strip()
+        if clean:
+            s0 = float(words[0].get("start", window_start))
+            s1 = float(words[-1].get("end", window_end))
+            return [SentenceFragment(text=clean, start=s0, end=s1)]
+    clean_fb = fallback_text.strip()
+    if not clean_fb:
+        return []
+    return [SentenceFragment(text=clean_fb, start=window_start, end=window_end)]
+
+
+def _build_sentences(
+    words: List[dict],
+    raw_text: str,
+    lang: str,
+    window_start: float,
+    window_end: float,
+) -> List[SentenceFragment]:
+    """
+    幫某個 source 把 Whisper 的逐詞變成句子片段。
+    - 中文：用 _merge_cjk_sentences
+    - 其他語言：用 _merge_default_sentence
+    """
+    if lang.lower() in CJK_LANGS:
+        return _merge_cjk_sentences(words, raw_text, window_start, window_end)
+    return _merge_default_sentence(words, raw_text, window_start, window_end)
+
+
+def _segments_from_sentences(sentences: List[SentenceFragment]) -> List[List[float]]:
+    """
+    給 summary.jsonl 用的小區間資訊
+    [[start, end], [start, end], ...]
+    """
+    return [
+        [round(seg.start, 3), round(seg.end, 3)]
+        for seg in sentences
+    ]
+
+
+def _build_asr_segments(
+    words: List[dict],
+    fallback_text: str,
+    window_start: float,
+    window_end: float,
+    avg_conf: float,
+) -> List[dict]:
+    """
+    給 output.json 的 asr_segments
+    """
+    if not words:
+        clean = fallback_text.strip()
+        if not clean:
+            return []
+        return [{
+            "text": clean,
+            "confidence": round(float(avg_conf), 3),
+            "start": round(window_start, 3),
+            "end": round(window_end, 3),
+        }]
+
+    return [{
+        "text": fallback_text.strip(),
+        "confidence": round(float(avg_conf), 3),
+        "start": round(float(words[0].get("start", window_start)), 3),
+        "end": round(float(words[-1].get("end", window_end)), 3),
+    }]
+
+
+def _str_to_bool(val: str) -> bool:
+    v = str(val).strip().lower()
+    if v in {"1", "true", "yes", "y", "on"}:
+        return True
+    if v in {"0", "false", "no", "n", "off"}:
+        return False
+    raise ValueError(f"Cannot parse boolean from {val!r}")
+
+
+# -----------------------------
+# 匈牙利追蹤器 (track manager)
+# -----------------------------
+
+
+class TrackManager:
+    """
+    做「連戲」字幕的重點：
+    - 不把 SpeakerIdentifier 的結果塞進決策（避免 track 重命名/亂跳）
+    - 只用 embedding + 時間距離 做匈牙利匹配
+    - 向量以 EMA 平滑，以提升跨窗穩定度
+    - 單一來源情境提供「黏著」保險：只有 1 個活躍 track 且 1 個 source 時，直接續用
+    """
+
+    def __init__(self) -> None:
+        self.tracks: Dict[int, TrackState] = {}
+        self.next_id = 0
+
+    def _expire_old_tracks(self, current_t: float) -> None:
+        stale = [tid for tid, st in self.tracks.items() if (current_t - st.last_seen) > TRACK_TTL]
+        for tid in stale:
+            self.tracks.pop(tid, None)
+
+    def assign(
+        self,
+        window_start: float,
+        window_end: float,
+        embeddings: List[np.ndarray],
+    ) -> Dict[int, int]:
+        """
+        回傳 {source_index: track_id} 並更新各個 track 的 embedding/last_seen
+        """
+        self._expire_old_tracks(window_start)
+        assignments: Dict[int, int] = {}
+        if not embeddings:
+            return assignments
+
+        track_ids = list(self.tracks.keys())
+
+        # --- 單一來源黏著保險 ---
+        if len(track_ids) == 1 and len(embeddings) == 1:
+            tid = track_ids[0]
+            assignments[0] = tid
+            self._ema_update_track(tid, embeddings[0], window_end, sticky=True)
+            return assignments
+
+        if track_ids:
+            cost = np.zeros((len(track_ids), len(embeddings)), dtype=np.float32)
+            for r, tid in enumerate(track_ids):
+                ref = self.tracks[tid]
+                gap = max(0.0, window_start - ref.last_seen)
+                for c, emb in enumerate(embeddings):
+                    dist = _cosine_distance(ref.embedding, emb)
+                    cval = EMBED_WEIGHT * dist + TIME_DECAY * gap
+                    cost[r, c] = cval
+
+            row_idx, col_idx = linear_sum_assignment(cost)
+
+            used_sources = set()
+            for r, c in zip(row_idx, col_idx):
+                if r >= len(track_ids) or c >= len(embeddings):
+                    continue
+                cval = float(cost[r, c])
+                if cval > NEW_TRACK_THRESHOLD:
+                    # 成本太高 → 視為新來源
+                    continue
+                tid = track_ids[r]
+                assignments[c] = tid
+                used_sources.add(c)
+                self._ema_update_track(tid, embeddings[c], window_end)
+
+            # 尚未指派的 source → 新 track
+            for s_idx in range(len(embeddings)):
+                if s_idx in used_sources:
+                    continue
+                tid_new = self._create_track(embeddings[s_idx], window_end)
+                assignments[s_idx] = tid_new
+        else:
+            # 系統剛啟動，沒有既有 track → 全部創新
+            for s_idx, emb in enumerate(embeddings):
+                tid_new = self._create_track(emb, window_end)
+                assignments[s_idx] = tid_new
+
+        return assignments
+
+    def _create_track(self, emb: np.ndarray, last_seen: float) -> int:
+        tid = self.next_id
+        self.next_id += 1
+        # emb 應已正規化；再保險一次
+        emb = emb / max(float(np.linalg.norm(emb)), 1e-12)
+        self.tracks[tid] = TrackState(track_id=tid, embedding=emb, last_seen=last_seen)
+        return tid
+
+    def _ema_update_track(self, tid: int, emb_new: np.ndarray, last_seen: float, sticky: bool = False) -> None:
+        st = self.tracks.get(tid)
+        if st is None:
+            return
+        # 兩邊皆為單位向量，做 EMA 後再正規化
+        alpha = st.ema_alpha
+        merged = (1.0 - alpha) * st.embedding + alpha * emb_new
+        n = float(np.linalg.norm(merged))
+        if n > 0.0 and np.isfinite(n):
+            merged = merged / n
+        st.embedding = merged
+        st.last_seen = last_seen
+        if sticky:
+            st.sticky_hits += 1
+
+
+
+# -----------------------------
+# 初始化各模組 (分離 / 辨識 / ASR)
+# -----------------------------
+
 
 def init_pipeline_modules(
     load_separator: bool = True,
     load_identifier: bool = True,
     load_asr: bool = True,
+    prefer_device: str = "auto",
 ) -> Tuple[Optional[AudioSeparator], Optional[SpeakerIdentifier], Optional[WhisperASR], bool]:
     """
-    Initialise the heavy pipeline modules while respecting the v1 GPU/CPU policy.
-
-    Args:
-        load_separator: Instantiate the separation module if ``True``.
-        load_identifier: Instantiate the speaker identification module if ``True``.
-        load_asr: Instantiate the ASR wrapper if ``True``.
-
-    Returns:
-        Tuple of (separator, identifier, asr, use_gpu_flag).
-        The module entries will be ``None`` when their respective ``load_*`` flag is ``False``.
+    啟動 AudioSeparator, SpeakerIdentifier, WhisperASR
+    回傳 (sep, identifier, asr, use_gpu)
     """
-    current_cuda_device = CUDA_DEVICE_INDEX
+    if not _HAS_TORCH:
+        raise RuntimeError("PyTorch/torchaudio not available.")
 
-    if FORCE_CPU:
+    # 決定要不要走 GPU
+    current_cuda_device = CUDA_DEVICE_INDEX
+    force_cpu = FORCE_CPU or (prefer_device == "cpu")
+    if prefer_device == "cuda" and not torch.cuda.is_available():
+        logger.warning("CUDA requested but not available; fallback to CPU.")
+        force_cpu = True
+
+    if force_cpu:
         use_gpu = False
-        logger.info("FORCE_CPU=true; forcing CPU execution.")
+        logger.info("Running on CPU.")
     else:
         use_gpu = torch.cuda.is_available()
         if use_gpu:
             if current_cuda_device < torch.cuda.device_count():
                 torch.cuda.set_device(current_cuda_device)
-                logger.info(
-                    "CUDA device %s selected (%s)",
-                    current_cuda_device,
-                    torch.cuda.get_device_name(current_cuda_device),
-                )
+                logger.info("CUDA device %s (%s)", current_cuda_device, torch.cuda.get_device_name(current_cuda_device))
             else:
-                logger.warning(
-                    "CUDA index %s unavailable; defaulting to device 0.",
-                    current_cuda_device,
-                )
-                current_cuda_device = 0
-                torch.cuda.set_device(current_cuda_device)
+                logger.warning("CUDA device index %s invalid, defaulting to 0.", current_cuda_device)
+                torch.cuda.set_device(0)
                 logger.info("Using CUDA device 0: %s", torch.cuda.get_device_name(0))
 
-    logger.info("Pipeline device: %s", f"cuda:{current_cuda_device}" if use_gpu else "cpu")
-
+    # 分離
     separator = AudioSeparator() if load_separator else None
-    identifier = SpeakerIdentifier() if load_identifier else None
-    asr = (
-        WhisperASR(
+
+    # 語者辨識
+    identifier = None
+    if load_identifier:
+        try:
+            identifier = SpeakerIdentifier()
+            logger.info("SpeakerIdentifier loaded.")
+        except Exception as exc:
+            logger.warning("SpeakerIdentifier unavailable: %s", exc)
+            identifier = None
+
+    # ASR
+    asr = None
+    if load_asr:
+        asr = WhisperASR(
             model_name=DEFAULT_WHISPER_MODEL,
             gpu=use_gpu,
             beam=DEFAULT_WHISPER_BEAM_SIZE,
         )
-        if load_asr
-        else None
-    )
+
     return separator, identifier, asr, use_gpu
 
 
-def generate_sliding_windows(
-    wav: np.ndarray,
-    sr: int,
-    win_len: float = 4.0,
-    stride: float = 1.0,
-) -> Iterable[Tuple[int, float, float, np.ndarray]]:
-    if wav.ndim != 1:
-        raise ValueError("Sliding window expects a mono waveform (1-D).")
-
-    win_size = int(win_len * sr)
-    hop = int(stride * sr)
-    if win_size <= 0 or hop <= 0:
-        raise ValueError("win_len and stride must be positive.")
-
-    total = wav.shape[0]
-    if total < win_size:
-        return
-
-    idx = 0
-    start = 0
-    while start + win_size <= total:
-        end = start + win_size
-        chunk = wav[start:end].astype(np.float32, copy=False)
-        yield idx, start / sr, end / sr, chunk
-        idx += 1
-        start += hop
-
-def compute_audio_metrics(audio: np.ndarray, sr: int) -> Dict[str, float]:
-    if audio.size == 0 or sr <= 0:
-        return {
-            "rms_db": -120.0,
-            "voiced_ratio": 0.0,
-            "duration_s": 0.0,
-            "peak_db": -120.0,
-        }
-
-    duration = float(audio.size) / float(sr)
-    rms = float(math.sqrt(np.mean(np.square(audio)) + 1e-12))
-    peak = float(np.max(np.abs(audio)) if audio.size else 0.0)
-    rms_db = 20.0 * math.log10(max(rms, 1e-9))
-    peak_db = 20.0 * math.log10(max(peak, 1e-9))
-
-    frame_len = max(1, int(0.02 * sr))
-    if audio.size < frame_len:
-        voiced_ratio = 1.0 if peak > 1e-3 else 0.0
-    else:
-        trimmed = (audio.size // frame_len) * frame_len
-        frames = audio[:trimmed].reshape(-1, frame_len)
-        frame_rms = np.sqrt(np.mean(np.square(frames), axis=1) + 1e-12)
-        threshold = max(1e-4, 0.25 * rms)
-        voiced_ratio = float(np.mean(frame_rms > threshold))
-
-    return {
-        "rms_db": rms_db,
-        "voiced_ratio": voiced_ratio,
-        "duration_s": duration,
-        "peak_db": peak_db,
-    }
+# -----------------------------
+# 音訊切窗
+# -----------------------------
 
 
-def should_drop_source(metrics: Dict[str, float], thresholds: SeparationThresholds) -> bool:
-    return (
-        metrics["voiced_ratio"] < thresholds.min_voiced
-        or metrics["rms_db"] < thresholds.min_rms_db
-        or metrics["duration_s"] < thresholds.min_duration
-    )
-
-
-def passes_asr_gate(metrics: Dict[str, float], gate: AsrGateConfig) -> bool:
-    return metrics["voiced_ratio"] >= gate.min_voiced and metrics["rms_db"] >= gate.min_rms_db
-
-
-def average_confidence(segments: List[Dict[str, Any]]) -> Optional[float]:
-    if not segments:
-        return None
-    vals = [seg.get("confidence") for seg in segments if seg.get("confidence") is not None]
-    if not vals:
-        return None
-    return float(sum(vals) / len(vals))
-
-
-def _blend_words_to_segment(
-    words: List[Dict[str, Any]],
-    window_start: float,
-    window_end: float,
-    text: str,
-    avg_conf: float,
-) -> List[Dict[str, Any]]:
-    if not words:
-        clean_text = text.strip()
-        if not clean_text:
-            return []
-        return [
-            {
-                "start": round(window_start, 3),
-                "end": round(window_end, 3),
-                "text": clean_text,
-                "confidence": round(float(avg_conf), 3),
-            }
-        ]
-
-    seg_start = window_start + float(words[0]["start"])
-    seg_end = window_start + float(words[-1]["end"])
-    return [
-        {
-            "start": round(seg_start, 3),
-            "end": round(seg_end, 3),
-            "text": text.strip(),
-            "confidence": round(float(avg_conf), 3),
-        }
-    ]
-
-
-def _decode_audio_bytes(raw_bytes: bytes, channels: int, bytes_per_sample: int) -> np.ndarray:
-    if bytes_per_sample not in (2, 4):
-        raise ValueError(f"Unsupported bytes_per_sample={bytes_per_sample}")
-
-    dtype = np.float32 if bytes_per_sample == 4 else np.int16
-    waveform = np.frombuffer(raw_bytes, dtype=dtype)
-    if channels > 1:
-        waveform = waveform.reshape(-1, channels).mean(axis=1)
-    if bytes_per_sample == 2:
-        waveform = waveform.astype(np.float32) / 32768.0
-    else:
-        waveform = waveform.astype(np.float32, copy=False)
-    return waveform
-
-class WindowOrchestrator:
+def _load_audio_file(path: Path) -> Tuple[torch.Tensor, int]:
     """
-    Sliding-window orchestrator that reuses the v1 modules while offering new modes.
+    讀整支 wav, downmix 成單聲道, resample 到 TARGET_RATE
+    回傳 (waveform[TorchTensor shape=(1,T)], sr)
     """
-
-    def __init__(
-        self,
-        separator: Optional[AudioSeparator],
-        identifier: Optional[SpeakerIdentifier],
-        asr: Optional[WhisperASR],
-        mode: str,
-        win_len: float = 4.0,
-        stride: float = 1.0,
-        separation_thresholds: SeparationThresholds = SeparationThresholds(0.30, -45.0, 0.50),
-        asr_gate: AsrGateConfig = AsrGateConfig(0.60, -45.0),
-        enable_asr: bool = True,
-        debug: bool = False,
-        debug_audio: bool = False,
-        asr_config: AsrRuntimeConfig = AsrRuntimeConfig(),
-    ) -> None:
-        if separator is None:
-            raise ValueError("AudioSeparator instance is required for sliding-window processing.")
-        if identifier is None:
-            raise ValueError("SpeakerIdentifier instance is required for sliding-window processing.")
-
-        self.sep = separator
-        self.identifier = identifier
-        self.asr = asr
-        self.mode = mode
-        self.win_len = win_len
-        self.stride = stride
-        self.sep_thresholds = separation_thresholds
-        self.asr_gate = asr_gate
-        self.enable_asr = enable_asr and (mode == "pipeline")
-        self.debug = debug
-        self.debug_audio = debug_audio
-        self.asr_config = asr_config
-
-        self.matcher = HungarianAB()
-        self._asr_kwargs = {
-            "language": asr_config.language,
-            "beam_size": asr_config.beam_size,
-            "best_of": asr_config.best_of,
-            "temperature": asr_config.temperature,
-            "task": asr_config.task,
-            "condition_on_previous_text": asr_config.condition_on_previous_text,
-            "vad_filter": asr_config.vad_filter,
-            "vad_parameters": asr_config.vad_parameters,
-            "no_speech_threshold": asr_config.no_speech_threshold,
-            "compression_ratio_threshold": asr_config.compression_ratio_threshold,
-            "log_prob_threshold": asr_config.log_prob_threshold,
-            "suppress_tokens": asr_config.suppress_tokens,
-        }
-
-    def process_window(
-        self,
-        window_idx: int,
-        t_start: float,
-        t_end: float,
-        chunk: np.ndarray,
-        chunk_sr: int = TARGET_RATE,
-    ) -> Dict[str, Any]:
-        if self.mode == "asr_only":
-            raise RuntimeError("process_window is not applicable in ASR-only mode.")
-
-        if chunk.size == 0:
-            logger.warning(
-                "Window %03d [%.2f, %.2f] received empty audio chunk.",
-                window_idx,
-                t_start,
-                t_end,
-            )
-            return self._empty_result(window_idx, t_start, t_end)
-
-        chunk = np.asarray(chunk, dtype=np.float32)
-        energy = float(np.mean(np.abs(chunk)))
-        if energy < MIN_ENERGY_THRESHOLD:
-            logger.warning(
-                "Window %03d [%.2f, %.2f] low energy (%.4f); skipping.",
-                window_idx,
-                t_start,
-                t_end,
-                energy,
-            )
-            return self._empty_result(window_idx, t_start, t_end)
-
-        if chunk_sr != TARGET_RATE:
-            chunk = resample_poly(chunk, TARGET_RATE, chunk_sr).astype(np.float32)
-            chunk_sr = TARGET_RATE
-
-        tensor_input = torch.from_numpy(chunk).unsqueeze(0).to(self.sep.device)
-
-        with torch.no_grad():
-            detected = self.sep.spk_counter.count_with_refine(
-                audio=tensor_input,
-                sample_rate=TARGET_RATE,
-                expected_min=1,
-                expected_max=3,
-                first_pass_range=(1, 3),
-                allow_zero=True,
-                debug=False,
-            )
-
-        if detected <= 0:
-            with torch.no_grad():
-                detected = self.sep.spk_counter.count_with_refine(
-                    audio=tensor_input,
-                    sample_rate=TARGET_RATE,
-                    expected_min=1,
-                    expected_max=3,
-                    first_pass_range=(1, 3),
-                    allow_zero=False,
-                    debug=False,
-                )
-
-        if detected <= 0:
-            logger.info(
-                "Window %03d [%.2f, %.2f] contains no active speakers.",
-                window_idx,
-                t_start,
-                t_end,
-            )
-            return self._empty_result(window_idx, t_start, t_end)
-        separated_sources, total_sources = self._separate_sources(
-            tensor_input, detected, window_idx
-        )
-        if not separated_sources:
-            logger.warning(
-                "Window %03d [%.2f, %.2f] separation returned no sources.",
-                window_idx,
-                t_start,
-                t_end,
-            )
-            return self._empty_result(window_idx, t_start, t_end, num_sources=0)
-
-        source_infos: List[Dict[str, Any]] = []
-        for idx, audio in enumerate(separated_sources):
-            metrics = compute_audio_metrics(audio, TARGET_RATE)
-            dropped = should_drop_source(metrics, self.sep_thresholds)
-            source_infos.append(
-                {
-                    "index": idx,
-                    "audio": audio,
-                    "metrics": metrics,
-                    "dropped": dropped,
-                }
-            )
-
-        kept = [info for info in source_infos if not info["dropped"]]
-        dropped = [info for info in source_infos if info["dropped"]]
-
-        if self.debug:
-            logger.debug(
-                "Window %03d metrics: %s",
-                window_idx,
-                [
-                    {
-                        "idx": info["index"],
-                        "rms_db": round(info["metrics"]["rms_db"], 2),
-                        "voiced_ratio": round(info["metrics"]["voiced_ratio"], 3),
-                        "duration_s": round(info["metrics"]["duration_s"], 3),
-                        "dropped": info["dropped"],
-                    }
-                    for info in source_infos
-                ],
-            )
-
-        embeddings: List[np.ndarray] = []
-        for info in kept:
-            try:
-                emb_audio = self._select_embedding_region(info["audio"], TARGET_RATE)
-                embedding = self.identifier.audio_processor.extract_embedding_from_stream(
-                    emb_audio, TARGET_RATE
-                )
-            except Exception as exc:  # pragma: no cover - defensive logging
-                logger.warning(
-                    "Window %03d embedding extraction failed for source %d: %s",
-                    window_idx,
-                    info["index"],
-                    exc,
-                )
-                embedding = np.zeros(192, dtype=np.float32)
-            embeddings.append(embedding)
-            info["embedding"] = embedding
-
-        assignment: Dict[int, int] = {}
-        if embeddings:
-            assignment = self.matcher.assign(embeddings)
-
-        cost_matrix = self.matcher.last_debug.get("cost_matrix")
-        if self.debug and cost_matrix is not None:
-            logger.debug("Window %03d cost matrix:\n%s", window_idx, cost_matrix)
-            logger.debug("Window %03d assignment: %s", window_idx, assignment)
-
-        track_entries: Dict[int, Dict[str, Any]] = {0: None, 1: None}  # type: ignore
-
-        for src_idx, track_id in assignment.items():
-            info = kept[src_idx]
-            metrics = info["metrics"]
-            track_entry = self._base_track_entry(track_id, metrics)
-
-            if self.mode == "sep_only":
-                track_entry["skip_reason"] = "sep_only_mode"
-            elif not self.enable_asr:
-                track_entry["skip_reason"] = "asr_disabled"
-            else:
-                if not self.asr:
-                    logger.error("ASR module is unavailable; skipping ASR inference.")
-                    track_entry["skip_reason"] = "asr_module_missing"
-                elif not passes_asr_gate(metrics, self.asr_gate):
-                    track_entry["skip_reason"] = "asr_gated_low_voice"
-                else:
-                    segments = self._run_asr_on_source(info["audio"], t_start, t_end)
-                    track_entry["asr_segments"] = segments
-                    track_entry["segments"] = len(segments)
-                    track_entry["avg_conf"] = average_confidence(segments)
-                    if self.debug:
-                        logger.debug(
-                            "Window %03d track %d ASR segments=%d avg_conf=%s",
-                            window_idx,
-                            track_id,
-                            track_entry["segments"],
-                            track_entry["avg_conf"],
-                        )
-            track_entries[track_id] = track_entry
-
-        remaining_track_ids = [tid for tid in (0, 1) if track_entries[tid] is None]
-        for info, track_id in zip(dropped, remaining_track_ids):
-            metrics = info["metrics"]
-            entry = self._base_track_entry(track_id, metrics)
-            entry["skip_reason"] = "silent_source_dropped"
-            track_entries[track_id] = entry
-
-        for track_id in (0, 1):
-            if track_entries[track_id] is None:
-                track_entries[track_id] = {
-                    "track_id": track_id,
-                    "rms_db": None,
-                    "voiced_ratio": None,
-                    "duration_s": None,
-                    "peak_db": None,
-                    "segments": 0,
-                    "avg_conf": None,
-                    "asr_segments": [],
-                    "skip_reason": "no_source_detected",
-                }
-
-        tracks_payload = sorted(track_entries.values(), key=lambda item: item["track_id"])
-        num_after_drop = sum(1 for entry in tracks_payload if entry.get("skip_reason") != "silent_source_dropped")
-
-        logger.info(
-            "Window %03d [%.2f, %.2f] -> detected=%d separated=%d kept=%d",
-            window_idx,
-            t_start,
-            t_end,
-            detected,
-            len(source_infos),
-            len(kept),
-        )
-
-        return {
-            "window_index": window_idx,
-            "t_start": round(float(t_start), 3),
-            "t_end": round(float(t_end), 3),
-            "num_sources_before_drop": len(source_infos),
-            "num_sources_after_drop": len(kept),
-            "num_sources": num_after_drop,
-            "tracks": tracks_payload,
-        }
-    def _base_track_entry(self, track_id: int, metrics: Dict[str, float]) -> Dict[str, Any]:
-        return {
-            "track_id": track_id,
-            "rms_db": round(float(metrics["rms_db"]), 3),
-            "voiced_ratio": round(float(metrics["voiced_ratio"]), 3),
-            "duration_s": round(float(metrics["duration_s"]), 3),
-            "peak_db": round(float(metrics["peak_db"]), 3),
-            "segments": 0,
-            "avg_conf": None,
-            "asr_segments": [],
-        }
-
-    def _empty_result(
-        self,
-        window_idx: int,
-        t_start: float,
-        t_end: float,
-        num_sources: int = 0,
-    ) -> Dict[str, Any]:
-        return {
-            "window_index": window_idx,
-            "t_start": round(float(t_start), 3),
-            "t_end": round(float(t_end), 3),
-            "num_sources_before_drop": num_sources,
-            "num_sources_after_drop": 0,
-            "num_sources": 0,
-            "tracks": [
-                {
-                    "track_id": 0,
-                    "rms_db": None,
-                    "voiced_ratio": None,
-                    "duration_s": None,
-                    "peak_db": None,
-                    "segments": 0,
-                    "avg_conf": None,
-                    "asr_segments": [],
-                    "skip_reason": "no_source_detected",
-                },
-                {
-                    "track_id": 1,
-                    "rms_db": None,
-                    "voiced_ratio": None,
-                    "duration_s": None,
-                    "peak_db": None,
-                    "segments": 0,
-                    "avg_conf": None,
-                    "asr_segments": [],
-                    "skip_reason": "no_source_detected",
-                },
-            ],
-        }
-
-    def _separate_sources(
-        self,
-        tensor_input: torch.Tensor,
-        detected: int,
-        window_idx: int,
-    ) -> Tuple[List[np.ndarray], int]:
-        with torch.no_grad():
-            model, _ = self.sep._get_appropriate_model(int(max(1, detected)))
-            prepared = tensor_input
-            if prepared.dim() == 3 and prepared.shape[1] == 1:
-                prepared = prepared.squeeze(1)
-
-            estimates = model.separate_batch(prepared)
-            estimates, layout, _, _ = self.sep._normalize_estimates(estimates)
-
-        if layout == "BST":
-            est_st = estimates[0]
-        elif layout == "BTS":
-            est_st = estimates[0].transpose(0, 1)
-        elif layout == "BT":
-            est_st = estimates.unsqueeze(0) if estimates.dim() == 1 else estimates
-        else:
-            est_st = estimates
-
-        if est_st.dim() == 1:
-            est_st = est_st.unsqueeze(0)
-
-        total_sources = est_st.shape[0]
-        energy = est_st.pow(2).mean(dim=1)
-        order = torch.argsort(energy, descending=True)
-
-        top_count = min(2, total_sources)
-        if total_sources > top_count:
-            logger.warning(
-                "Window %03d detected %d sources; selecting top-%d by energy.",
-                window_idx,
-                total_sources,
-                top_count,
-            )
-
-        top_indices = order[:top_count]
-        separated = [
-            est_st[idx].detach().cpu().numpy().astype(np.float32) for idx in top_indices
-        ]
-
-        return separated, total_sources
-
-    def _select_embedding_region(self, audio: np.ndarray, sr: int) -> np.ndarray:
-        if audio.size == 0:
-            return audio
-
-        target = min(audio.shape[0], max(int(sr), int(2 * sr)))
-        if audio.shape[0] <= target:
-            return audio
-
-        frame = max(1, int(0.25 * sr))
-        trimmed = (audio.shape[0] // frame) * frame
-        if trimmed == 0:
-            return audio[-target:]
-
-        frames = audio[:trimmed].reshape(-1, frame)
-        energy = np.mean(np.square(frames), axis=1)
-        best_idx = int(np.argmax(energy))
-        start = min(best_idx * frame, audio.shape[0] - target)
-        start = max(0, start)
-        return audio[start : start + target]
-
-    def _run_asr_on_source(
-        self,
-        audio: np.ndarray,
-        window_start: float,
-        window_end: float,
-    ) -> List[Dict[str, Any]]:
-        if not self.asr or audio.size == 0:
-            return []
-
-        tensor = torch.from_numpy(audio).unsqueeze(0)
-
-        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
-            tmp_path = tmp.name
-        try:
-            torchaudio.save(tmp_path, tensor, TARGET_RATE)
-            text, avg_conf, words = self.asr.transcribe(tmp_path, **self._asr_kwargs)
-            return _blend_words_to_segment(words, window_start, window_end, text, avg_conf)
-        finally:
-            try:
-                os.remove(tmp_path)
-            except FileNotFoundError:  # pragma: no cover - defensive cleanup
-                pass
-
-def _prepare_audio(path: Path) -> Tuple[np.ndarray, int]:
-    waveform, sr = torchaudio.load(str(path))
+    waveform, sr = torchaudio.load(str(path))  # [ch, T]
     if waveform.ndim != 2:
-        raise ValueError("Unexpected waveform shape.")
-
+        raise ValueError("Unexpected waveform shape from torchaudio.load")
     if waveform.shape[0] > 1:
-        waveform = waveform.mean(dim=0, keepdim=False)
-    else:
-        waveform = waveform.squeeze(0)
-
-    waveform_np = waveform.cpu().numpy()
-
+        # 轉單聲道
+        waveform = waveform.mean(dim=0, keepdim=True)
     if sr != TARGET_RATE:
-        waveform_np = resample_poly(waveform_np, TARGET_RATE, sr)
+        waveform = torchaudio.functional.resample(waveform, sr, TARGET_RATE)
         sr = TARGET_RATE
+    # 確保 contiguous + float32
+    return waveform.contiguous().to(torch.float32), sr
 
-    return waveform_np.astype(np.float32), sr
 
-def run_file_pipeline(
-    wav_path: Path,
-    out_path: Path,
+def _generate_windows(
+    waveform: torch.Tensor,
+    sr: int,
     win_len: float,
     stride: float,
-    mode: str,
-    separation_thresholds: SeparationThresholds,
-    asr_gate: AsrGateConfig,
-    enable_asr: bool,
-    debug: bool,
-    debug_audio: bool,
-    asr_config: AsrRuntimeConfig,
-) -> None:
-    if mode == "asr_only":
-        raise RuntimeError("run_file_pipeline cannot be used in ASR-only mode.")
+) -> Iterable[Tuple[int, float, float, torch.Tensor]]:
+    """
+    sliding window:
+    - 每個 window 長 win_len 秒 (預設 4s)
+    - 每次平移 stride 秒 (預設 1s)
+    - 最後一段如果不夠長，用 zero pad 補齊到 win_len
+    """
+    assert waveform.ndim == 2 and waveform.shape[0] == 1
+    total_samples = waveform.shape[1]
 
-    load_asr = mode == "pipeline" and enable_asr
-    sep, identifier, asr, use_gpu = init_pipeline_modules(
-        load_separator=True,
-        load_identifier=True,
-        load_asr=load_asr,
-    )
+    win_samples = max(1, int(round(win_len * sr)))
+    hop_samples = max(1, int(round(stride * sr)))
 
-    if asr:
-        asr.lang = asr_config.language
-
-    orchestrator = WindowOrchestrator(
-        separator=sep,
-        identifier=identifier,
-        asr=asr,
-        mode=mode,
-        win_len=win_len,
-        stride=stride,
-        separation_thresholds=separation_thresholds,
-        asr_gate=asr_gate,
-        enable_asr=enable_asr,
-        debug=debug,
-        debug_audio=debug_audio,
-        asr_config=asr_config,
-    )
-
-    waveform, sr = _prepare_audio(wav_path)
-    if sr != TARGET_RATE:
-        raise RuntimeError("Audio preparation failed to resample properly.")
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    windows = list(generate_sliding_windows(waveform, sr, win_len=win_len, stride=stride))
-    if not windows:
-        logger.warning(
-            "Audio shorter than window length (%.2fs); nothing to process.", win_len
-        )
-        return
-
-    logger.info("Processing %d windows from %s", len(windows), wav_path)
-
-    with out_path.open("a", encoding="utf-8") as handle:
-        for idx, t0, t1, chunk in windows:
-            result = orchestrator.process_window(idx, t0, t1, chunk, chunk_sr=TARGET_RATE)
-            handle.write(json.dumps(result, ensure_ascii=False) + "\n")
-
-    if use_gpu and torch.cuda.is_available():
-        try:
-            torch.cuda.empty_cache()
-        except Exception:  # pragma: no cover - defensive cleanup
-            pass
-
-def run_asr_only_mix(
-    wav_path: Path,
-    out_path: Path,
-    asr: WhisperASR,
-    asr_config: AsrRuntimeConfig,
-) -> None:
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    asr.lang = asr_config.language
-    kwargs = {
-        "language": asr_config.language,
-        "beam_size": asr_config.beam_size,
-        "best_of": asr_config.best_of,
-        "temperature": asr_config.temperature,
-        "task": asr_config.task,
-        "condition_on_previous_text": asr_config.condition_on_previous_text,
-        "vad_filter": asr_config.vad_filter,
-        "vad_parameters": asr_config.vad_parameters,
-        "no_speech_threshold": asr_config.no_speech_threshold,
-        "compression_ratio_threshold": asr_config.compression_ratio_threshold,
-        "log_prob_threshold": asr_config.log_prob_threshold,
-        "suppress_tokens": asr_config.suppress_tokens,
-    }
-    text, avg_conf, words = asr.transcribe(str(wav_path), **kwargs)
-    result = {
-        "mode": "asr_only_mix",
-        "input": str(wav_path),
-        "text": text,
-        "avg_conf": avg_conf,
-        "words": words,
-    }
-    out_path.write_text(json.dumps(result, ensure_ascii=False, indent=2), encoding="utf-8")
-    logger.info("ASR-only mix result written to %s", out_path)
-
-
-def run_asr_only_files(
-    pattern: str,
-    out_path: Path,
-    asr: WhisperASR,
-    asr_config: AsrRuntimeConfig,
-) -> None:
-    paths = sorted(Path().glob(pattern))
-    if not paths:
-        logger.warning("No files matched pattern %s", pattern)
-        return
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    asr.lang = asr_config.language
-    kwargs = {
-        "language": asr_config.language,
-        "beam_size": asr_config.beam_size,
-        "best_of": asr_config.best_of,
-        "temperature": asr_config.temperature,
-        "task": asr_config.task,
-        "condition_on_previous_text": asr_config.condition_on_previous_text,
-        "vad_filter": asr_config.vad_filter,
-        "vad_parameters": asr_config.vad_parameters,
-        "no_speech_threshold": asr_config.no_speech_threshold,
-        "compression_ratio_threshold": asr_config.compression_ratio_threshold,
-        "log_prob_threshold": asr_config.log_prob_threshold,
-        "suppress_tokens": asr_config.suppress_tokens,
-    }
-
-    with out_path.open("a", encoding="utf-8") as handle:
-        for path in paths:
-            text, avg_conf, words = asr.transcribe(str(path), **kwargs)
-            result = {
-                "mode": "asr_only_files",
-                "input": str(path),
-                "text": text,
-                "avg_conf": avg_conf,
-                "words": words,
-            }
-            handle.write(json.dumps(result, ensure_ascii=False) + "\n")
-    logger.info("ASR-only files result written to %s", out_path)
-
-def run_pipeline_stream_v2(
-    chunk_secs: float = 4.0,
-    rate: int = 16000,
-    channels: int = 1,
-    frames_per_buffer: int = 1024,
-    max_workers: int = 2,
-    record_secs: Optional[float] = None,
-    queue_out: "queue.Queue[dict] | None" = None,
-    stop_event: Optional[threading.Event] = None,
-    in_bytes_queue: "queue.Queue[bytes] | None" = None,
-    sep: Optional[AudioSeparator] = None,
-    spk: Optional[SpeakerIdentifier] = None,
-    asr: Optional[WhisperASR] = None,
-    out_path: Optional[Path] = None,
-    debug_audio: bool = False,
-    mode: str = "pipeline",
-    separation_thresholds: SeparationThresholds = SeparationThresholds(0.30, -45.0, 0.50),
-    asr_gate: AsrGateConfig = AsrGateConfig(0.60, -45.0),
-    enable_asr: bool = True,
-    debug: bool = False,
-    asr_config: AsrRuntimeConfig = AsrRuntimeConfig(),
-) -> None:
-    if mode == "asr_only":
-        raise ValueError("Streaming ASR-only mode is not supported.")
-
-    if sep is None or spk is None or (asr is None and mode == "pipeline" and enable_asr):
-        load_asr = mode == "pipeline" and enable_asr
-        sep, spk, asr, _ = init_pipeline_modules(
-            load_separator=True,
-            load_identifier=True,
-            load_asr=load_asr,
-        )
-
-    if asr:
-        asr.lang = asr_config.language
-
-    orchestrator = WindowOrchestrator(
-        separator=sep,
-        identifier=spk,
-        asr=asr,
-        mode=mode,
-        win_len=chunk_secs,
-        stride=1.0,
-        separation_thresholds=separation_thresholds,
-        asr_gate=asr_gate,
-        enable_asr=enable_asr,
-        debug=debug,
-        debug_audio=debug_audio,
-        asr_config=asr_config,
-    )
-
-    output_path = out_path or Path("outputs") / "v2_windows.jsonl"
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-
-    taipei_tz = timezone(timedelta(hours=8))
-    stream_start = datetime.now(taipei_tz)
-
-    executor: ThreadPoolExecutor = ThreadPoolExecutor(max_workers=max_workers)
-    pending: Dict[int, Future] = {}
-    next_to_write = 0
-
-    results_queue: "queue.Queue[Tuple[bytes, int, int, int, int]]" = queue.Queue(maxsize=max_workers * 2)
-    shared_stop = stop_event or threading.Event()
-
-    ingest_chunks = deque(maxlen=max(1, int(round(chunk_secs / 1.0))))
-    out_handle = output_path.open("a", encoding="utf-8")
-
-    ring_sr: Optional[int] = None
-    bytes_per_sample_hint: Optional[int] = None
-
-    running = True
-
-    def submit_window(
-        idx: int,
-        t_start: float,
-        t_end: float,
-        audio_chunk: np.ndarray,
-        src_sr: int,
-    ) -> None:
-        future = executor.submit(
-            orchestrator.process_window,
-            idx,
-            t_start,
-            t_end,
-            audio_chunk,
-            src_sr,
-        )
-        pending[idx] = future
-        flush_pending()
-
-    def flush_pending(force: bool = False) -> None:
-        nonlocal next_to_write
-        while next_to_write in pending:
-            future = pending[next_to_write]
-            if not future.done():
-                if not force:
-                    break
-                try:
-                    future.result(timeout=10.0)
-                except Exception as exc:
-                    logger.error("Window %03d failed: %s", next_to_write, exc)
-            try:
-                result = future.result()
-            except Exception as exc:  # pragma: no cover - already logged
-                logger.error("Window %03d processing error: %s", next_to_write, exc)
-                result = orchestrator._empty_result(
-                    next_to_write,
-                    next_to_write,
-                    next_to_write + chunk_secs,
-                )
-
-            out_handle.write(json.dumps(result, ensure_ascii=False) + "\n")
-            out_handle.flush()
-
-            if queue_out is not None:
-                queue_out.put(result)
-            del pending[next_to_write]
-            next_to_write += 1
-    def recorder_from_queue() -> None:
-        nonlocal ring_sr, bytes_per_sample_hint
-        ch = max(1, int(channels))
-
-        buf = bytearray()
-        idx = 0
-        start_time = time.time()
-
-        provisional_sr = max(1, int(rate))
-        frames_needed = int(provisional_sr * 1.0) * ch
-
-        calibrated = False
-        calib_t0 = time.time()
-        calib_bytes = 0
-
-        while not shared_stop.is_set():
-            try:
-                pkt = in_bytes_queue.get(timeout=0.1)  # type: ignore[arg-type]
-            except queue.Empty:
-                if record_secs is not None and time.time() - start_time >= record_secs:
-                    shared_stop.set()
-                    break
-                continue
-
-            buf.extend(pkt)
-            calib_bytes += len(pkt)
-
-            if not calibrated:
-                elapsed = max(1e-3, time.time() - calib_t0)
-                if elapsed >= 0.30:
-                    candidates_sr = [48000, 44100, 32000, 24000, 22050, 16000]
-                    best_score = float("inf")
-                    best_choice = (provisional_sr, 4)
-                    for bps in (2, 4):
-                        est_sr = calib_bytes / (elapsed * bps * ch)
-                        candidate = min(candidates_sr, key=lambda s: abs(s - est_sr))
-                        score = abs(candidate - est_sr)
-                        if score < best_score:
-                            best_score = score
-                            best_choice = (int(candidate), bps)
-                    ring_sr, bytes_per_sample_hint = best_choice
-                    frames_needed = int(ring_sr * 1.0) * bytes_per_sample_hint * ch
-                    calibrated = True
-                    logger.info(
-                        "[calib] est_sr≈%.1fHz -> use %dHz, bytes/sample=%d",
-                        calib_bytes / (elapsed * ch * best_choice[1]),
-                        ring_sr,
-                        bytes_per_sample_hint,
-                    )
-
-            if not calibrated:
-                continue
-
-            required = int(ring_sr * 1.0) * bytes_per_sample_hint * ch
-            while len(buf) >= required:
-                raw = bytes(buf[:required])
-                del buf[:required]
-                results_queue.put((raw, idx, ring_sr, bytes_per_sample_hint, ch))
-                idx += 1
-
-    def recorder_from_mic() -> None:
-        if pyaudio is None:
-            raise RuntimeError("pyaudio is required for microphone streaming mode.")
-
-        pa = pyaudio.PyAudio()
-        stream = pa.open(
-            format=pyaudio.paInt16,
-            channels=channels,
-            rate=rate,
-            input=True,
-            frames_per_buffer=frames_per_buffer,
-        )
-        bytes_per_sample = 2
-        frames_needed = int(rate * 1.0) * bytes_per_sample * channels
-        buf = bytearray()
-        idx = 0
-        start_time = time.time()
-
-        try:
-            while not shared_stop.is_set():
-                data = stream.read(frames_per_buffer, exception_on_overflow=False)
-                buf.extend(data)
-
-                if record_secs is not None and time.time() - start_time >= record_secs:
-                    shared_stop.set()
-                    break
-
-                while len(buf) >= frames_needed:
-                    raw = bytes(buf[:frames_needed])
-                    del buf[:frames_needed]
-                    results_queue.put((raw, idx, rate, bytes_per_sample, channels))
-                    idx += 1
-        finally:
-            stream.stop_stream()
-            stream.close()
-            pa.terminate()
-    ingest_thread = threading.Thread(
-        target=recorder_from_queue if in_bytes_queue else recorder_from_mic,
-        daemon=True,
-    )
-    ingest_thread.start()
-
-    loop_start = time.time()
+    start_sample = 0
     window_idx = 0
 
+    while start_sample < total_samples:
+        end_sample = start_sample + win_samples
+        chunk = waveform[:, start_sample:end_sample]  # shape [1, T?<=win_samples]
+        if chunk.shape[1] < win_samples:
+            pad = win_samples - chunk.shape[1]
+            if F is None:
+                raise RuntimeError("torch.nn.functional (F.pad) missing.")
+            chunk = F.pad(chunk, (0, pad))  # right pad zeros
+
+        t0 = start_sample / sr
+        t1 = t0 + win_len
+        yield window_idx, t0, t1, chunk.contiguous()
+        window_idx += 1
+        start_sample += hop_samples
+
+
+# -----------------------------
+# 一個 window 的 heavy 工作
+# -----------------------------
+
+
+def _offset_words_global(words: List[dict], offset: float) -> List[dict]:
+    """
+    Whisper 回傳的 word 時間通常是相對於該音檔開頭(0s)。
+    我們把它加上 window 的起點 t_start，變成全域時間軸。
+    """
+    adjusted = []
+    for w in words or []:
+        local_start = float(w.get("start") or 0.0)
+        local_end = float(w.get("end") or w.get("start") or 0.0)
+        adjusted.append(
+            {
+                "word": str(w.get("word") or w.get("text") or "").strip(),
+                "text": str(w.get("text") or w.get("word") or "").strip(),
+                "start": local_start + offset,
+                "end": local_end + offset,
+                "probability": float(w.get("probability") or w.get("prob") or 0.0),
+            }
+        )
+    return adjusted
+
+
+def _safe_extract_embedding(
+    identifier: Optional[SpeakerIdentifier],
+    wav_path: str,
+    window_idx: int,
+    local_idx: int,
+) -> np.ndarray:
+    """
+    匈牙利需要 embedding 來比較 source 之間的相似度。
+    正常路線：identifier.extract_embedding(wav_path) 或 identifier.audio_processor.extract_embedding(...)
+    備援：deterministic random（也會 L2 正規化）
+    """
+    # 1) 嘗試從 v5 取真正的向量
+    if identifier is not None:
+        try:
+            if hasattr(identifier, "extract_embedding"):
+                emb = identifier.extract_embedding(wav_path)
+            elif hasattr(identifier, "audio_processor") and hasattr(identifier.audio_processor, "extract_embedding"):
+                emb = identifier.audio_processor.extract_embedding(wav_path)
+            else:
+                emb = None
+
+            if emb is not None:
+                emb = np.asarray(emb, dtype=np.float32).reshape(-1)
+                n = float(np.linalg.norm(emb))
+                if np.isfinite(n) and n > 0.0:
+                    emb = emb / n  # L2 normalize
+                    return emb
+        except Exception as exc:
+            logger.debug("extract_embedding failed for %s: %s", wav_path, exc)
+
+    # 2) 備援：可重現亂數 + 正規化
+    rng = np.random.RandomState(window_idx * 7919 + local_idx * 104729)
+    emb = rng.randn(192).astype(np.float32)
+    emb /= max(float(np.linalg.norm(emb)), 1e-12)
+    return emb
+
+
+
+def _safe_speaker_meta(identifier: Optional[SpeakerIdentifier], wav_path: str) -> Optional[Tuple[str, str, float]]:
+    """
+    給 summary 用的額外資訊 (speaker_id, name, distance)
+    不干擾 track 決策
+    """
+    if identifier is None:
+        return None
     try:
-        while running:
-            if shared_stop.is_set():
-                break
+        return identifier.process_audio_file(wav_path)
+    except Exception as exc:
+        logger.debug("SpeakerIdentifier.process_audio_file error: %s", exc)
+        return None
 
-            if record_secs is not None and time.time() - loop_start >= record_secs:
-                shared_stop.set()
-                break
 
-            try:
-                raw, idx, src_sr, bytes_per_sample, ch = results_queue.get(timeout=0.1)
-            except queue.Empty:
-                continue
+def process_window(
+    window_idx: int,
+    chunk: torch.Tensor,          # shape [1, T] @ TARGET_RATE
+    t_start: float,
+    t_end: float,
+    base_ts: datetime,
+    session_dir: Path,
+    separator: AudioSeparator,
+    identifier: Optional[SpeakerIdentifier],
+    asr: WhisperASR,
+    lang: str,
+) -> WindowRawResult:
+    """
+    真正重的 pipeline：
+    1. 存 mix.wav
+    2. 呼叫 separator.separate_and_save() → 輸出 speaker1.wav, speaker2.wav...
+    3. 對每個 speakerX.wav:
+        - speakerID (metadata)
+        - embedding (for Hungarian)
+        - Whisper ASR
+        - 句子切分
+    4. 統一打包回傳
+    """
 
-            ring_sr = src_sr
-            bytes_per_sample_hint = bytes_per_sample
+    seg_dir = session_dir / f"segment_{window_idx:04d}"
+    seg_dir.mkdir(parents=True, exist_ok=True)
 
-            decoded = _decode_audio_bytes(raw, ch, bytes_per_sample)
-            if decoded.size == 0:
-                logger.warning("Stride chunk %d empty; skipping.", idx)
-                continue
+    mix_path = seg_dir / "mix.wav"
+    # chunk shape [1, T], torchaudio.save expects shape [ch, T]
+    torchaudio.save(str(mix_path), chunk.cpu(), TARGET_RATE)
 
-            ingest_chunks.append(decoded)
-            if len(ingest_chunks) < ingest_chunks.maxlen:
-                continue
+    # base_ts 是整段開始錄製/處理時的 "真實世界時間"
+    # 我們給 separator 用，因為它會存絕對 timestamp
+    abs_ts = base_ts + timedelta(seconds=t_start)
 
-            window_audio = np.concatenate(list(ingest_chunks), axis=0)
-            t_start = window_idx * 1.0
-            t_end = t_start + chunk_secs
+    start_t = time.perf_counter()
+    separated_info = separator.separate_and_save(
+        audio_tensor=chunk,                 # torch.Tensor [1,T]
+        output_dir=seg_dir.as_posix(),      # 存哪裡
+        segment_index=window_idx,           # 第幾個窗
+        absolute_start_time=abs_ts,         # 用來記錄時間
+    )
+    # separated_info 是 list[(wav_path, rel_start, rel_end, absolute_timestamp)]
+    # (依你們 separator 的實作)
 
-            submit_window(window_idx, t_start, t_end, window_audio, ring_sr)
-            window_idx += 1
-    except KeyboardInterrupt:
-        logger.info("Stream interrupted by user; shutting down.")
-        shared_stop.set()
-    finally:
-        shared_stop.set()
-        ingest_thread.join(timeout=1.0)
-        flush_pending(force=True)
-        executor.shutdown(wait=True)
-        out_handle.close()
-        logger.info(
-            "Stream finished. Results appended to %s (started at %s)",
-            output_path,
-            stream_start.isoformat(),
+    window_sources: List[RawSourceResult] = []
+
+    for local_idx, entry in enumerate(separated_info):
+        wav_path, rel_t0, rel_t1, _abs_ts = entry  # 我們其實用不到 rel_t0/rel_t1/abs_ts 這邊
+
+        # 1) speaker metadata / embedding
+        spk_meta = _safe_speaker_meta(identifier, wav_path)
+        emb_vec = _safe_extract_embedding(identifier, wav_path, window_idx, local_idx)
+
+        # 2) Whisper ASR
+        #    我們盡量不動 ASR 前處理 (不做奇怪正規化/Mask)
+        text, avg_conf, words = asr.transcribe(
+            wav_path,
+            language=lang,
         )
 
+        # 調整 words 時間軸成全域絕對時間 (不是4秒local)
+        global_words = _offset_words_global(words, t_start)
+
+        # 3) 句子切分/合併
+        sentences = _build_sentences(
+            global_words,
+            text,
+            lang,
+            window_start=t_start,
+            window_end=t_end,
+        )
+
+        # 4) asr_segments 格式化 (給 output.json / debug UI)
+        asr_segments = _build_asr_segments(
+            global_words,
+            text,
+            t_start,
+            t_end,
+            avg_conf,
+        )
+
+        window_sources.append(
+            RawSourceResult(
+                embedding=emb_vec,
+                sentences=sentences,
+                asr_segments=asr_segments,
+                id_info=spk_meta,
+                words=global_words,            # ★ 新增
+            )
+        )
+
+    elapsed = time.perf_counter() - start_t
+    win_dur = max(t_end - t_start, 1e-6)
+    rtf = elapsed / win_dur  # 如果 >1 代表比即時還慢
+
+    logger.info(
+        "[RTF=%.2f] win=%d t0=%.2f srcs=%d text_len=%d",
+        rtf,
+        window_idx,
+        t_start,
+        len(window_sources),
+        sum(len(seg.text) for src in window_sources for seg in src.sentences),
+    )
+
+    return WindowRawResult(
+        window_index=window_idx,
+        t_start=t_start,
+        t_end=t_end,
+        sources=window_sources,
+        rtf=rtf,
+        seg_dir=seg_dir,
+        error=None,
+    )
+
+
+# -----------------------------
+# 把 future 結果寫到檔案 & summary
+# 這一步是「序列化 + 匈牙利追蹤 + FAST聚合」
+# -----------------------------
+
+
+def handle_window_result(
+    result: WindowRawResult,
+    track_manager: TrackManager,
+    summary_writer: SummaryWriter,
+    aggregator: Optional[FastAggregator],
+    rtf_state: Dict[str, float],
+    is_last: bool = False,  # ★ 新增
+) -> None:
+    """
+    必須照 window_index 的順序執行：
+      1) 匈牙利分配 track_id
+      2) 建立 output.json
+      3) 追加一行到 summary.jsonl
+      4) 把句子丟進 FAST 聚合器（跨窗合併）
+    """
+    # 1) 匈牙利：只用 embedding + 時間做追蹤，不混 SpeakerID
+    embeddings = [src.embedding for src in result.sources]
+    assignments = track_manager.assign(
+        window_start=result.t_start,
+        window_end=result.t_end,
+        embeddings=embeddings,
+    )
+
+    tracks_payload_for_segment: List[dict] = []
+    summary_tracks: List[dict] = []
+
+    # 2) 組 per-window 的輸出內容
+    for s_idx, src in enumerate(result.sources):
+        tid = assignments.get(s_idx)
+        if tid is None:
+            # 理論上 assign() 會涵蓋所有 source；保險起見：
+            tid = track_manager._create_track(src.embedding, result.t_end)
+
+        speaker_label = f"S{tid}"
+
+        # SpeakerID 只作為輸出 metadata（不參與追蹤決策）
+        spk_id = None
+        spk_name = None
+        spk_dist = None
+        if src.id_info:
+            try:
+                spk_id = src.id_info[0]
+                spk_name = src.id_info[1]
+                spk_dist = float(src.id_info[2]) if src.id_info[2] is not None else None
+            except Exception:
+                pass
+
+        # CJK 已合併的句子
+        joined_text = " ".join(seg.text for seg in src.sentences).strip()
+        seg_spans = _segments_from_sentences(src.sentences)
+
+        # 2-1) segment_XXXX/output.json 內的 tracks 欄位
+        tracks_payload_for_segment.append({
+            "track_id": tid,
+            "speaker": speaker_label,
+            "asr_segments": src.asr_segments,  # 這裡保留 ASR 的句段（供下游需要）
+            "speaker_id": spk_id,
+            "speaker_name": spk_name,
+            "speaker_dist": round(spk_dist, 3) if isinstance(spk_dist, float) else None,
+        })
+
+        # 2-2) summary.jsonl 這一行要寫的 tracks 陣列
+        summary_tracks.append({
+            "track_id": tid,
+            "speaker": speaker_label,
+            "text": joined_text,
+            "segments": seg_spans,
+            "speaker_id": spk_id,
+            "speaker_name": spk_name,
+            "speaker_dist": round(spk_dist, 3) if isinstance(spk_dist, float) else None,
+        })
+
+        # 4) 丟給 FAST（跨窗合併）：以「句子片段」為 token
+        # 新：餵 words（全域時間）
+        # 新（word 級；用 word/text/start/end/prob）
+        if aggregator and getattr(src, "words", None):
+            tokens = []
+            for w in src.words:
+                txt = (w.get("word") or w.get("text") or "").strip()
+                if not txt:
+                    continue
+                tokens.append({
+                    "text": txt,
+                    "start": float(w.get("start", result.t_start)),
+                    "end": float(w.get("end", result.t_end)),
+                    "prob": float(w.get("probability") or w.get("prob") or 0.0),
+                })
+            if tokens:
+                aggregator.append_window_tokens(
+                    track_id=tid,
+                    tokens=tokens,
+                    t_start=result.t_start,
+                    t_end=result.t_end,
+                    is_last_window= is_last,              # ★ 傳下去
+                    window_index=result.window_index,  # 供監控/除錯
+                    rtf=float(result.rtf),
+                )
+
+
+
+    # 3) 落地 output.json（本窗）
+    segment_payload = {
+        "window_index": result.window_index,
+        "t_start": round(result.t_start, 3),
+        "t_end": round(result.t_end, 3),
+        "num_sources": len(result.sources),
+        "tracks": tracks_payload_for_segment,
+    }
+    out_json_path = result.seg_dir / "output.json"
+    out_json_path.write_text(
+        json.dumps(segment_payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+
+    # 3) 追加一行到 summary.jsonl
+    summary_writer.write_line({
+    "window_index": result.window_index,
+    "t_start": round(result.t_start, 3),
+    "t_end": round(result.t_end, 3),
+    "num_sources": len(result.sources),
+    "tracks": summary_tracks,
+    })
+
+
+    # RTF EMA：監控延遲風險
+    prev_ema = rtf_state.get("ema", 0.0)
+    rtf_now = float(result.rtf)
+    new_ema = (RTF_EMA_ALPHA * rtf_now) + (1.0 - RTF_EMA_ALPHA) * prev_ema
+    rtf_state["ema"] = new_ema
+    logger.debug(
+        "RTF current=%.2f, EMA=%.2f, window=%d",
+        rtf_now,
+        new_ema,
+        result.window_index,
+    )
+
+    # ⬇⬇⬇ 這是新增的部分 ⬇⬇⬇
+    # 我們希望在每個 window flush 後，馬上把目前聚合好的 transcript 輸出到同一個 txt
+    # 也可以同時把 snapshot 用 SSE broadcast 出去（如果你啟動了 SSE）。
+    if aggregator is not None:
+        try:
+            aggregator.finalize()  # 讓成熟 tail 推進 committed
+            # 即時視圖：可選
+            aggregator.broadcast_snapshot(getattr(aggregator, "_session_stem", "session"))
+        except Exception as e:
+            logger.error(f"[FAST per-window finalize/snapshot] {e}", exc_info=True)
+
+
+
+# -----------------------------
+# 檔案模式：整支 wav -> sliding windows -> executor -> flush
+# -----------------------------
+
+
+def run_file_mode(
+    wav_path: Path,
+    outdir: Path,
+    win_len: float,
+    stride: float,
+    workers: int,
+    lang: str,
+    enable_fast: bool,
+    separator: AudioSeparator,
+    identifier: Optional[SpeakerIdentifier],
+    asr: WhisperASR,
+    agg_config: AggregatorCLIConfig,  # ★ NEW: pass config explicitly
+) -> None:
+
+    stem = wav_path.stem
+    session_dir = outdir / stem
+    summary_path = outdir / f"{stem}_summary.jsonl"
+    transcript_path = outdir / f"{stem}.txt"
+
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_writer = SummaryWriter(summary_path)
+    track_manager = TrackManager()
+    
+    # MIRRORED FROM orchestrator_sample.py: aggregator construction (do not diverge)
+    aggregator = FastAggregator(config=agg_config) if enable_fast else None
+    if aggregator:
+        aggregator.set_export_path(str(transcript_path))
+        aggregator.set_session_stem(stem)
+        # Optional SSE (sample behavior)
+        aggregator.enable_sse_server(host="127.0.0.1", port=9877)
+    
+    rtf_state = {"ema": 0.0}
+
+    executor = ThreadPoolExecutor(max_workers=max(1, workers))
+    pending: Dict[int, Future] = {}
+    next_to_flush = 0
+
+    tz = timezone(timedelta(hours=8))
+    base_ts = datetime.now(tz)
+
+    waveform, sr = _load_audio_file(wav_path)
+
+    try:
+        for w_idx, t0, t1, chunk_tensor in _generate_windows(
+            waveform, sr, win_len, stride
+        ):
+            fut = executor.submit(
+                process_window,
+                w_idx,
+                chunk_tensor,
+                t0,
+                t1,
+                base_ts,
+                session_dir,
+                separator,
+                identifier,
+                asr,
+                lang,
+            )
+            pending[w_idx] = fut
+
+            _flush_ready_results_in_order(
+                pending, track_manager, summary_writer, aggregator, rtf_state, next_to_flush
+            )
+            while next_to_flush in pending and pending[next_to_flush].done():
+                pending.pop(next_to_flush, None)
+                next_to_flush += 1
+
+    except KeyboardInterrupt:
+        logger.info("File mode interrupted by user.")
+    finally:
+        executor.shutdown(wait=True)
+        _flush_all_remaining(
+            pending, track_manager, summary_writer, aggregator, rtf_state
+        )
+
+    # MIRRORED FROM orchestrator_sample.py: finalize + export (do not diverge)
+    if aggregator:
+        aggregator.finalize()
+        aggregator.export_transcripts(
+            base_dir=outdir,
+            stem=wav_path.stem,
+            write_txt=True,
+            write_srt=True,
+        )
+    summary_writer.close()
+
+    logger.info("File processing complete. Summary -> %s", summary_path)
+
+
+def _flush_ready_results_in_order(
+    pending: Dict[int, Future],
+    track_manager: TrackManager,
+    summary_writer: SummaryWriter,
+    aggregator: Optional[FastAggregator],
+    rtf_state: Dict[str, float],
+    next_to_flush: int,
+) -> None:
+    """
+    嘗試從 next_to_flush 開始，依序處理已經完成的 future。
+    注意：我們不會 block 等它完成；只處理「已經 done()」的。
+    這等同於 sample 裡「邊跑邊寫」的感覺，避免整批卡在記憶體。
+    """
+    while next_to_flush in pending:
+        fut = pending[next_to_flush]
+        if not fut.done():
+            break
+        try:
+            result = fut.result()
+        except Exception as exc:
+            logger.exception("Window %d failed: %s", next_to_flush, exc)
+            # 如果一個 window 壞掉，我們還是寫一個空的 result
+            fake_dir = Path()
+            result = WindowRawResult(
+                window_index=next_to_flush,
+                t_start=float(next_to_flush),
+                t_end=float(next_to_flush) + DEFAULT_WINDOW_LEN,
+                sources=[],
+                rtf=0.0,
+                seg_dir=fake_dir,
+                error=str(exc),
+            )
+        handle_window_result(
+            result,
+            track_manager,
+            summary_writer,
+            aggregator,
+            rtf_state,
+        )
+        # 不能在這裡 pop，因為外面也會 pop & 進位 (避免重入衝突)
+        next_to_flush += 1
+
+
+def _flush_all_remaining(
+    pending: Dict[int, Future],
+    track_manager: TrackManager,
+    summary_writer: SummaryWriter,
+    aggregator: Optional[FastAggregator],
+    rtf_state: Dict[str, float],
+) -> None:
+    """
+    結束前保底：把所有 future.block 等到結束，然後依序寫出。
+    """
+    # 先拿所有 keys 排序
+    keys_sorted = sorted(pending.keys())
+    last_idx = keys_sorted[-1] if keys_sorted else None
+    for idx in keys_sorted:
+        fut = pending[idx]
+        try:
+            result = fut.result()
+        except Exception as exc:
+            logger.exception("Window %d failed (final flush): %s", idx, exc)
+            fake_dir = Path()
+            result = WindowRawResult(
+                window_index=idx,
+                t_start=float(idx),
+                t_end=float(idx) + DEFAULT_WINDOW_LEN,
+                sources=[],
+                rtf=0.0,
+                seg_dir=fake_dir,
+                error=str(exc),
+            )
+        handle_window_result(
+            result,
+            track_manager,
+            summary_writer,
+            aggregator,
+            rtf_state,
+            is_last=(idx == last_idx),   # ★ 新增
+        )
+
+
+# -----------------------------
+# 直播模式(麥克風): 即時切窗 + executor + flush
+# -----------------------------
+
+
+def run_stream_mode(
+    outdir: Path,
+    win_len: float,
+    stride: float,
+    workers: int,
+    lang: str,
+    enable_fast: bool,
+    separator: AudioSeparator,
+    identifier: Optional[SpeakerIdentifier],
+    asr: WhisperASR,
+    rate: int,
+    channels: int,
+    frames_per_buffer: int,
+    agg_config: AggregatorCLIConfig,  # ★ NEW: pass config explicitly
+) -> None:
+    if pyaudio is None:
+        raise RuntimeError("pyaudio is not available; can't run in stream mode.")
+
+    tz = timezone(timedelta(hours=8))
+    stem = datetime.now(tz).strftime("stream_%Y%m%d_%H%M%S")
+    session_dir = outdir / stem
+    summary_path = outdir / f"{stem}_summary.jsonl"
+    transcript_path = outdir / f"{stem}.txt"
+    session_dir.mkdir(parents=True, exist_ok=True)
+
+    summary_writer = SummaryWriter(summary_path)
+    track_manager = TrackManager()
+    
+    # MIRRORED FROM orchestrator_sample.py: aggregator construction (do not diverge)
+    aggregator = FastAggregator(config=agg_config) if enable_fast else None
+    if aggregator:
+        aggregator.set_export_path(str(transcript_path))
+        aggregator.set_session_stem(stem)
+        aggregator.enable_sse_server(host="127.0.0.1", port=9877)
+    
+    rtf_state = {"ema": 0.0}
+
+    executor = ThreadPoolExecutor(max_workers=max(1, workers))
+    pending: Dict[int, Future] = {}
+    next_to_flush = 0
+
+    base_ts = datetime.now(tz)
+
+    # mic stream
+    pa = pyaudio.PyAudio()
+    stream = pa.open(
+        format=pyaudio.paFloat32,
+        channels=channels,
+        rate=rate,
+        input=True,
+        frames_per_buffer=frames_per_buffer,
+    )
+
+    # 我們會持續把麥克風資料 append 到 buffer
+    # 然後用 ring buffer 方式每 stride 秒切一次 win_len 長度的窗
+    buffer = np.zeros(0, dtype=np.float32)
+    buffer_start_sample = 0  # 全域 buffer 的起點 index
+    next_window_start = 0    # 下一個要切的窗的起點 (以 TARGET_RATE 為單位)
+    win_samples = int(round(win_len * TARGET_RATE))
+    hop_samples = int(round(stride * TARGET_RATE))
+
+    win_idx = 0
+
+    try:
+        while True:
+            data = stream.read(frames_per_buffer, exception_on_overflow=False)
+            chunk = np.frombuffer(data, dtype=np.float32)
+
+            # downmix 如果多聲道
+            if channels > 1:
+                chunk = chunk.reshape(-1, channels).mean(axis=1)
+
+            # 重採樣到 TARGET_RATE
+            if rate != TARGET_RATE:
+                chunk = resample_poly(chunk, TARGET_RATE, rate).astype(np.float32)
+
+            # append 進 buffer
+            buffer = np.concatenate([buffer, chunk])
+
+            # 只要 buffer 足夠，就切一個新 window
+            while (next_window_start + win_samples) <= (buffer_start_sample + len(buffer)):
+                # 把這一段 [next_window_start, next_window_start + win_samples) 抽出
+                offset0 = next_window_start - buffer_start_sample
+                seg = buffer[offset0: offset0 + win_samples]  # shape [samples]
+
+                # 變成 torch.Tensor [1, T]
+                seg_tensor = torch.from_numpy(seg).unsqueeze(0).to(torch.float32)
+
+                t0 = next_window_start / TARGET_RATE
+                t1 = t0 + win_len
+
+                fut = executor.submit(
+                    process_window,
+                    win_idx,
+                    seg_tensor,
+                    t0,
+                    t1,
+                    base_ts,
+                    session_dir,
+                    separator,
+                    identifier,
+                    asr,
+                    lang,
+                )
+                pending[win_idx] = fut
+
+                # 推進到下一個窗
+                win_idx += 1
+                next_window_start += hop_samples
+
+                # 丟一個 flush 檢查
+                _flush_ready_results_in_order(
+                    pending, track_manager, summary_writer, aggregator, rtf_state, next_to_flush
+                )
+                while next_to_flush in pending and pending[next_to_flush].done():
+                    pending.pop(next_to_flush, None)
+                    next_to_flush += 1
+
+            # 丟掉太舊的 buffer (防止越囤越大)
+            drop_until = next_window_start - win_samples
+            if drop_until > buffer_start_sample:
+                drop_n = drop_until - buffer_start_sample
+                if drop_n > 0:
+                    buffer = buffer[drop_n:]
+                    buffer_start_sample += drop_n
+
+    except KeyboardInterrupt:
+        logger.info("Stream mode interrupted by user.")
+    finally:
+        # 停麥克風
+        stream.stop_stream()
+        stream.close()
+        pa.terminate()
+
+        executor.shutdown(wait=True)
+        _flush_all_remaining(
+            pending, track_manager, summary_writer, aggregator, rtf_state
+        )
+
+        if aggregator:
+            aggregator.finalize()
+            aggregator.export_txt(str(transcript_path))
+
+        summary_writer.close()
+
+    logger.info("Stream finished. Summary -> %s", summary_path)
+
+
+# -----------------------------
+# CLI / main (aggregator flags mirrored from sample)
+# -----------------------------
+
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Sliding-window orchestrator v2.")
-    parser.add_argument("--wav", type=str, help="Input WAV file path.")
-    parser.add_argument("--out", type=str, help="Output path (mode-dependent).")
-    parser.add_argument("--win-len", type=float, default=4.0, help="Window length in seconds.")
-    parser.add_argument("--stride", type=float, default=1.0, help="Stride in seconds (offline mode).")
-    parser.add_argument("--stream", action="store_true", help="Enable streaming mode.")
-    parser.add_argument("--from-queue", action="store_true", help="Stream from external bytes queue (programmatic use).")
-    parser.add_argument("--record-secs", type=float, default=None, help="Limit stream duration in seconds.")
-    parser.add_argument("--workers", type=int, default=2, help="ThreadPoolExecutor worker count.")
-    parser.add_argument("--rate", type=int, default=16000, help="Recorder sample rate (mic mode).")
-    parser.add_argument("--channels", type=int, default=1, help="Recorder channel count.")
-    parser.add_argument("--frames-per-buffer", type=int, default=1024, help="PyAudio frames per buffer.")
-    parser.add_argument("--debug-audio", action="store_true", help="Save debug audio artifacts (placeholder).")
-    parser.add_argument("--debug", action="store_true", help="Enable verbose DEBUG logging.")
+    p = argparse.ArgumentParser(
+        description="Unsaycret orchestrator_v2 (clean, sample-style)."
+    )
+    p.add_argument("--mode", choices=["file", "stream"], default="file")
+    p.add_argument("--wav", type=str, help="Input WAV path (file mode).")
+    p.add_argument("--outdir", type=str, default="outputs")
 
-    parser.add_argument("--mode", choices=["pipeline", "asr_only", "sep_only"], default="pipeline", help="Processing mode.")
-    parser.add_argument("--asr-target", default="mix", help="ASR-only target: 'mix' or 'files:<glob>'.")
+    # MIRRORED FROM orchestrator_sample.py: window geometry (do not diverge)
+    p.add_argument("--chunk", type=float, default=4.0, help="window length seconds (MIRRORED: sample default=4.0)")
+    p.add_argument("--stride", type=float, default=1.0, help="window hop seconds (MIRRORED: sample default=1.0)")
 
-    parser.add_argument("--sep-min-voiced", type=float, default=0.30, help="Minimum voiced ratio before separation drop.")
-    parser.add_argument("--sep-min-rms-db", type=float, default=-45.0, help="Minimum RMS dBFS before separation drop.")
-    parser.add_argument("--sep-min-duration", type=float, default=0.50, help="Minimum voiced duration before separation drop.")
+    p.add_argument("--workers", type=int, default=2, help="thread pool size")
+    p.add_argument("--lang", type=str, default="zh")
+    p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
+    p.add_argument("--enable-fast", type=str, default="true")
 
-    parser.add_argument("--enable-asr", dest="enable_asr", action="store_true", help="Enable ASR stage.")
-    parser.add_argument("--disable-asr", dest="enable_asr", action="store_false", help="Disable ASR stage.")
-    parser.set_defaults(enable_asr=True)
+    # stream mode audio params
+    p.add_argument("--rate", type=int, default=16000)
+    p.add_argument("--channels", type=int, default=1)
+    p.add_argument("--frames-per-buffer", type=int, default=1024)
 
-    parser.add_argument("--asr-min-voiced", type=float, default=0.45, help="ASR gating minimum voiced ratio.")
-    parser.add_argument("--asr-min-rms-db", type=float, default=-45.0, help="ASR gating minimum RMS dBFS.")
-    parser.add_argument("--asr-language", type=str, default="zh", help="ASR language code.")
-    return parser.parse_args()
+    # MIRRORED FROM orchestrator_sample.py: aggregator config flags (do not diverge)
+    agg_grp = p.add_argument_group("FAST Aggregator (mirrored from orchestrator_sample.py)")
+    agg_grp.add_argument("--commit-tail-sec", type=float, default=1.6, help="MIRRORED: sample default=1.6")
+    agg_grp.add_argument("--epsilon", type=float, default=0.001, help="MIRRORED: sample default=0.001")
+    agg_grp.add_argument("--guard-sec", type=float, default=0.4, help="MIRRORED: sample default=0.4")
+    agg_grp.add_argument("--protect-head-sec", type=float, default=0.8, help="MIRRORED: sample default=0.8")
+    agg_grp.add_argument("--final-protect-sec", type=float, default=0.6, help="MIRRORED: sample default=0.6")
+    agg_grp.add_argument("--last-slack-sec", type=float, default=0.12, help="MIRRORED: sample default=0.12")
+    agg_grp.add_argument("--fuse-back", type=float, default=0.16, help="MIRRORED: sample default=0.16")
+    agg_grp.add_argument("--san-near-dup-gap", type=float, default=0.12, help="MIRRORED: sample default=0.12")
+    agg_grp.add_argument("--san-back-overlap-tol", type=float, default=0.02, help="MIRRORED: sample default=0.02")
+    agg_grp.add_argument("--san-overlap-ratio", type=float, default=0.5, help="MIRRORED: sample default=0.5")
+    agg_grp.add_argument("--cov-min-overlap-sec", type=float, default=0.02, help="MIRRORED: sample default=0.02")
+    agg_grp.add_argument("--cov-min-cover-ratio", type=float, default=0.6, help="MIRRORED: sample default=0.6")
+    agg_grp.add_argument("--dedup-near-gap", type=float, default=0.1, help="MIRRORED: sample default=0.1")
+    agg_grp.add_argument("--dedup-overlap-ratio", type=float, default=0.5, help="MIRRORED: sample default=0.5")
+    agg_grp.add_argument("--dedup-repeat-gap", type=float, default=0.22, help="MIRRORED: sample default=0.22")
+    agg_grp.add_argument("--dedup-bigram-gap", type=float, default=0.30, help="MIRRORED: sample default=0.30")
+    agg_grp.add_argument("--track-limit", type=int, default=10, help="MIRRORED: sample default=10")
+    agg_grp.add_argument("--srt-gap-break", type=float, default=0.5, help="MIRRORED: sample default=0.5")
+    agg_grp.add_argument("--srt-max-line", type=int, default=18, help="MIRRORED: sample default=18")
 
+    # DEPRECATED v2 aliases (backward compatibility; map to sample names internally)
+    p.add_argument("--window-len", type=float, dest="chunk", help="DEPRECATED: use --chunk (maps to --chunk)")
+    p.add_argument("--commit-tail", type=float, dest="commit_tail_sec", help="DEPRECATED: use --commit-tail-sec")
+
+    return p.parse_args()
+
+def _build_aggregator_config(args: argparse.Namespace) -> AggregatorCLIConfig:
+    """
+    MIRRORED FROM orchestrator_sample.py:
+    Build config from CLI args with exact same parameter mapping.
+    """
+    return AggregatorCLIConfig(
+        window_len=args.chunk,
+        stride=args.stride,
+        commit_tail_sec=args.commit_tail_sec,
+        epsilon=args.epsilon,
+        guard_sec=args.guard_sec,
+        protect_head_sec=args.protect_head_sec,
+        final_protect_sec=args.final_protect_sec,
+        last_slack_sec=args.last_slack_sec,
+        fuse_back=args.fuse_back,
+        san_near_dup_gap=args.san_near_dup_gap,
+        san_back_overlap_tol=args.san_back_overlap_tol,
+        san_overlap_ratio=args.san_overlap_ratio,
+        cov_min_overlap_sec=args.cov_min_overlap_sec,
+        cov_min_cover_ratio=args.cov_min_cover_ratio,
+        dedup_near_gap=args.dedup_near_gap,
+        dedup_overlap_ratio=args.dedup_overlap_ratio,
+        dedup_repeat_gap=args.dedup_repeat_gap,
+        dedup_bigram_gap=args.dedup_bigram_gap,
+        track_limit=args.track_limit,
+        srt_gap_break=args.srt_gap_break,
+        srt_max_line=args.srt_max_line,
+    )
+
+
+# -----------------------------
+# main (wire in aggregator config)
+# -----------------------------
 
 def main() -> None:
     args = parse_args()
 
-    if args.debug:
-        logging.getLogger().setLevel(logging.DEBUG)
-        logger.debug("Debug logging enabled.")
+    enable_fast = _str_to_bool(args.enable_fast)
+    
+    # MIRRORED FROM orchestrator_sample.py: build aggregator config (do not diverge)
+    agg_config = _build_aggregator_config(args)
 
-    sep_thresholds = SeparationThresholds(
-        min_voiced=args.sep_min_voiced,
-        min_rms_db=args.sep_min_rms_db,
-        min_duration=args.sep_min_duration,
+    separator, identifier, asr, _use_gpu = init_pipeline_modules(
+        load_separator=True,
+        load_identifier=True,
+        load_asr=True,
+        prefer_device=args.device,
     )
-    asr_gate = AsrGateConfig(
-        min_voiced=args.asr_min_voiced,
-        min_rms_db=args.asr_min_rms_db,
-    )
-    asr_config = AsrRuntimeConfig(language=args.asr_language)
+    if separator is None or asr is None:
+        raise RuntimeError("Failed to initialize core modules (separator/asr).")
 
-    if args.mode == "asr_only":
-        if args.stream:
-            raise ValueError("Streaming mode is incompatible with --mode asr_only.")
+    outdir = Path(args.outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
 
-        _, _, asr, _ = init_pipeline_modules(
-            load_separator=False,
-            load_identifier=False,
-            load_asr=True,
+    if args.mode == "file":
+        if not args.wav:
+            raise ValueError("--wav is required in file mode.")
+        wav_path = Path(args.wav)
+        if not wav_path.exists():
+            raise FileNotFoundError(f"Input file not found: {wav_path}")
+
+        run_file_mode(
+            wav_path=wav_path,
+            outdir=outdir,
+            win_len=args.chunk,
+            stride=args.stride,
+            workers=args.workers,
+            lang=args.lang,
+            enable_fast=enable_fast,
+            separator=separator,
+            identifier=identifier,
+            asr=asr,
+            agg_config=agg_config,  # ★ NEW: pass config explicitly
         )
-        asr_output = Path(args.out) if args.out else None
-
-        target = args.asr_target
-        if target == "mix":
-            if not args.wav:
-                raise ValueError("ASR-only mix mode requires --wav PATH.")
-            wav_path = Path(args.wav)
-            if not wav_path.exists():
-                raise FileNotFoundError(f"WAV path does not exist: {wav_path}")
-            out_path = asr_output or Path("outputs") / "asr_only_mix.json"
-            run_asr_only_mix(wav_path, out_path, asr, asr_config)
-        elif target.startswith("files:"):
-            pattern = target.split(":", 1)[1]
-            out_path = asr_output or Path("outputs") / "asr_only_files.jsonl"
-            run_asr_only_files(pattern, out_path, asr, asr_config)
-        else:
-            raise ValueError(f"Unsupported --asr-target: {target}")
-        return
-
-    out_path = Path(args.out) if args.out else Path("outputs") / "v2_windows.jsonl"
-
-    if args.stream:
-        run_pipeline_stream_v2(
-            chunk_secs=args.win_len,
+    else:
+        run_stream_mode(
+            outdir=outdir,
+            win_len=args.chunk,
+            stride=args.stride,
+            workers=args.workers,
+            lang=args.lang,
+            enable_fast=enable_fast,
+            separator=separator,
+            identifier=identifier,
+            asr=asr,
             rate=args.rate,
             channels=args.channels,
             frames_per_buffer=args.frames_per_buffer,
-            max_workers=args.workers,
-            record_secs=args.record_secs,
-            queue_out=None,
-            stop_event=None,
-            in_bytes_queue=None,
-            out_path=out_path,
-            debug_audio=args.debug_audio,
-            mode=args.mode,
-            separation_thresholds=sep_thresholds,
-            asr_gate=asr_gate,
-            enable_asr=args.enable_asr,
-            debug=args.debug,
-            asr_config=asr_config,
+            agg_config=agg_config,  # ★ NEW: pass config explicitly
         )
-        return
-
-    if not args.wav:
-        raise ValueError("Offline mode requires --wav PATH.")
-
-    wav_path = Path(args.wav)
-    if not wav_path.exists():
-        raise FileNotFoundError(f"WAV path does not exist: {wav_path}")
-
-    run_file_pipeline(
-        wav_path=wav_path,
-        out_path=out_path,
-        win_len=args.win_len,
-        stride=args.stride,
-        mode=args.mode,
-        separation_thresholds=sep_thresholds,
-        asr_gate=asr_gate,
-        enable_asr=args.enable_asr,
-        debug=args.debug,
-        debug_audio=args.debug_audio,
-        asr_config=asr_config,
-    )
-    logger.info("Processing complete. Results appended to %s", out_path)
-
 
 if __name__ == "__main__":
     main()

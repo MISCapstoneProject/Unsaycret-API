@@ -3,15 +3,32 @@
 語者識別引擎 (Speaker Identification Engine) V2
 ===============================================================================
 
-版本：v5.2.1 - V2資料庫版本，有pyannote模型  
+版本：v5.3.1 - weaviate V2資料庫版本，預設用效果最好的 Wespeaker 模型  
 作者：CYouuu
-最後更新：2025-08-13
+最後更新：2025-10-28
 
-⚠️ 重要變更 ⚠️
-本版本已升級為V2資料庫結構，與V1版本不相容！
-- Speaker: 新增speaker_id (INT)、full_name、nickname、gender等欄位  
-- VoicePrint: 移除冗餘的voiceprint_id，直接使用Weaviate UUID、sample_count、quality_score等欄位
-- 時間欄位重命名: create_time -> created_at, updated_time -> updated_at
+⭐ AI 工具快速導覽：
+-----------
+【核心類別架構】
+1. AudioProcessor - 音訊處理與 embedding 提取
+   - extract_embedding(audio_path) ⭐ 主要方法：從音檔提取聲紋向量
+   - resample_audio() - 音訊重採樣
+   
+2. WeaviateRepository - 資料庫操作（Weaviate V2）
+   - compare_embedding() ⭐ 比對聲紋相似度
+   - update_embedding() - 更新現有聲紋
+   - handle_new_speaker() - 創建新語者
+   
+3. SpeakerIdentifier - 主要公開介面（單例模式）
+   - process_audio_file() ⭐ 最常用：處理音檔並識別語者，自動更新資料庫
+   - process_audio_stream() - 處理音訊流的版本（未實作 Wespeaker 版本，因此先註解）
+   - add_voiceprint_to_speaker() - 手動添加聲紋到指定語者
+   - process_audio_directory() - 批次處理（測試用）
+
+【Orchestrator 實際使用】
+- orchestrator.py: 使用 process_audio_file()
+- orchestrator_v2.py: 使用 audio_processor.extract_embedding() + process_audio_file()
+- ⚠️ extract_embedding_from_stream() 已註解，請勿使用
 
 功能摘要：
 -----------
@@ -26,54 +43,58 @@
 
 技術架構：
 -----------
- - 語者嵌入模型: SpeechBrain ECAPA-TDNN 模型
+ - 語者嵌入模型: Wespeaker 的 wespeaker-voxceleb-resnet293-LM 模型
  - 向量資料庫: Weaviate
  - 取樣率自適應: 自動處理 8kHz/16kHz/44.1kHz 等常見取樣率
  - 向量更新策略: 加權移動平均，保持聲紋向量穩定性
 
-更新歷程：
------------
- - v5.1.2 (2025-05-06): 新增多聲紋映射功能、支援外部傳入時間戳記、優化使用體驗
-
 使用方式：
 -----------
- 1. 單檔案辨識:
+ 1. 單檔案辨識（自動更新資料庫）:
     ```python
     identifier = SpeakerIdentifier()
-    identifier.process_audio_file("path/to/audio.wav")
+    speaker_id, speaker_name, distance = identifier.process_audio_file("path/to/audio.wav")
     ```
-
- 2. 整個目錄檔案辨識:
+    
+ 2. 僅提取聲紋向量（不更新資料庫）:
     ```python
     identifier = SpeakerIdentifier()
-    identifier.process_audio_directory("path/to/directory")
+    embedding = identifier.audio_processor.extract_embedding("path/to/audio.wav")
+    # 回傳 numpy array，shape: (192,) for Wespeaker
     ```
-
- 3. 單個音訊流辨識:
+    
+ 3. 比對聲紋與資料庫（不自動更新）:
     ```python
     identifier = SpeakerIdentifier()
-    identifier.process_audio_stream(stream)
+    embedding = identifier.audio_processor.extract_embedding("path/to/audio.wav")
+    best_id, best_name, best_distance, all_distances = identifier.database.compare_embedding(embedding)
+    # all_distances: [(voice_print_id, speaker_name, distance, update_count), ...]
     ```
-
- 4. 添加音檔到指定語者:
+    
+ 4. 手動添加聲紋到指定語者:
     ```python
     identifier = SpeakerIdentifier()
-    identifier.add_voiceprint_to_speaker("path/to/audio.wav", "speaker_uuid")
+    success = identifier.add_voiceprint_to_speaker("path/to/audio.wav", "speaker_uuid")
     ```
-
- 5. 使用speaker_system_v2.py進行語者識別模組呼叫
+    
+ 5. 批次處理整個目錄:
+    ```python
+    identifier = SpeakerIdentifier()
+    results = identifier.process_audio_directory("path/to/directory")
+    ```
 
 閾值參數設定：
 -----------
- - THRESHOLD_LOW = 0.26: 過於相似，不更新向量
- - THRESHOLD_UPDATE = 0.34: 下:更新聲紋向量，上:新增一筆聲紋到語者
- - THRESHOLD_NEW = 0.385: 超過此值視為新語者
+ - THRESHOLD_LOW = 0.11: 過於相似，不更新向量
+ - THRESHOLD_UPDATE = 0.22: 下:更新聲紋向量，上:新增一筆聲紋到語者
+ - THRESHOLD_NEW = 0.39: 超過此值視為新語者
 
 前置需求：
 -----------
  - Python 3.9+
  - SpeechBrain
  - Weaviate 向量資料庫 (需通過 Docker 啟動)
+ - Wespeaker 套件 (使用 requirements-base.txt 安裝，或 pip install git+https://github.com/wenet-e2e/wespeaker.git)
  - NumPy, PyTorch, SoundFile 等相關處理套件
 
 注意事項：
@@ -298,53 +319,54 @@ class AudioProcessor:
         """
         return resample_poly(signal, target_sr, orig_sr)
 
-    def extract_embedding_from_stream(self, signal: np.ndarray, sr: int) -> np.ndarray:
-        """從音訊流提取嵌入向量"""
-        try:
-            if not isinstance(signal, np.ndarray):
-                signal = np.array(signal)
-            if signal.ndim > 1:
-                signal = signal.mean(axis=1)
+    # 目前 Wespeaker 模型無法使用音流版本，只能用音檔版本
+    # def extract_embedding_from_stream(self, signal: np.ndarray, sr: int) -> np.ndarray:
+    #     """從音訊流提取嵌入向量"""
+    #     try:
+    #         if not isinstance(signal, np.ndarray):
+    #             signal = np.array(signal)
+    #         if signal.ndim > 1:
+    #             signal = signal.mean(axis=1)
 
-            target_sr = AUDIO_TARGET_RATE
-            if sr != target_sr:
-                signal = self.resample_audio(signal, sr, target_sr)
+    #         target_sr = AUDIO_TARGET_RATE
+    #         if sr != target_sr:
+    #             signal = self.resample_audio(signal, sr, target_sr)
 
-            signal_tensor = torch.tensor(signal, dtype=torch.float32).unsqueeze(0).to(self.device)
+    #         signal_tensor = torch.tensor(signal, dtype=torch.float32).unsqueeze(0).to(self.device)
 
-            if self.model_type == "speechbrain":
-                embedding = self.model.encode_batch(signal_tensor).squeeze().cpu().numpy()
+    #         if self.model_type == "speechbrain":
+    #             embedding = self.model.encode_batch(signal_tensor).squeeze().cpu().numpy()
             
-            # elif self.model_type == "wespeaker":
-            # 沒有實作音流版本的 Wespeaker，改用檔案版本
+    #         # elif self.model_type == "wespeaker":
+    #         # 沒有實作音流版本的 Wespeaker，改用檔案版本
 
-            elif self.model_type == "pyannote":
-                # pyannote 的 Inference 需要從文件中讀取，所以我們需要創建臨時文件
-                import tempfile
-                import soundfile as sf
+    #         elif self.model_type == "pyannote":
+    #             # pyannote 的 Inference 需要從文件中讀取，所以我們需要創建臨時文件
+    #             import tempfile
+    #             import soundfile as sf
                 
-                with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                    temp_path = temp_file.name
-                    # 將信號寫入臨時文件
-                    sf.write(temp_path, signal, target_sr)
+    #             with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
+    #                 temp_path = temp_file.name
+    #                 # 將信號寫入臨時文件
+    #                 sf.write(temp_path, signal, target_sr)
                 
-                try:
-                    # 整個音頻模式：使用 crop 方法
-                    duration = len(signal) / target_sr
-                    segment = self.Segment(0, duration)
-                    embedding = self.model.crop(temp_path, segment)
-                    embedding = embedding.squeeze()  # 移除第一維
-                    embedding = embedding / np.linalg.norm(embedding)  # 正規化
-                finally:
-                    # 清理臨時文件
-                    if os.path.exists(temp_path):
-                        os.unlink(temp_path)
+    #             try:
+    #                 # 整個音頻模式：使用 crop 方法
+    #                 duration = len(signal) / target_sr
+    #                 segment = self.Segment(0, duration)
+    #                 embedding = self.model.crop(temp_path, segment)
+    #                 embedding = embedding.squeeze()  # 移除第一維
+    #                 embedding = embedding / np.linalg.norm(embedding)  # 正規化
+    #             finally:
+    #                 # 清理臨時文件
+    #                 if os.path.exists(temp_path):
+    #                     os.unlink(temp_path)
 
-            return embedding
+    #         return embedding
 
-        except Exception as e:
-            logger.error(f"提取嵌入向量時發生錯誤: {e}")
-            raise
+    #     except Exception as e:
+    #         logger.error(f"提取嵌入向量時發生錯誤: {e}")
+    #         raise
     
     def extract_embedding(self, audio_path: str) -> np.ndarray:
         """

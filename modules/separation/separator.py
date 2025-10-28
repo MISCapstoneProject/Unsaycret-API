@@ -5,7 +5,7 @@
 
 版本：v3.0.0
 作者：EvanLo62
-最後更新：2025-08-24
+最後更新：2025-10-25
 
 模組概要：
 -----------
@@ -186,10 +186,10 @@ from .speaker_counter import SpeakerCounter
 # 導入單人選路器
 from .best_speaker_selector import SingleSpeakerSelector
 
-# 導入自適應降噪模組
-from .adaptive_denoiser import (
-    AdaptiveDenoiserEnhanced as AdaptiveDenoiser,
-    get_adaptive_denoiser_enhanced as get_adaptive_denoiser
+# 導入自適應後降噪模組
+from .post_adaptive_denoiser import (
+    AdaptiveDenoiser,
+    get_adaptive_denoiser
 )
 
 # 基本錄音參數（從配置讀取）
@@ -200,7 +200,7 @@ RATE = AUDIO_RATE
 TARGET_RATE = AUDIO_TARGET_RATE
 WINDOW_SIZE = AUDIO_WINDOW_SIZE
 OVERLAP = AUDIO_OVERLAP
-DEVICE_INDEX = None
+DEVICE_INDEX = None  # 使用預設錄音設備
 
 # 處理參數（從配置讀取）
 MIN_ENERGY_THRESHOLD = AUDIO_MIN_ENERGY_THRESHOLD
@@ -255,7 +255,7 @@ _GLOBAL_SPEAKER_PIPELINE_CACHE = None
 # ================== 語者分離類別 ======================
 
 class AudioSeparator:
-    def __init__(self, model_type: SeparationModel = DEFAULT_MODEL, enable_noise_reduction=True, snr_threshold=SNR_THRESHOLD, enable_dynamic_model=True):
+    def __init__(self, model_type: SeparationModel = DEFAULT_MODEL, enable_dynamic_model=True, enable_post_denoiser=True):
         # 設備選擇邏輯：優先考慮 FORCE_CPU 設定
         if FORCE_CPU:
             self.device = "cpu"
@@ -280,10 +280,6 @@ class AudioSeparator:
         self.model_type = model_type
         self.model_config = MODEL_CONFIGS[model_type]
         self.num_speakers = self.model_config["num_speakers"]
-        
-        # 關閉降噪功能以保持原始音質
-        self.enable_noise_reduction = enable_noise_reduction  # 強制關閉以保持音質一致性
-        self.snr_threshold = snr_threshold
         
         logger.info(f"使用設備: {self.device}")
         logger.info(f"模型類型: {model_type.value}")
@@ -383,15 +379,17 @@ class AudioSeparator:
         logger.info("語者計數器初始化完成")
         
         # 初始化自適應降噪器
-        self.denoiser = get_adaptive_denoiser(
-            device=self.device,
-            aggressive_mode=False,         # 標準模式
-            enable_hiss_removal=True,      # 去除嘶嘶聲
-            enable_rumble_filter=True,     # 去除低頻
-            enable_dereverb=False,         # 可選：去混響（較慢）
-            hiss_threshold=0.15            # 敏感度
-        )
-        logger.info("自適應降噪器初始化完成")
+        self.enable_post_denoiser = enable_post_denoiser
+        if self.enable_post_denoiser:
+            self.denoiser = get_adaptive_denoiser(
+                device=self.device,
+                aggressive_mode=False,         # 標準模式
+                enable_hiss_removal=True,      # 去除嘶嘶聲
+                enable_rumble_filter=True,     # 去除低頻
+                enable_dereverb=False,         # 可選：去混響（較慢）
+                hiss_threshold=0.15            # 敏感度
+            )
+            logger.info("自適應降噪器初始化完成")
         
         self._last_single_route_idx = None
         self._last_single_route_score = None
@@ -938,10 +936,15 @@ class AudioSeparator:
                 for i in range(effective_speakers):
                     try:
                         speaker_audio = est_ST[i].contiguous()  # 1D [T]
-                        denoised_audio = self.denoiser.denoise(
-                            audio=speaker_audio,  # 1D 張量
-                            sample_rate=TARGET_RATE
-                        )
+                        
+                        if self.enable_post_denoiser and self.denoiser is not None:
+                            # 使用自適應降噪器進行降噪
+                            denoised_audio = self.denoiser.denoise(
+                                audio=speaker_audio,  # 1D 張量
+                                sample_rate=TARGET_RATE
+                            )
+                        else:
+                            denoised_audio = speaker_audio
 
                         final_tensor = denoised_audio.unsqueeze(0).cpu()  # [1, T]
 
@@ -1050,7 +1053,7 @@ def clear_separator_cache():
             
     # 清理降噪器快取
     try:
-        from .adaptive_denoiser import clear_denoiser_cache
+        from .post_adaptive_denoiser import clear_denoiser_cache
         clear_denoiser_cache()
         logger.info("已清理降噪器快取")
     except Exception as e:

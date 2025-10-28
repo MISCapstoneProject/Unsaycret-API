@@ -4,7 +4,7 @@ Weaviate Collections V2 初始化模組
 此模組負責建立新版本的 Weaviate 資料庫結構，包含 4 個正規化的集合：
 - Speaker: 說話者主檔（包含 speaker_id INT 從 1 開始遞增）
 - Session: 對話場景（取代原本的 Meeting）  
-- SpeechLog: 一句話記錄（正規化的語音內容）
+- SpeechLog: 一句話記錄（正規化的語音內容，API 自動附加 speaker_name 和 speaker_nickname）
 - VoicePrint: 聲紋特徵庫（改進版）
 
 ⚠️ 重要變更警告 ⚠️
