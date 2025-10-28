@@ -47,7 +47,7 @@ from modules.separation.separator import (
 )
 from modules.identification.VID_identify_v5 import SpeakerIdentifier
 from modules.asr.whisper_asr import WhisperASR
-from pipelines.fast_aggregator import FastAggregator
+from pipelines.fast_aggregator import FastAggregator, AggregatorCLIConfig
 
 
 logger = get_logger(__name__)
@@ -100,7 +100,8 @@ class RawSourceResult:
     sentences: List[SentenceFragment]
     asr_segments: List[dict]
     id_info: Optional[Tuple[str, str, float]]
-
+    # 新增：保存「全域時間」的 word 級結果（供 FAST 使用）
+    words: List[dict]
 
 @dataclass
 class WindowRawResult:
@@ -724,6 +725,7 @@ def process_window(
                 sentences=sentences,
                 asr_segments=asr_segments,
                 id_info=spk_meta,
+                words=global_words,            # ★ 新增
             )
         )
 
@@ -763,6 +765,7 @@ def handle_window_result(
     summary_writer: SummaryWriter,
     aggregator: Optional[FastAggregator],
     rtf_state: Dict[str, float],
+    is_last: bool = False,  # ★ 新增
 ) -> None:
     """
     必須照 window_index 的順序執行：
@@ -829,21 +832,32 @@ def handle_window_result(
         })
 
         # 4) 丟給 FAST（跨窗合併）：以「句子片段」為 token
-        if aggregator and src.sentences:
-            tokens = [
-                {
-                    "text": seg_frag.text,
-                    "start": seg_frag.start,
-                    "end": seg_frag.end,
-                }
-                for seg_frag in src.sentences
-            ]
-            aggregator.append_window_tokens(
-                track_id=tid,
-                tokens=tokens,
-                t_start=result.t_start,
-                t_end=result.t_end,
-            )
+        # 新：餵 words（全域時間）
+        # 新（word 級；用 word/text/start/end/prob）
+        if aggregator and getattr(src, "words", None):
+            tokens = []
+            for w in src.words:
+                txt = (w.get("word") or w.get("text") or "").strip()
+                if not txt:
+                    continue
+                tokens.append({
+                    "text": txt,
+                    "start": float(w.get("start", result.t_start)),
+                    "end": float(w.get("end", result.t_end)),
+                    "prob": float(w.get("probability") or w.get("prob") or 0.0),
+                })
+            if tokens:
+                aggregator.append_window_tokens(
+                    track_id=tid,
+                    tokens=tokens,
+                    t_start=result.t_start,
+                    t_end=result.t_end,
+                    is_last_window= is_last,              # ★ 傳下去
+                    window_index=result.window_index,  # 供監控/除錯
+                    rtf=float(result.rtf),
+                )
+
+
 
     # 3) 落地 output.json（本窗）
     segment_payload = {
@@ -886,30 +900,11 @@ def handle_window_result(
     # 也可以同時把 snapshot 用 SSE broadcast 出去（如果你啟動了 SSE）。
     if aggregator is not None:
         try:
-            # 1) 先 finalize() 目前累積的片段，讓最後一句在檔案裡是最新版本
-            aggregator.finalize()
-        except Exception:
-            pass
-
-        # 2) 這邊需要 transcript_path，file mode 跟 stream mode 都有，
-        #    但 handle_window_result() 現在拿不到那個路徑本身。
-        #    我們做一個簡單折衷：Aggregator 自己維護最後一次 export 的路徑。
-        #    這表示我們要在 FastAggregator 裡加一個 set_export_path()。
-        try:
-            if hasattr(aggregator, "_export_path") and aggregator._export_path:
-                aggregator.export_txt(aggregator._export_path)
-        except Exception:
-            pass
-
-        # 3) SSE: 如果啟動了 SSE (aggregator.enable_sse_server 叫過)
-        #    每次 window 更新後就 broadcast 最新 snapshot，
-        #    這樣你的前端就可以即時看到修好的字幕
-        try:
-            if hasattr(aggregator, "broadcast_snapshot"):
-                # 用 stem 當 session id，純顯示用
-                aggregator.broadcast_snapshot(getattr(aggregator, "_session_stem", "session"))
-        except Exception:
-            pass
+            aggregator.finalize()  # 讓成熟 tail 推進 committed
+            # 即時視圖：可選
+            aggregator.broadcast_snapshot(getattr(aggregator, "_session_stem", "session"))
+        except Exception as e:
+            logger.error(f"[FAST per-window finalize/snapshot] {e}", exc_info=True)
 
 
 
@@ -929,9 +924,9 @@ def run_file_mode(
     separator: AudioSeparator,
     identifier: Optional[SpeakerIdentifier],
     asr: WhisperASR,
+    agg_config: AggregatorCLIConfig,  # ★ NEW: pass config explicitly
 ) -> None:
 
-    # 輸出檔名基底
     stem = wav_path.stem
     session_dir = outdir / stem
     summary_path = outdir / f"{stem}_summary.jsonl"
@@ -939,35 +934,32 @@ def run_file_mode(
 
     session_dir.mkdir(parents=True, exist_ok=True)
 
-    # 共用物件 (這些東西要跨 window 維持狀態)
     summary_writer = SummaryWriter(summary_path)
     track_manager = TrackManager()
-    aggregator = FastAggregator() if enable_fast else None
+    
+    # MIRRORED FROM orchestrator_sample.py: aggregator construction (do not diverge)
+    aggregator = FastAggregator(config=agg_config) if enable_fast else None
     if aggregator:
         aggregator.set_export_path(str(transcript_path))
         aggregator.set_session_stem(stem)
-        # 如果你想啟動 SSE server 讓你邊看邊長字幕，打開這行：
+        # Optional SSE (sample behavior)
         aggregator.enable_sse_server(host="127.0.0.1", port=9877)
+    
     rtf_state = {"ema": 0.0}
 
-    # executor for heavy work
     executor = ThreadPoolExecutor(max_workers=max(1, workers))
     pending: Dict[int, Future] = {}
     next_to_flush = 0
 
-    # 時區時間 (做絕對 timestamp 用)
     tz = timezone(timedelta(hours=8))
     base_ts = datetime.now(tz)
 
-    # 讀整隻音檔 & 切窗
     waveform, sr = _load_audio_file(wav_path)
 
-    # 主要 loop：每個 window 丟進 executor
     try:
         for w_idx, t0, t1, chunk_tensor in _generate_windows(
             waveform, sr, win_len, stride
         ):
-            # submit heavy job
             fut = executor.submit(
                 process_window,
                 w_idx,
@@ -983,32 +975,31 @@ def run_file_mode(
             )
             pending[w_idx] = fut
 
-            # flush anything ready in order
             _flush_ready_results_in_order(
                 pending, track_manager, summary_writer, aggregator, rtf_state, next_to_flush
             )
-            # update pointer if we flushed
             while next_to_flush in pending and pending[next_to_flush].done():
-                # after flush_ready_results_in_order we already handled them,
-                # so we can pop and advance
                 pending.pop(next_to_flush, None)
                 next_to_flush += 1
 
     except KeyboardInterrupt:
         logger.info("File mode interrupted by user.")
     finally:
-        # 完整收尾：等全部 future 跑完，強制 flush
         executor.shutdown(wait=True)
-
-        # flush all remaining (force=True)
         _flush_all_remaining(
             pending, track_manager, summary_writer, aggregator, rtf_state
         )
 
+    # MIRRORED FROM orchestrator_sample.py: finalize + export (do not diverge)
     if aggregator:
         aggregator.finalize()
-        aggregator.export_txt(str(transcript_path))
-        summary_writer.close()
+        aggregator.export_transcripts(
+            base_dir=outdir,
+            stem=wav_path.stem,
+            write_txt=True,
+            write_srt=True,
+        )
+    summary_writer.close()
 
     logger.info("File processing complete. Summary -> %s", summary_path)
 
@@ -1068,6 +1059,7 @@ def _flush_all_remaining(
     """
     # 先拿所有 keys 排序
     keys_sorted = sorted(pending.keys())
+    last_idx = keys_sorted[-1] if keys_sorted else None
     for idx in keys_sorted:
         fut = pending[idx]
         try:
@@ -1090,6 +1082,7 @@ def _flush_all_remaining(
             summary_writer,
             aggregator,
             rtf_state,
+            is_last=(idx == last_idx),   # ★ 新增
         )
 
 
@@ -1111,11 +1104,11 @@ def run_stream_mode(
     rate: int,
     channels: int,
     frames_per_buffer: int,
+    agg_config: AggregatorCLIConfig,  # ★ NEW: pass config explicitly
 ) -> None:
     if pyaudio is None:
         raise RuntimeError("pyaudio is not available; can't run in stream mode.")
 
-    # 以當下時間做 session 名稱
     tz = timezone(timedelta(hours=8))
     stem = datetime.now(tz).strftime("stream_%Y%m%d_%H%M%S")
     session_dir = outdir / stem
@@ -1125,12 +1118,14 @@ def run_stream_mode(
 
     summary_writer = SummaryWriter(summary_path)
     track_manager = TrackManager()
-    aggregator = FastAggregator() if enable_fast else None
+    
+    # MIRRORED FROM orchestrator_sample.py: aggregator construction (do not diverge)
+    aggregator = FastAggregator(config=agg_config) if enable_fast else None
     if aggregator:
         aggregator.set_export_path(str(transcript_path))
         aggregator.set_session_stem(stem)
-        # 如果你想啟動 SSE server 讓你邊看邊長字幕，打開這行：
         aggregator.enable_sse_server(host="127.0.0.1", port=9877)
+    
     rtf_state = {"ema": 0.0}
 
     executor = ThreadPoolExecutor(max_workers=max(1, workers))
@@ -1245,9 +1240,8 @@ def run_stream_mode(
 
 
 # -----------------------------
-# CLI / main
+# CLI / main (aggregator flags mirrored from sample)
 # -----------------------------
-
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(
@@ -1257,14 +1251,13 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--wav", type=str, help="Input WAV path (file mode).")
     p.add_argument("--outdir", type=str, default="outputs")
 
-    p.add_argument("--chunk", type=float, default=DEFAULT_WINDOW_LEN, help="window length seconds")
-    p.add_argument("--stride", type=float, default=DEFAULT_STRIDE, help="window hop seconds")
+    # MIRRORED FROM orchestrator_sample.py: window geometry (do not diverge)
+    p.add_argument("--chunk", type=float, default=4.0, help="window length seconds (MIRRORED: sample default=4.0)")
+    p.add_argument("--stride", type=float, default=1.0, help="window hop seconds (MIRRORED: sample default=1.0)")
 
     p.add_argument("--workers", type=int, default=2, help="thread pool size")
     p.add_argument("--lang", type=str, default="zh")
-
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
-
     p.add_argument("--enable-fast", type=str, default="true")
 
     # stream mode audio params
@@ -1272,15 +1265,76 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--channels", type=int, default=1)
     p.add_argument("--frames-per-buffer", type=int, default=1024)
 
+    # MIRRORED FROM orchestrator_sample.py: aggregator config flags (do not diverge)
+    agg_grp = p.add_argument_group("FAST Aggregator (mirrored from orchestrator_sample.py)")
+    agg_grp.add_argument("--commit-tail-sec", type=float, default=1.6, help="MIRRORED: sample default=1.6")
+    agg_grp.add_argument("--epsilon", type=float, default=0.001, help="MIRRORED: sample default=0.001")
+    agg_grp.add_argument("--guard-sec", type=float, default=0.4, help="MIRRORED: sample default=0.4")
+    agg_grp.add_argument("--protect-head-sec", type=float, default=0.8, help="MIRRORED: sample default=0.8")
+    agg_grp.add_argument("--final-protect-sec", type=float, default=0.6, help="MIRRORED: sample default=0.6")
+    agg_grp.add_argument("--last-slack-sec", type=float, default=0.12, help="MIRRORED: sample default=0.12")
+    agg_grp.add_argument("--fuse-back", type=float, default=0.16, help="MIRRORED: sample default=0.16")
+    agg_grp.add_argument("--san-near-dup-gap", type=float, default=0.12, help="MIRRORED: sample default=0.12")
+    agg_grp.add_argument("--san-back-overlap-tol", type=float, default=0.02, help="MIRRORED: sample default=0.02")
+    agg_grp.add_argument("--san-overlap-ratio", type=float, default=0.5, help="MIRRORED: sample default=0.5")
+    agg_grp.add_argument("--cov-min-overlap-sec", type=float, default=0.02, help="MIRRORED: sample default=0.02")
+    agg_grp.add_argument("--cov-min-cover-ratio", type=float, default=0.6, help="MIRRORED: sample default=0.6")
+    agg_grp.add_argument("--dedup-near-gap", type=float, default=0.1, help="MIRRORED: sample default=0.1")
+    agg_grp.add_argument("--dedup-overlap-ratio", type=float, default=0.5, help="MIRRORED: sample default=0.5")
+    agg_grp.add_argument("--dedup-repeat-gap", type=float, default=0.22, help="MIRRORED: sample default=0.22")
+    agg_grp.add_argument("--dedup-bigram-gap", type=float, default=0.30, help="MIRRORED: sample default=0.30")
+    agg_grp.add_argument("--track-limit", type=int, default=10, help="MIRRORED: sample default=10")
+    agg_grp.add_argument("--srt-gap-break", type=float, default=0.5, help="MIRRORED: sample default=0.5")
+    agg_grp.add_argument("--srt-max-line", type=int, default=18, help="MIRRORED: sample default=18")
+
+    # DEPRECATED v2 aliases (backward compatibility; map to sample names internally)
+    p.add_argument("--window-len", type=float, dest="chunk", help="DEPRECATED: use --chunk (maps to --chunk)")
+    p.add_argument("--commit-tail", type=float, dest="commit_tail_sec", help="DEPRECATED: use --commit-tail-sec")
+
     return p.parse_args()
 
+def _build_aggregator_config(args: argparse.Namespace) -> AggregatorCLIConfig:
+    """
+    MIRRORED FROM orchestrator_sample.py:
+    Build config from CLI args with exact same parameter mapping.
+    """
+    return AggregatorCLIConfig(
+        window_len=args.chunk,
+        stride=args.stride,
+        commit_tail_sec=args.commit_tail_sec,
+        epsilon=args.epsilon,
+        guard_sec=args.guard_sec,
+        protect_head_sec=args.protect_head_sec,
+        final_protect_sec=args.final_protect_sec,
+        last_slack_sec=args.last_slack_sec,
+        fuse_back=args.fuse_back,
+        san_near_dup_gap=args.san_near_dup_gap,
+        san_back_overlap_tol=args.san_back_overlap_tol,
+        san_overlap_ratio=args.san_overlap_ratio,
+        cov_min_overlap_sec=args.cov_min_overlap_sec,
+        cov_min_cover_ratio=args.cov_min_cover_ratio,
+        dedup_near_gap=args.dedup_near_gap,
+        dedup_overlap_ratio=args.dedup_overlap_ratio,
+        dedup_repeat_gap=args.dedup_repeat_gap,
+        dedup_bigram_gap=args.dedup_bigram_gap,
+        track_limit=args.track_limit,
+        srt_gap_break=args.srt_gap_break,
+        srt_max_line=args.srt_max_line,
+    )
+
+
+# -----------------------------
+# main (wire in aggregator config)
+# -----------------------------
 
 def main() -> None:
     args = parse_args()
 
     enable_fast = _str_to_bool(args.enable_fast)
+    
+    # MIRRORED FROM orchestrator_sample.py: build aggregator config (do not diverge)
+    agg_config = _build_aggregator_config(args)
 
-    # 啟動所有必要模組
     separator, identifier, asr, _use_gpu = init_pipeline_modules(
         load_separator=True,
         load_identifier=True,
@@ -1311,6 +1365,7 @@ def main() -> None:
             separator=separator,
             identifier=identifier,
             asr=asr,
+            agg_config=agg_config,  # ★ NEW: pass config explicitly
         )
     else:
         run_stream_mode(
@@ -1326,8 +1381,8 @@ def main() -> None:
             rate=args.rate,
             channels=args.channels,
             frames_per_buffer=args.frames_per_buffer,
+            agg_config=agg_config,  # ★ NEW: pass config explicitly
         )
-
 
 if __name__ == "__main__":
     main()
