@@ -522,15 +522,26 @@ def run_pipeline_stream(
 
         while not stop_event.is_set():
             try:
-                pkt = in_bytes_queue.get(timeout=0.1)  # 縮短等待時間提升響應性
+                pkt = in_bytes_queue.get(timeout=0.05)  # 縮短等待時間提升響應性
             except queue.Empty:
                 if record_secs is not None and time.time() - start_time >= record_secs:
                     stop_event.set()  # 統一使用 stop_event
                     break
                 # 每次 timeout 都檢查停止信號，提升響應性
                 if stop_event.is_set():
+                    logger.info("🛑 recorder_from_queue: 偵測到停止信號，正在退出...")
                     break
                 continue
+            
+            # 收到資料後也要檢查停止信號和是否為結束標記
+            if stop_event.is_set():
+                logger.info("🛑 recorder_from_queue: 收到資料後偵測到停止信號")
+                break
+            
+            # 處理結束標記（空 bytes 或 None）
+            if pkt is None or len(pkt) == 0:
+                logger.info("🏁 recorder_from_queue: 收到結束標記")
+                break
 
             calib_bytes += len(pkt)    # 用來估計來源 sr
             buf.extend(pkt)
@@ -603,21 +614,49 @@ def run_pipeline_stream(
     try:
         while True:
             if stop_event and stop_event.is_set():
+                logger.info("🛑 主循環: 偵測到停止信號，準備結束")
                 break
             try:
-                raw, idx, src_sr = q.get(timeout=0.1)
+                raw, idx, src_sr = q.get(timeout=0.05)  # 縮短 timeout 提升響應性
             except queue.Empty:
                 if stop_event.is_set():
+                    logger.info("🛑 主循環: 佇列為空且收到停止信號")
                     break
                 continue
+            
+            # 檢查是否為結束標記
+            if not raw or len(raw) == 0:
+                logger.info("🏁 主循環: 收到結束標記")
+                break
+                
             futures.append(executor.submit(process_chunk, raw, idx, src_sr))
     except KeyboardInterrupt:
         logger.info("🛑 Ctrl‑C 偵測到使用者手動停止")
         stop_event.set()  # 統一使用 stop_event
     finally:
+        logger.info("🧹 開始清理 pipeline 資源")
         stop_event.set()  # 確保停止信號被設置
-        rec_thread.join(timeout=1)
+        
+        # 發送結束標記喚醒可能阻塞的 recorder 線程
+        try:
+            if in_bytes_queue:
+                in_bytes_queue.put_nowait(b"")
+            q.put_nowait((b"", -1, 16000))  # 結束標記
+        except:
+            pass
+        
+        # 等待 recorder 線程結束
+        logger.info("⏳ 等待 recorder 線程結束...")
+        rec_thread.join(timeout=2)
+        if rec_thread.is_alive():
+            logger.warning("⚠️  recorder 線程未在時限內結束")
+        else:
+            logger.info("✅ recorder 線程已結束")
+        
+        # 等待所有工作完成
+        logger.info("⏳ 等待所有處理工作完成...")
         executor.shutdown(wait=True)
+        logger.info("✅ Pipeline 清理完成")
 
     # 等待所有 Future 完成，確保不丟失任何處理結果
     bundle = []

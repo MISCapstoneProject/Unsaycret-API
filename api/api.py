@@ -11,7 +11,7 @@ from pydantic import BaseModel
 from typing import Optional, List
 from fastapi import WebSocket, WebSocketDisconnect
 from fastapi.responses import StreamingResponse
-import asyncio, threading, queue, json
+import asyncio, threading, queue, json, time
 from datetime import datetime
 from pipelines.orchestrator import (
     run_pipeline_FILE,
@@ -485,14 +485,18 @@ async def ws_stream(ws: WebSocket):
         frontend_connected = True    # 📡 追蹤前端連線狀態
         websocket_broken = False     # 🔌 WebSocket 連線是否已斷開
 
+        # 建立非同步任務用於並行處理
+        ws_receive_task = None
+        last_ws_receive_time = time.time()
+
         # ========== 主處理迴圈 - 雙向通訊核心 ==========
         logger.info("🔄 進入主處理迴圈 - 開始雙向通訊")
         while True:
             
             # ========== 步驟 1: 處理背景結果 (字幕發送) ==========
             try:
-                # 📥 從結果佇列取得處理完的語音片段 (短暫等待避免阻塞)
-                seg = result_q.get(timeout=0.1)
+                # 📥 從結果佇列取得處理完的語音片段 (非常短的等待時間以提升響應性)
+                seg = result_q.get(timeout=0.01)
 
                 # 🏁 檢查是否為結束信號
                 if seg is None:
@@ -626,99 +630,147 @@ async def ws_stream(ws: WebSocket):
                 # 😴 結果佇列暫時為空，繼續等待
                 pass
 
-            # ========== 步驟 2: 接收前端訊息 (音訊輸入處理) ==========
+            # ========== 步驟 2: 接收前端訊息 (音訊輸入處理) - 使用非阻塞方式 ==========
             # 🔌 如果 WebSocket 已斷開，跳過接收步驟，只處理剩餘結果
-            if websocket_broken:
-                continue
+            if not websocket_broken:
+                # 創建或檢查 WebSocket 接收任務
+                if ws_receive_task is None:
+                    # 創建新的接收任務（非阻塞）
+                    try:
+                        ws_receive_task = asyncio.create_task(ws.receive())
+                        last_ws_receive_time = time.time()
+                    except Exception as e:
+                        logger.error(f"創建 WebSocket 接收任務失敗: {e}")
+                        websocket_broken = True
+                        stop_evt.set()
+                        ws_receive_task = None
                 
-            try:
-                # 📥 等待前端發送訊息 (原始 bytes/text 格式，增加超時時間避免錯過信號)
-                msg = await asyncio.wait_for(ws.receive(), timeout=0.5)
+                # 檢查接收任務是否完成（非阻塞檢查）
+                if ws_receive_task is not None and ws_receive_task.done():
+                    try:
+                        msg = ws_receive_task.result()
+                        ws_receive_task = None  # 重置任務以便下次創建新的
+                        
+                        mtype = msg.get("type")
+                        
+                        if mtype == "websocket.receive":
+                            t = msg.get("text")
+                            b = msg.get("bytes")
 
-                mtype = msg.get("type")
-                if mtype == "websocket.receive":
-                    t = msg.get("text")
-                    b = msg.get("bytes")
+                            # 先處理文字，確保 "stop" 不會被 bytes 分支吃掉
+                            if t is not None:
+                                if t == "stop" or t.strip() == "stop":
+                                    logger.info("🛑 收到停止信號，開始優雅關閉")
+                                    stop_evt.set()
+                                    # 立即清空音訊佇列
+                                    cleared_count = 0
+                                    try:
+                                        while not raw_q.empty():
+                                            raw_q.get_nowait()
+                                            cleared_count += 1
+                                        logger.info(f"已清空音訊佇列 ({cleared_count} 個項目)")
+                                    except Exception:
+                                        pass
+                                    # 發送結束標記喚醒 pipeline
+                                    try:
+                                        raw_q.put_nowait(b"")
+                                    except Exception:
+                                        pass
+                                    frontend_connected = False
+                                    websocket_broken = True
+                                    # 回 ACK
+                                    try:
+                                        await ws.send_text(json.dumps({"type": "status", "event": "stopping"}))
+                                    except Exception:
+                                        pass
 
-                    # 先處理文字，確保 "stop" 不會被 bytes 分支吃掉
-                    if t is not None:
-                        logger.info(f"📝 收到文字訊息: {t!r}")
-                        if t == "stop":
-                            logger.info("🛑 收到停止信號，開始優雅關閉")
-                            stop_evt.set()
-                            # 喚醒 pipeline（若有可能在 raw_q.get() 阻塞）
-                            try:
-                                raw_q.put_nowait(b"")  # 或 None，依你的 pipeline 規格
-                            except Exception:
-                                pass
+                            elif b is not None:
+                                if len(b) > 0:
+                                    raw_q.put(b)
+
+                            else:
+                                logger.warning(f"websocket.receive 但 text/bytes 皆為 None")
+
+                        elif mtype == "websocket.disconnect":
+                            code = msg.get("code")
+                            logger.info(f"🔌 客戶端斷線，code={code}")
                             frontend_connected = False
-                            # 回 ACK，讓前端知道收到
+                            websocket_broken = True
+                            stop_evt.set()
+                            # 清空音訊佇列
                             try:
-                                await ws.send_text(json.dumps({"type": "status", "event": "stopping"}))
+                                while not raw_q.empty():
+                                    raw_q.get_nowait()
+                                raw_q.put_nowait(b"")
                             except Exception:
                                 pass
 
-                    elif b is not None:
-                        if len(b) == 0:
-                            logger.debug("🔕 空 bytes（可能哨兵），忽略")
                         else:
-                            raw_q.put(b)
-                            logger.debug(f"🎤 收到音訊片段: {len(b)} bytes")
-
-                    else:
-                        logger.warning(f"❓ websocket.receive 但 text/bytes 皆為 None: {msg}")
-
-                elif mtype == "websocket.disconnect":
-                    code = msg.get("code")
-                    logger.info(f"🔌 客戶端斷線，code={code}")
-                    frontend_connected = False
-                    websocket_broken = True
-                    stop_evt.set()
-
+                            logger.warning(f"❓ 未知訊息: {msg}")
+                            
+                    except WebSocketDisconnect:
+                        # 🔌 前端主動斷線 - 但不立即結束，先完成背景處理
+                        logger.info("🔌 前端主動斷線，但繼續完成背景處理以避免資料遺失")
+                        frontend_connected = False
+                        websocket_broken = True
+                        stop_evt.set()
+                        try:
+                            while not raw_q.empty():
+                                raw_q.get_nowait()
+                            raw_q.put_nowait(b"")
+                        except Exception:
+                            pass
+                        
+                    except Exception as e:
+                        # 💥 前端通訊錯誤
+                        error_msg = str(e)
+                        if "disconnect" in error_msg.lower() or "receive" in error_msg.lower():
+                            logger.info("🔌 檢測到前端斷線，停止接收新音訊")
+                            frontend_connected = False
+                            websocket_broken = True
+                            stop_evt.set()
+                            try:
+                                while not raw_q.empty():
+                                    raw_q.get_nowait()
+                                raw_q.put_nowait(b"")
+                            except Exception:
+                                pass
+                        else:
+                            logger.warning(f"� 前端通訊錯誤: {e}")
+                            stop_evt.set()
                 else:
-                    logger.warning(f"❓ 未知訊息: {msg}")
-
-            except asyncio.TimeoutError:
-                # 😴 前端暫時沒有發送資料 - 檢查是否該結束
-                if processing_complete:
-                    # ✅ 背景處理已完成，可以安全結束
-                    logger.info("🏁 背景處理完成，準備結束 WebSocket 連線")
+                    # WebSocket 接收任務尚未完成，檢查是否超時
+                    if time.time() - last_ws_receive_time > 10.0:
+                        logger.warning("⏰ WebSocket 接收超時 (10秒)，可能連線已斷開")
+                        websocket_broken = True
+                        stop_evt.set()
+                        try:
+                            ws_receive_task.cancel()
+                        except Exception:
+                            pass
+                
+            # ========== 步驟 3: 檢查是否該結束 ==========
+            # ========== 步驟 3: 檢查是否該結束 ==========
+            if processing_complete:
+                # ✅ 背景處理已完成，可以安全結束
+                logger.info("🏁 背景處理完成，準備結束 WebSocket 連線")
+                break
+            elif stop_evt.is_set() and websocket_broken:
+                # 🛑 已收到停止信號且連線已斷開，檢查是否該超時退出
+                # 給予最多 3 秒時間完成剩餘處理
+                if not hasattr(stop_evt, '_stop_time'):
+                    stop_evt._stop_time = time.time()  # type: ignore
+                    logger.info("⏰ 開始計時，最多等待 3 秒完成剩餘處理")
+                elif time.time() - stop_evt._stop_time > 3.0:  # type: ignore
+                    logger.warning("⏰ 超時：停止信號後 3 秒仍未完成，強制結束")
+                    processing_complete = True
                     break
-                elif stop_evt.is_set():
-                    # ⏳ 已收到停止信號，但背景處理尚未完成，繼續等待
-                    logger.info("⏳ 已收到停止信號，等待背景處理完成中...")
-                    # 檢查結果佇列是否還有資料
-                    queue_size = result_q.qsize()
-                    if queue_size > 0:
-                        logger.info(f"📊 結果佇列還有 {queue_size} 個待處理項目")
-                # 否則繼續等待
-                continue
-                
-            except WebSocketDisconnect:
-                # 🔌 前端主動斷線 - 但不立即結束，先完成背景處理
-                logger.info("🔌 前端主動斷線，但繼續完成背景處理以避免資料遺失")
-                frontend_connected = False  # 標記前端已斷線
-                websocket_broken = True     # 標記 WebSocket 已斷開
-                stop_evt.set()  # 通知背景線程停止接收新音訊
-                # 不 break，讓主循環繼續處理 result_q 中的剩餘結果
-                
-            except Exception as e:
-                # 💥 前端通訊錯誤 - 檢查是否為斷線相關錯誤
-                error_msg = str(e)
-                if "disconnect" in error_msg.lower() or "receive" in error_msg.lower():
-                    # 🔌 斷線相關錯誤，標記前端已斷線
-                    logger.info("🔌 檢測到前端斷線，停止接收新音訊")
-                    frontend_connected = False
-                    websocket_broken = True
-                    stop_evt.set()
-                else:
-                    # 💥 其他通訊錯誤
-                    logger.warning(f"💥 前端通訊錯誤: {e}")
-                    stop_evt.set()  # 停止接收新音訊，但完成已有的處理
-
-
-                    # 否則繼續等待
-                continue
+            elif stop_evt.is_set():
+                # ⏳ 已收到停止信號但連線未斷開，繼續等待
+                pass
+            
+            # 短暫休眠避免 CPU 空轉
+            await asyncio.sleep(0.001)  # 1ms，讓出 CPU 時間
 
         # ========== 最後檢查 - 僅作為調試驗證 ==========
         logger.info("🔍 主循環結束，驗證佇列狀態")
