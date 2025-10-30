@@ -527,6 +527,22 @@ async def ws_stream(ws: WebSocket):
                     if speaker_id and speaker_text.strip():
                         logger.info(f"🗣️  處理語者 {speaker_idx + 1}: {speaker_id}")
                         
+                        # 🔍 【診斷】驗證語者是否存在於資料庫
+                        try:
+                            speaker_exists = data_facade.get_speaker_info(speaker_id)
+                            if speaker_exists:
+                                logger.debug(f"✅ 語者驗證通過: {speaker_exists.get('full_name', 'Unknown')}")
+                            else:
+                                logger.error(f"❌ 語者不存在於資料庫: {speaker_id}")
+                        except HTTPException as he:
+                            if he.status_code == 404:
+                                logger.error(f"❌ 語者不存在於資料庫: {speaker_id}")
+                                logger.error("   此字幕將無法儲存！請檢查 pipeline 的語者識別邏輯")
+                            else:
+                                logger.warning(f"⚠️  語者驗證時發生錯誤: {he.detail}")
+                        except Exception as ve:
+                            logger.warning(f"⚠️  語者驗證異常: {ve}")
+                        
                         # 📅 時間戳處理 - 使用絕對時間而非相對時間
                         absolute_start_time = sp.get("absolute_start_time")
                         start_time = seg.get("start", 0)
@@ -558,9 +574,21 @@ async def ws_stream(ws: WebSocket):
                                     logger.warning(f"⚠️  SpeechLog 儲存成功但未取得 UUID: {speaker_id}")
                                 speechlog_created = True
                             else:
-                                logger.error(f"❌ SpeechLog 儲存失敗: {result.get('message')}")
+                                # 🚨 【Bug #2 增強】詳細記錄失敗原因
+                                error_msg = result.get('message', '未知錯誤')
+                                logger.error(f"❌ SpeechLog 儲存失敗: {error_msg}")
+                                logger.error(f"   語者ID: {speaker_id}")
+                                logger.error(f"   Session: {session_uuid}")
+                                logger.error(f"   內容: \"{speaker_text[:50]}...\"")
+                                
+                                # 如果是語者不存在的錯誤，特別標記
+                                if "語者不存在" in error_msg or "不存在" in error_msg:
+                                    logger.critical(f"🚨 語者 {speaker_id} 不存在於資料庫！")
+                                    logger.critical("   可能需要檢查語者識別邏輯或資料庫同步問題")
                         except Exception as e:
-                            logger.error(f"💥 SpeechLog 儲存異常: {e}")
+                            logger.error(f"💥 SpeechLog 儲存發生異常: {e}")
+                            logger.error(f"   語者ID: {speaker_id}")
+                            logger.error(f"   異常類型: {type(e).__name__}")
 
                         # 👥 Session 參與者管理 - 新語者自動加入
                         if speaker_id not in session_participants:
@@ -607,6 +635,13 @@ async def ws_stream(ws: WebSocket):
                         
                         # 🆔 取得這個語者對應的 SpeechLog UUID
                         speechlog_uuid = speaker_speechlog_uuids.get(speaker_id)
+                        
+                        # 🚨 【Bug #1 修復】只發送已成功儲存到資料庫的字幕
+                        # 如果該語者的 SpeechLog 儲存失敗（字典中沒有 UUID），則跳過發送
+                        if not speechlog_uuid:
+                            logger.error(f"❌ 跳過發送：語者 {speaker_id} 的字幕未成功儲存到資料庫")
+                            logger.error(f"   內容: \"{speaker_text[:50]}...\"")
+                            continue
                             
                         # 🏗️  組裝標準 subtitle 訊息格式 (含完整時間資訊 + SpeechLog UUID)
                         subtitle_msg = {

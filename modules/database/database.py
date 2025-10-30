@@ -1908,10 +1908,24 @@ class DatabaseService:
             
             # 處理語者引用
             speaker_uuid = getattr(request, 'speaker', None)
-            if speaker_uuid and valid_uuid(speaker_uuid) and self.get_speaker(speaker_uuid):
+            if speaker_uuid:
+                # 🚨 【Bug #2 修復】驗證 UUID 格式
+                if not valid_uuid(speaker_uuid):
+                    error_msg = f"語者 UUID 格式無效: {speaker_uuid}"
+                    logger.error(error_msg)
+                    raise ValueError(error_msg)
+                
+                # 🚨 【Bug #2 修復】驗證語者是否存在於資料庫
+                speaker_obj = self.get_speaker(speaker_uuid)
+                if not speaker_obj:
+                    error_msg = f"語者不存在（UUID: {speaker_uuid}），無法建立 SpeechLog"
+                    logger.error(error_msg)
+                    logger.error("可能原因: 1) 語者已被刪除 2) 語者尚未建立 3) 時序競態條件")
+                    raise ValueError(error_msg)
+                
+                # ✅ 語者驗證通過，建立引用
                 references["speaker"] = [speaker_uuid]
-            elif speaker_uuid:
-                logger.warning(f"(e2) 語者 UUID {speaker_uuid} 無效或不存在，已跳過")
+                logger.debug(f"✅ 語者引用已建立: {speaker_uuid}")
             
             # 處理 Session 引用
             session_uuid = getattr(request, 'session', None)
