@@ -1941,13 +1941,51 @@ class DatabaseService:
             
             # 建立 SpeechLog
             speechlog_collection = self.client.collections.get(self.SPEECHLOG_CLASS)
-            speechlog_collection.data.insert(
-                properties=properties,
-                uuid=speechlog_uuid,
-                references=references
-            )
             
-            logger.info(f"已建立新 SpeechLog (UUID: {speechlog_uuid})")
+            # 🔧 【修復】檢查 Weaviate 返回值，確保真正寫入成功
+            try:
+                insert_result = speechlog_collection.data.insert(
+                    properties=properties,
+                    uuid=speechlog_uuid,
+                    references=references
+                )
+                
+                # 驗證寫入結果
+                logger.info(f"✅ Weaviate 插入返回: {insert_result}")
+                
+                # 🔍 【驗證】立即回查確認寫入成功（重試機制）
+                import time
+                max_retries = 5  # 🔧 增加到 5 次重試
+                retry_delay = 0.2  # 🔧 延遲增加到 200ms
+                verify_obj = None
+                
+                for attempt in range(max_retries):
+                    verify_obj = speechlog_collection.query.fetch_object_by_id(uuid=speechlog_uuid)
+                    if verify_obj:
+                        logger.info(f"✅ 回查驗證成功 (嘗試 {attempt + 1}/{max_retries}): {verify_obj.properties.get('content', '')[:30]}...")
+                        break
+                    else:
+                        if attempt < max_retries - 1:
+                            logger.warning(f"⚠️  回查失敗 (嘗試 {attempt + 1}/{max_retries})，{retry_delay}秒後重試...")
+                            time.sleep(retry_delay)
+                        else:
+                            error_msg = f"❌ SpeechLog {speechlog_uuid} 寫入後回查失敗（重試 {max_retries} 次）！"
+                            logger.error(error_msg)
+                            logger.error(f"   內容: {properties.get('content', '')[:50]}")
+                            logger.error(f"   語者: {speaker_uuid}")
+                            logger.error(f"   Session: {session_uuid}")
+                            logger.error(f"   Weaviate 可能存在最終一致性延遲問題")
+                            raise RuntimeError(error_msg)
+                
+                logger.info(f"已建立新 SpeechLog (UUID: {speechlog_uuid})")
+                
+            except Exception as insert_error:
+                logger.error(f"❌ Weaviate 插入操作失敗: {insert_error}")
+                logger.error(f"   UUID: {speechlog_uuid}")
+                logger.error(f"   屬性: {properties}")
+                logger.error(f"   引用: {references}")
+                raise
+            
             return {
                 "success": True,
                 "message": "成功建立 SpeechLog",
@@ -1955,8 +1993,13 @@ class DatabaseService:
             }
             
         except Exception as e:
-            logger.error(f"建立 SpeechLog 時發生錯誤: {e}")
-            return {"success": False, "message": str(e), "data": None}
+            # 🚨 不要吞掉異常！重新拋出讓上層處理
+            logger.error(f"❌ 建立 SpeechLog 發生嚴重錯誤: {e}")
+            logger.error(f"   異常類型: {type(e).__name__}")
+            logger.error(f"   內容: {getattr(request, 'content', '')[:50]}...")
+            logger.error(f"   語者: {getattr(request, 'speaker', 'N/A')}")
+            logger.error(f"   Session: {getattr(request, 'session', 'N/A')}")
+            raise  # 🔥 重新拋出異常，讓 API 層知道失敗了
     
     def list_speechlogs(self) -> list:
         """
@@ -1972,7 +2015,8 @@ class DatabaseService:
                         # ✅ JOIN Speaker: 一次性取得 full_name 和 nickname
                         QueryReference(link_on="speaker", return_properties=["uuid", "full_name", "nickname"]),
                         QueryReference(link_on="session", return_properties=["uuid"])
-                    ]
+                    ],
+                    limit=10000  # 🔧 明確設置 limit，避免默認限制（Weaviate 默認可能只返回 100 條）
                 )
             )
             
@@ -2249,17 +2293,66 @@ class DatabaseService:
             list: SpeechLogInfo 列表 (包含 speaker_name, speaker_nickname)
         """
         try:
-            # 使用優化後的 list_speechlogs (已包含 Speaker JOIN)
-            all_speechlogs = self.list_speechlogs()
+            from weaviate.classes.query import Filter, QueryReference
             
-            # 篩選出屬於指定 Session 的 SpeechLog
-            result = [sl for sl in all_speechlogs if sl.get("session") == session_id]
+            # 🔧 【修復】直接用 Weaviate 條件查詢，避免先取所有再過濾
+            results = (
+                self.client.collections.get(self.SPEECHLOG_CLASS)
+                .query.fetch_objects(
+                    filters=Filter.by_ref("session").by_id().equal(session_id),
+                    return_references=[
+                        QueryReference(link_on="speaker", return_properties=["uuid", "full_name", "nickname"]),
+                        QueryReference(link_on="session", return_properties=["uuid"])
+                    ],
+                    limit=1000  # 🔧 明確設置 limit，避免默認限制
+                )
+            )
             
-            logger.info(f"找到 {len(result)} 個 SpeechLog 屬於 Session {session_id}")
-            return result
+            speechlogs = []
+            for obj in results.objects:
+                # 處理引用
+                speaker_uuid = None
+                speaker_name = None
+                speaker_nickname = None
+                session_uuid = None
+                
+                if obj.references:
+                    if obj.references.get("speaker") and obj.references["speaker"].objects:
+                        speaker_obj = obj.references["speaker"].objects[0]
+                        speaker_uuid = str(speaker_obj.uuid)
+                        speaker_name = speaker_obj.properties.get("full_name")
+                        speaker_nickname = speaker_obj.properties.get("nickname")
+                    if obj.references.get("session") and obj.references["session"].objects:
+                        session_uuid = str(obj.references["session"].objects[0].uuid)
+                
+                # 處理時間欄位
+                timestamp = obj.properties.get("timestamp")
+                if hasattr(timestamp, 'isoformat'):
+                    timestamp = timestamp.isoformat()
+                
+                speechlogs.append({
+                    "uuid": str(obj.uuid),
+                    "content": obj.properties.get("content"),
+                    "timestamp": timestamp,
+                    "confidence": obj.properties.get("confidence"),
+                    "duration": obj.properties.get("duration"),
+                    "language": obj.properties.get("language"),
+                    "speaker": speaker_uuid,
+                    "speaker_name": speaker_name,
+                    "speaker_nickname": speaker_nickname,
+                    "session": session_uuid
+                })
+            
+            # 按時間排序（最新在前）
+            speechlogs.sort(key=lambda s: s["timestamp"] or "", reverse=True)
+            
+            logger.info(f"找到 {len(speechlogs)} 個 SpeechLog 屬於 Session {session_id}")
+            return speechlogs
             
         except Exception as e:
             logger.error(f"查詢 Session 的 SpeechLog 時發生錯誤: {e}")
+            logger.error(f"   Session UUID: {session_id}")
+            logger.error(f"   異常類型: {type(e).__name__}")
             return []
 
 # 單元測試代碼
