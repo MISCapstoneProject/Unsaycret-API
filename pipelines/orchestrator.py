@@ -91,6 +91,24 @@ def process_segment(seg_path: str, t0: float, t1: float, absolute_timestamp: flo
             
         (text, conf, words), asr_time = asr_future.result()
 
+    # Immediate cleanup for Chinese ASR text (fail-open on errors)
+    try:
+        if not hasattr(process_segment, "_punctuator_lock"):
+            process_segment._punctuator_lock = threading.Lock()
+
+        if not hasattr(process_segment, "_punctuator"):
+            with process_segment._punctuator_lock:
+                if not hasattr(process_segment, "_punctuator"):
+                    from modules.text.punctuator import ChinesePunctuator
+                    device = "cuda" if getattr(asr, "gpu", False) else "cpu"
+                    process_segment._punctuator = ChinesePunctuator(device=device)
+
+        punctuator = getattr(process_segment, "_punctuator", None)
+        if punctuator is not None:
+            text = punctuator.apply(text, use_macbert=True)
+    except Exception:
+        logger.debug("Chinese punctuator cleanup skipped due to error.", exc_info=True)
+
     logger.info(f"⏱ SpeakerID 耗時 {spk_time:.3f}s")
     logger.info(f"⏱ ASR 耗時 {asr_time:.3f}s")
 

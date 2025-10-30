@@ -698,6 +698,24 @@ def process_window(
             language=lang,
         )
 
+        # Immediate cleanup for Chinese ASR text (fail-open on errors)
+        try:
+            if not hasattr(process_window, "_punctuator_lock"):
+                process_window._punctuator_lock = threading.Lock()
+
+            if not hasattr(process_window, "_punctuator"):
+                with process_window._punctuator_lock:
+                    if not hasattr(process_window, "_punctuator"):
+                        from modules.text.punctuator import ChinesePunctuator
+                        device = "cuda" if getattr(asr, "gpu", False) else "cpu"
+                        process_window._punctuator = ChinesePunctuator(device=device)
+
+            punctuator = getattr(process_window, "_punctuator", None)
+            if punctuator is not None:
+                text = punctuator.apply(text, use_macbert=True)
+        except Exception:
+            logger.debug("Chinese punctuator cleanup skipped due to error.", exc_info=True)
+
         # 調整 words 時間軸成全域絕對時間 (不是4秒local)
         global_words = _offset_words_global(words, t_start)
 
@@ -1253,7 +1271,7 @@ def parse_args() -> argparse.Namespace:
 
     # MIRRORED FROM orchestrator_sample.py: window geometry (do not diverge)
     p.add_argument("--chunk", type=float, default=4.0, help="window length seconds (MIRRORED: sample default=4.0)")
-    p.add_argument("--stride", type=float, default=1.0, help="window hop seconds (MIRRORED: sample default=1.0)")
+    p.add_argument("--stride", type=float, default=2.0, help="window hop seconds (MIRRORED: sample default=1.0)")
 
     p.add_argument("--workers", type=int, default=2, help="thread pool size")
     p.add_argument("--lang", type=str, default="zh")
