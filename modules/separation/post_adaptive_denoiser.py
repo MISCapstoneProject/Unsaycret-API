@@ -328,6 +328,10 @@ class AdaptiveDenoiser:
         sos = signal.butter(4, cutoff, btype='high', output='sos')
         filtered = signal.sosfilt(sos, audio_np)
         
+        # sosfilt 會將 float32 轉換為 float64，需要轉回來
+        if audio_np.dtype == np.float32:
+            filtered = filtered.astype(np.float32)
+        
         return filtered
     
     def _apply_dereverb(
