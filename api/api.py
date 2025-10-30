@@ -513,6 +513,8 @@ async def ws_stream(ws: WebSocket):
                 # ========== 資料庫儲存階段 (SpeechLog 管理) ==========
                 logger.info(f"💾 開始處理 segment {segment_id} 的資料庫儲存")
                 speechlog_created = False
+                # 🆔 儲存每個語者的 SpeechLog UUID（用於前端追蹤和編輯）
+                speaker_speechlog_uuids = {}
                 
                 # 遍歷此音訊片段中的所有識別到的語者
                 speakers = seg.get("speakers", [])
@@ -547,7 +549,13 @@ async def ws_stream(ws: WebSocket):
                         try:
                             result = data_facade.create_speechlog(sl_req)
                             if result.get("success"):
-                                logger.info(f"✅ SpeechLog 儲存成功: {speaker_id} - \"{speaker_text[:50]}...\"")
+                                # 🆔 捕獲 SpeechLog UUID 供前端使用
+                                speechlog_uuid = result.get("data", {}).get("uuid")
+                                if speechlog_uuid:
+                                    speaker_speechlog_uuids[speaker_id] = speechlog_uuid
+                                    logger.info(f"✅ SpeechLog 儲存成功 (UUID: {speechlog_uuid}): {speaker_id} - \"{speaker_text[:50]}...\"")
+                                else:
+                                    logger.warning(f"⚠️  SpeechLog 儲存成功但未取得 UUID: {speaker_id}")
                                 speechlog_created = True
                             else:
                                 logger.error(f"❌ SpeechLog 儲存失敗: {result.get('message')}")
@@ -588,26 +596,34 @@ async def ws_stream(ws: WebSocket):
                     logger.info(f"👥 此片段有 {total_speakers} 個語者，將分別發送字幕")
                     
                     for speaker_idx, speaker in enumerate(speakers):
-                        # 只發送有文字內容的語者
-                        if not speaker.get("text", "").strip():
-                            logger.debug(f"⏭️  跳過空白文字的語者: {speaker.get('speaker_id', 'unknown')}")
+                        speaker_id = speaker.get("speaker_id")
+                        speaker_text = speaker.get("text", "")
+                        
+                        # ⚠️ 【修復】統一過濾條件：必須同時有 speaker_id 和 text 才發送
+                        # 這樣可以確保前端顯示的字幕都有對應的資料庫記錄
+                        if not speaker_id or not speaker_text.strip():
+                            logger.debug(f"⏭️  跳過無效語者資料: speaker_id={speaker_id}, text=\"{speaker_text}\"")
                             continue
+                        
+                        # 🆔 取得這個語者對應的 SpeechLog UUID
+                        speechlog_uuid = speaker_speechlog_uuids.get(speaker_id)
                             
-                        # 🏗️  組裝標準 subtitle 訊息格式 (含完整時間資訊)
+                        # 🏗️  組裝標準 subtitle 訊息格式 (含完整時間資訊 + SpeechLog UUID)
                         subtitle_msg = {
                             "type": "subtitle",                                    # 🏷️  訊息類型標識
                             "segmentId": seg.get("segment", "unknown"),           # 🆔 片段唯一識別碼
-                            "speakerId": speaker.get("speaker_id", "unknown"),    # 👤 語者 UUID
+                            "speakerId": speaker_id,                              # 👤 語者 UUID
                             "speakerName": speaker.get("speaker", "Unknown"),     # 📛 語者顯示名稱
+                            "speechLogUuid": speechlog_uuid,                      # 🆔 SpeechLog UUID (供前端編輯/刪除)
                             "distance": speaker.get("distance", None),           # 📏 識別信心距離
-                            "text": speaker.get("text", ""),                     # 💬 轉錄文字內容
+                            "text": speaker_text,                                # 💬 轉錄文字內容（使用已驗證的變數）
                             "confidence": speaker.get("confidence", None),       # 🎯 ASR 信心度
                             "startTime": speaker.get("start", None),             # ⏰ 語者開始時間 (相對)
                             "endTime": speaker.get("end", None),                 # ⏰ 語者結束時間 (相對)
                             "absoluteStartTime": speaker.get("absolute_start_time", None),  # 📅 絕對開始時間
                             "absoluteEndTime": speaker.get("absolute_end_time", None),      # 📅 絕對結束時間
                             "isFinal": True,                                      # ✅ 串流模式都是最終版本
-                            "segment": {                                          # � 片段資訊
+                            "segment": {                                          # 📦 片段資訊
                                 "totalSpeakers": total_speakers,                 # 👥 此片段總語者數
                                 "speakerIndex": speaker_idx,                     # 📍 當前語者在片段中的索引
                                 "segmentStart": seg.get("start", None),          # ⏰ 片段開始時間
@@ -618,7 +634,7 @@ async def ws_stream(ws: WebSocket):
                         # 📤 發送 JSON 訊息給前端
                         try:
                             await ws.send_text(json.dumps(subtitle_msg, ensure_ascii=False))
-                            logger.info(f"✅ 已發送字幕 [{speaker_idx+1}/{total_speakers}]: segment={segment_id}, speaker={speaker.get('speaker_id', 'unknown')}, text=\"{speaker.get('text', '')[:30]}...\"")
+                            logger.info(f"✅ 已發送字幕 [{speaker_idx+1}/{total_speakers}]: segment={segment_id}, speaker={speaker_id}, text=\"{speaker_text[:30]}...\"")
                         except Exception as send_error:
                             logger.warning(f"⚠️  發送字幕時發生錯誤: {send_error}")
                             frontend_connected = False  # 標記前端已斷線

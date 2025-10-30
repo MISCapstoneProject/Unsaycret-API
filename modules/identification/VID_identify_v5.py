@@ -909,7 +909,7 @@ class SpeakerIdentifier:
         處理過於相似的情況：不更新向量
         
         Args:
-            best_id: 最佳匹配ID
+            best_id: 最佳匹配的聲紋向量 UUID
             best_name: 最佳匹配語者名稱
             best_distance: 最佳匹配距離
             
@@ -919,7 +919,10 @@ class SpeakerIdentifier:
         if self.verbose:
             print(f"(跳過) 嵌入向量過於相似 (距離 = {best_distance:.4f})，不進行更新。")
             print(f"該音檔與語者 {best_name} 的檔案相同。")
-        return best_id, best_name, best_distance
+        
+        # 🐛【修復】從聲紋獲取所屬的語者UUID，而不是直接回傳聲紋UUID
+        speaker_id = self._get_speaker_id_from_voiceprint(best_id)
+        return speaker_id, best_name, best_distance
     
     def _handle_update_embedding(self, best_id: str, best_name: str, best_distance: float, new_embedding: np.ndarray) -> Tuple[str, str, float]:
         """
@@ -946,7 +949,10 @@ class SpeakerIdentifier:
             # 更新嵌入向量（傳遞新的更新次數）
             self.database.update_embedding(best_id, new_embedding, new_update_count)
             print(f"該音檔與語者 {best_name} 相符，且已更新嵌入檔案。")
-            return best_id, best_name, best_distance
+            
+            # 🐛【修復】從聲紋獲取所屬的語者UUID，而不是直接回傳聲紋UUID
+            speaker_id = self._get_speaker_id_from_voiceprint(best_id)
+            return speaker_id, best_name, best_distance
         except Exception as e:
             print(f"更新嵌入向量時發生錯誤: {e}")
             raise

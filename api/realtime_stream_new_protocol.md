@@ -68,6 +68,7 @@ websocket.send("stop");
   "segmentId": "1",                    // 片段唯一 ID
   "speakerId": "speaker-uuid-123",     // 語者唯一 UUID
   "speakerName": "John",               // 語者顯示名稱
+  "speechLogUuid": "speechlog-uuid",   // SpeechLog UUID (用於前端編輯/刪除資料庫記錄)
   "distance": 0.25,                    // 語者辨識距離 (0-1, 越小越準確)
   "text": "今天天氣很好",               // 轉錄文字內容
   "confidence": 0.89,                  // ASR 信心度 (0-1)
