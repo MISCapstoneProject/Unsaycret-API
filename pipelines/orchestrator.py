@@ -20,12 +20,31 @@ import numpy as np
 from scipy.signal import resample_poly
 
 from utils.logger import get_logger
-from utils.constants import DEFAULT_WHISPER_MODEL,DEFAULT_WHISPER_BEAM_SIZE
+from utils.constants import (
+    DEFAULT_WHISPER_MODEL,
+    DEFAULT_WHISPER_BEAM_SIZE,
+    ASR_WIN_SEC,
+    ASR_CTX_SEC,
+    ASR_SAMPLE_RATE,
+    ASR_EDGE_MS,
+    ASR_EDGE_CONF,
+    ASR_EDGE_MIN_DUR,
+    ASR_TAIL_PUNCT_GAP,
+    ASR_STREAM_POLICY,
+)
 from utils.env_config import FORCE_CPU, CUDA_DEVICE_INDEX
 from modules.separation.separator import AudioSeparator
 from modules.identification.VID_identify_v5 import SpeakerIdentifier
 from modules.asr.whisper_asr import WhisperASR
-from modules.asr.text_utils import compute_cer, compute_wer
+from modules.audio.context_reader import fetch_audio_with_context
+from modules.asr.text_utils import (
+    compute_cer,
+    compute_wer,
+    clip_words_to_window,
+    edge_sanitize,
+    suppress_tail_punct,
+    rebuild_text_from_words,
+)
 
 logger = get_logger(__name__)
 
@@ -75,10 +94,110 @@ def process_segment(seg_path: str, t0: float, t1: float, absolute_timestamp: flo
     )
     
     start = time.perf_counter()
+    
+    seg_path_obj = Path(seg_path)
+    seg_dir = seg_path_obj.parent
+    speaker_file = seg_path_obj.name
+    seg_root_dir = seg_dir.parent if seg_dir is not None else None
+
+    #是否跨窗0.6秒上下文
+    USE_CONTEXT_ASR = False  # True = current behavior; False = legacy no-context
+
+    seg_idx = None
+    if seg_dir is not None:
+        seg_name = seg_dir.name
+        try:
+            seg_idx = int(seg_name.split("_")[-1])
+        except Exception:
+            seg_idx = None
+    if seg_idx is None and ASR_WIN_SEC:
+        try:
+            seg_idx = int(round(t0 / ASR_WIN_SEC))
+        except Exception:
+            seg_idx = None
+
+    def _asr_with_context():
+        if seg_root_dir is None or seg_idx is None:
+            text, conf, raw_words = asr.transcribe(seg_path, language="zh")
+            abs_words = []
+            for w in raw_words:
+                w2 = dict(w)
+                w2["start"] = float(w2.get("start", 0.0)) + t0
+                w2["end"] = float(w2.get("end", 0.0)) + t0
+                abs_words.append(w2)
+            words = clip_words_to_window(abs_words, t0, t1)
+            words = edge_sanitize(words, t0, t1, ASR_EDGE_MS, ASR_EDGE_CONF, ASR_EDGE_MIN_DUR)
+            final_text = rebuild_text_from_words(words) or text
+            if words:
+                last_end = float(words[-1].get("end", t0))
+                final_text = suppress_tail_punct(final_text, last_end, t1, ASR_TAIL_PUNCT_GAP)
+            return final_text, conf, words
+
+        next_path = seg_root_dir / f"segment_{seg_idx + 1:03d}" / speaker_file
+        if ASR_STREAM_POLICY == "SMALL_LOOKAHEAD":
+            deadline = time.perf_counter() + ASR_CTX_SEC
+            while not next_path.exists() and time.perf_counter() < deadline:
+                time.sleep(0.05)
+
+        buf = fetch_audio_with_context(
+            base_dir=str(seg_root_dir),
+            seg_idx=seg_idx,
+            speaker_file=speaker_file,
+            win_sec=ASR_WIN_SEC,
+            ctx_sec=ASR_CTX_SEC,
+            sr=ASR_SAMPLE_RATE,
+        )
+        _full_text, avg_conf, word_info = asr.transcribe_tensor(buf, language="zh")
+
+        offset = t0 - ASR_CTX_SEC
+        contextual_words = []
+        for w in word_info:
+            w2 = dict(w)
+            w2["start"] = float(w2.get("start", 0.0)) + offset
+            w2["end"] = float(w2.get("end", 0.0)) + offset
+            contextual_words.append(w2)
+
+        words = clip_words_to_window(contextual_words, t0, t1)
+        words = edge_sanitize(words, t0, t1, ASR_EDGE_MS, ASR_EDGE_CONF, ASR_EDGE_MIN_DUR)
+        final_text = rebuild_text_from_words(words)
+        if words:
+            last_end = float(words[-1].get("end", t0))
+            final_text = suppress_tail_punct(final_text, last_end, t1, ASR_TAIL_PUNCT_GAP)
+        else:
+            final_text = final_text or ""
+
+        return final_text, avg_conf, words
+
+    def _asr_no_context():
+        # No look-ahead, no contextual buffer; preserve downstream invariants
+        text, conf, raw_words = asr.transcribe(seg_path, language="zh")
+
+        # Convert to absolute word times
+        abs_words = []
+        for w in (raw_words or []):
+            w2 = dict(w)
+            w2["start"] = float(w2.get("start", 0.0)) + t0
+            w2["end"] = float(w2.get("end", 0.0)) + t0
+            abs_words.append(w2)
+
+        # Clip to current window and sanitize edges
+        words = clip_words_to_window(abs_words, t0, t1)
+        words = edge_sanitize(words, t0, t1, ASR_EDGE_MS, ASR_EDGE_CONF, ASR_EDGE_MIN_DUR)
+
+        # Rebuild text and suppress unstable tail punctuation
+        final_text = rebuild_text_from_words(words) or (text or "")
+        if words:
+            last_end = float(words[-1].get("end", t0))
+            final_text = suppress_tail_punct(final_text, last_end, t1, ASR_TAIL_PUNCT_GAP)
+
+        return final_text, conf, words
 
     with ThreadPoolExecutor(max_workers=2) as ex:
         spk_future = ex.submit(_timed_call, spk.process_audio_file, seg_path)
-        asr_future = ex.submit(_timed_call, asr.transcribe, seg_path)
+        if USE_CONTEXT_ASR:
+            asr_future = ex.submit(_timed_call, _asr_with_context)
+        else:
+            asr_future = ex.submit(_timed_call, _asr_no_context)
 
         # 安全地取得語者識別結果
         spk_result = spk_future.result()
@@ -91,33 +210,33 @@ def process_segment(seg_path: str, t0: float, t1: float, absolute_timestamp: flo
             
         (text, conf, words), asr_time = asr_future.result()
 
-    # Immediate cleanup for Chinese ASR text (fail-open on errors)
-    try:
-        if not hasattr(process_segment, "_punctuator_lock"):
-            process_segment._punctuator_lock = threading.Lock()
+    #標點符號與簡單修字
+    USE_PUNCTUATOR = False  # True = enable ChinesePunctuator cleanup; False = skip entirely
 
-        if not hasattr(process_segment, "_punctuator"):
-            with process_segment._punctuator_lock:
-                if not hasattr(process_segment, "_punctuator"):
-                    from modules.text.punctuator import ChinesePunctuator
-                    device = "cuda" if getattr(asr, "gpu", False) else "cpu"
-                    process_segment._punctuator = ChinesePunctuator(device=device)
+    if USE_PUNCTUATOR:
+        # Immediate cleanup for Chinese ASR text (fail-open on errors)
+        try:
+            if not hasattr(process_segment, "_punctuator_lock"):
+                process_segment._punctuator_lock = threading.Lock()
 
-        punctuator = getattr(process_segment, "_punctuator", None)
-        if punctuator is not None:
-            text = punctuator.apply(text, use_macbert=True)
-    except Exception:
-        logger.debug("Chinese punctuator cleanup skipped due to error.", exc_info=True)
+            if not hasattr(process_segment, "_punctuator"):
+                with process_segment._punctuator_lock:
+                    if not hasattr(process_segment, "_punctuator"):
+                        from modules.text.punctuator import ChinesePunctuator
+                        device = "cuda" if getattr(asr, "gpu", False) else "cpu"
+                        process_segment._punctuator = ChinesePunctuator(device=device)
+
+            punctuator = getattr(process_segment, "_punctuator", None)
+            if punctuator is not None:
+                text = punctuator.apply(text, use_macbert=True)
+        except Exception:
+            logger.debug("Chinese punctuator cleanup skipped due to error.", exc_info=True)
 
     logger.info(f"⏱ SpeakerID 耗時 {spk_time:.3f}s")
     logger.info(f"⏱ ASR 耗時 {asr_time:.3f}s")
 
-    # 調整每個詞的時間戳，使其對齊原始混音檔軸
-    adjusted_words = []
-    for w in words:
-        w['start'] = w['start'] + t0
-        w['end']   = w['end'] + t0
-        adjusted_words.append(w)
+    # Word timestamps already absolute; copy for downstream consumers.
+    adjusted_words = [dict(w) for w in (words or [])]
 
     total = time.perf_counter() - start
     logger.info(f"⏱ segment 總耗時 {total:.3f}s")

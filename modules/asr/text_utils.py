@@ -118,3 +118,66 @@ def compute_cer(reference: str, hypothesis: str) -> float:
         return 0.0
     dist = _levenshtein(ref_chars, hyp_chars)
     return dist / len(ref_chars)
+
+
+def clip_words_to_window(words, win_start, win_end):
+    """Keep words overlapping [win_start, win_end) and clamp their spans."""
+    out = []
+    for w in words or []:
+        s = float(w.get("start", 0.0))
+        e = float(w.get("end", 0.0))
+        if e <= win_start or s >= win_end:
+            continue
+        w2 = dict(w)
+        w2["start"] = max(win_start, s)
+        w2["end"] = min(win_end, e)
+        out.append(w2)
+    return out
+
+
+def edge_sanitize(words, win_start, win_end, edge_ms, edge_conf, edge_min_dur):
+    """Apply stricter confidence/duration near window edges."""
+    if not words:
+        return []
+    head_edge = win_start + edge_ms
+    tail_edge = win_end - edge_ms
+    keep = []
+    for w in words:
+        s = float(w.get("start", 0.0))
+        e = float(w.get("end", 0.0))
+        p = float(w.get("probability", 1.0))
+        dur = max(0.0, e - s)
+        in_edge = (s < head_edge) or (e > tail_edge)
+        if in_edge:
+            if (p >= edge_conf) and (dur >= edge_min_dur):
+                keep.append(w)
+        else:
+            keep.append(w)
+    return keep
+
+
+def suppress_tail_punct(text, last_word_end, win_end, tail_gap):
+    """Strip trailing punctuation if last word ends too close to window end."""
+    if not text:
+        return text
+    if (win_end - float(last_word_end or 0.0)) < tail_gap:
+        stripped = text.rstrip()
+        for tail in ("。", "！", "？", ".", "!", "?", "…", "..."):
+            if stripped.endswith(tail):
+                return stripped[: -len(tail)]
+    return text
+
+
+def rebuild_text_from_words(words):
+    """Rebuild utterance text using spacing rules for CJK tokens."""
+    if not words:
+        return ""
+    buf = []
+    for i, w in enumerate(words):
+        tok = str(w.get("word", "") or "")
+        if not tok:
+            continue
+        if i > 0 and tok and ord(tok[0]) < 128:
+            buf.append(" ")
+        buf.append(tok)
+    return "".join(buf).strip()

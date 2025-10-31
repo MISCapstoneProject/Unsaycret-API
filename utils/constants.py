@@ -14,6 +14,19 @@ AUDIO_TARGET_RATE = 16000    # 處理時統一的目標取樣率
 AUDIO_CHANNELS = 1           # 單聲道
 WHISPER_MODEL_CACHE_DIR = "models/faster-whisper"
 
+# ASR context decoding constants
+ASR_WIN_SEC = 4.0           # fixed output window length
+ASR_CTX_SEC = 0.6           # context on both sides for decoding
+ASR_SAMPLE_RATE = 16000
+# Optional guardrails
+ASR_EDGE_MS = 0.35
+ASR_EDGE_CONF = 0.90
+ASR_EDGE_MIN_DUR = 0.08
+ASR_TAIL_PUNCT_GAP = 0.18
+# Streaming policy: "STRICT_REALTIME" (no wait, pad) or "SMALL_LOOKAHEAD" (+ctx delay)
+ASR_STREAM_POLICY = "SMALL_LOOKAHEAD"
+
+
 # 預設模型配置 (經過測試的穩定版本)
 DEFAULT_WHISPER_MODEL = "medium"
 DEFAULT_WHISPER_BEAM_SIZE = 5

@@ -6,6 +6,7 @@ from utils.constants import DEFAULT_WHISPER_MODEL, DEFAULT_WHISPER_BEAM_SIZE
 import torch
 import torchaudio
 import re
+import numpy as np
 from typing import Iterable
 
 from .asr_model import load_model
@@ -248,6 +249,82 @@ class WhisperASR:
             torch.cuda.empty_cache()
 
         # 簡轉繁（臺灣用字＋標點）
+        do_conv = (self.cc is not None) and (
+            self.lang in (None, "zh", "auto") or str(self.lang).startswith("zh")
+        )
+        if do_conv:
+            if full_txt:
+                full_txt = self.cc.convert(full_txt)
+            if word_info:
+                for wi in word_info:
+                    if "word" in wi and isinstance(wi["word"], str):
+                        wi["word"] = self.cc.convert(wi["word"])
+
+        self.last_infer_time = infer_end - infer_start
+        self.last_total_time = time.perf_counter() - total_start
+
+        return full_txt, avg_conf, word_info
+
+    def transcribe_tensor(self, audio, **kwargs) -> tuple[str, float, list[dict]]:
+        """
+        Transcribe in-memory mono float32 audio buffer at ASR sample rate.
+        """
+        total_start = time.perf_counter()
+        infer_start = time.perf_counter()
+
+        if isinstance(audio, torch.Tensor):
+            audio_np = audio.detach().cpu().numpy()
+        else:
+            audio_np = np.asarray(audio)
+
+        if audio_np.ndim > 1:
+            audio_np = np.reshape(audio_np, (-1,))
+        audio_np = audio_np.astype("float32", copy=False)
+
+        options = {
+            "word_timestamps": True,
+            "beam_size": 1,
+            "temperature": 0.0,
+            "condition_on_previous_text": False,
+            "suppress_tokens": "-1",
+            "language": "zh",
+        }
+        options.update(kwargs)
+
+        seg_gen, _ = self.model.transcribe(
+            audio_np,
+            **_normalize_asr_kwargs(options),
+        )
+        infer_end = time.perf_counter()
+
+        segments = list(seg_gen)
+        if not segments:
+            self.last_infer_time = infer_end - infer_start
+            self.last_total_time = time.perf_counter() - total_start
+            return "", 0.0, []
+
+        full_txt = "".join(s.text for s in segments).strip()
+        words = [w for s in segments for w in (s.words or [])]
+
+        if words:
+            probs = [w.probability for w in words]
+            avg_conf = float(sum(probs) / len(probs)) if probs else 0.0
+            word_info = [
+                {
+                    "start": float(w.start),
+                    "end": float(w.end),
+                    "word": str(w.word),
+                    "probability": float(w.probability),
+                }
+                for w in words
+            ]
+        else:
+            avg_conf = float(sum(s.avg_logprob for s in segments) / len(segments))
+            word_info = []
+
+        if self.gpu and torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
         do_conv = (self.cc is not None) and (
             self.lang in (None, "zh", "auto") or str(self.lang).startswith("zh")
         )
