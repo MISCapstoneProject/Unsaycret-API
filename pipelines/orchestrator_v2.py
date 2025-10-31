@@ -95,11 +95,13 @@ class RawSourceResult:
     - asr_segments: [{text, confidence, start, end}] 給 UI / summary
     - id_info: (speaker_id, speaker_name, distance) 來自 SpeakerIdentifier
                不參與 track 決策，只是 metadata
+    - speaker_name: 上游辨識直接給出的語者名稱 (若缺少就留 None)
     """
     embedding: np.ndarray
     sentences: List[SentenceFragment]
     asr_segments: List[dict]
     id_info: Optional[Tuple[str, str, float]]
+    speaker_name: Optional[str]
     # 新增：保存「全域時間」的 word 級結果（供 FAST 使用）
     words: List[dict]
 
@@ -688,7 +690,33 @@ def process_window(
         wav_path, rel_t0, rel_t1, _abs_ts = entry  # 我們其實用不到 rel_t0/rel_t1/abs_ts 這邊
 
         # 1) speaker metadata / embedding
-        spk_meta = _safe_speaker_meta(identifier, wav_path)
+        spk_meta_raw = _safe_speaker_meta(identifier, wav_path)
+        speaker_id: Optional[str] = None
+        speaker_name_norm: Optional[str] = None
+        speaker_dist: Optional[float] = None
+        if spk_meta_raw:
+            try:
+                speaker_id = spk_meta_raw[0]
+            except Exception:
+                speaker_id = None
+            try:
+                raw_name = spk_meta_raw[1]
+                if raw_name is not None:
+                    name_str = str(raw_name).strip()
+                    speaker_name_norm = name_str or None
+            except Exception:
+                speaker_name_norm = None
+            try:
+                raw_dist = spk_meta_raw[2]
+                speaker_dist = float(raw_dist) if raw_dist is not None else None
+            except Exception:
+                speaker_dist = None
+
+        if any(val is not None for val in (speaker_id, speaker_name_norm, speaker_dist)):
+            spk_meta = (speaker_id, speaker_name_norm, speaker_dist)
+        else:
+            spk_meta = None
+
         emb_vec = _safe_extract_embedding(identifier, wav_path, window_idx, local_idx)
 
         # 2) Whisper ASR
@@ -743,6 +771,7 @@ def process_window(
                 sentences=sentences,
                 asr_segments=asr_segments,
                 id_info=spk_meta,
+                speaker_name=speaker_name_norm,
                 words=global_words,            # ★ 新增
             )
         )
@@ -783,6 +812,7 @@ def handle_window_result(
     summary_writer: SummaryWriter,
     aggregator: Optional[FastAggregator],
     rtf_state: Dict[str, float],
+    use_speaker_name: bool,
     is_last: bool = False,  # ★ 新增
 ) -> None:
     """
@@ -792,62 +822,105 @@ def handle_window_result(
       3) 追加一行到 summary.jsonl
       4) 把句子丟進 FAST 聚合器（跨窗合併）
     """
-    # 1) 匈牙利：只用 embedding + 時間做追蹤，不混 SpeakerID
+    # 1) 決定語者身份：優先使用上游給出的 speaker_name，必要時才回退匈牙利
     embeddings = [src.embedding for src in result.sources]
-    assignments = track_manager.assign(
-        window_start=result.t_start,
-        window_end=result.t_end,
-        embeddings=embeddings,
-    )
+
+    speaker_names: List[Optional[str]] = []
+    for src in result.sources:
+        candidate = src.speaker_name
+        if not candidate and src.id_info:
+            try:
+                candidate = src.id_info[1]
+            except Exception:
+                candidate = None
+        if candidate is not None:
+            candidate = str(candidate).strip()
+            if not candidate:
+                candidate = None
+        speaker_names.append(candidate)
+        src.speaker_name = candidate
+
+    assignments: Dict[int, int] = {}
+    fallback_needed = not use_speaker_name
+    if use_speaker_name:
+        missing = [idx for idx, name in enumerate(speaker_names) if not name]
+        if missing:
+            logger.warning("Missing speaker_name, using fallback assignment")
+            fallback_needed = True
+
+    if fallback_needed:
+        assignments = track_manager.assign(
+            window_start=result.t_start,
+            window_end=result.t_end,
+            embeddings=embeddings,
+        )
 
     tracks_payload_for_segment: List[dict] = []
     summary_tracks: List[dict] = []
 
     # 2) 組 per-window 的輸出內容
     for s_idx, src in enumerate(result.sources):
-        tid = assignments.get(s_idx)
-        if tid is None:
-            # 理論上 assign() 會涵蓋所有 source；保險起見：
-            tid = track_manager._create_track(src.embedding, result.t_end)
+        tid = None
+        if fallback_needed:
+            tid = assignments.get(s_idx)
+            if tid is None:
+                tid = track_manager._create_track(src.embedding, result.t_end)
 
-        speaker_label = f"S{tid}"
+        speaker_name = speaker_names[s_idx]
+        if speaker_name:
+            speaker_label = speaker_name
+        else:
+            speaker_label = f"S{tid}" if tid is not None else "Unknown"
 
-        # SpeakerID 只作為輸出 metadata（不參與追蹤決策）
-        spk_id = None
-        spk_name = None
-        spk_dist = None
+        # SpeakerID 仍保留在 metadata（不參與追蹤決策）
+        spk_id: Optional[str] = None
+        spk_meta_name: Optional[str] = None
+        spk_dist: Optional[float] = None
         if src.id_info:
             try:
                 spk_id = src.id_info[0]
-                spk_name = src.id_info[1]
-                spk_dist = float(src.id_info[2]) if src.id_info[2] is not None else None
             except Exception:
-                pass
+                spk_id = None
+            try:
+                spk_meta_name = src.id_info[1]
+            except Exception:
+                spk_meta_name = None
+            try:
+                raw_dist = src.id_info[2]
+                spk_dist = float(raw_dist) if raw_dist is not None else None
+            except Exception:
+                spk_dist = None
+
+        resolved_name = speaker_name or (str(spk_meta_name).strip() if spk_meta_name else None)
 
         # CJK 已合併的句子
         joined_text = " ".join(seg.text for seg in src.sentences).strip()
         seg_spans = _segments_from_sentences(src.sentences)
 
         # 2-1) segment_XXXX/output.json 內的 tracks 欄位
-        tracks_payload_for_segment.append({
-            "track_id": tid,
+        track_payload = {
             "speaker": speaker_label,
             "asr_segments": src.asr_segments,  # 這裡保留 ASR 的句段（供下游需要）
             "speaker_id": spk_id,
-            "speaker_name": spk_name,
+            "speaker_name": resolved_name,
             "speaker_dist": round(spk_dist, 3) if isinstance(spk_dist, float) else None,
-        })
+        }
+        if tid is not None:
+            track_payload["track_id"] = tid
+        tracks_payload_for_segment.append(track_payload)
 
         # 2-2) summary.jsonl 這一行要寫的 tracks 陣列
-        summary_tracks.append({
-            "track_id": tid,
+        summary_track = {
             "speaker": speaker_label,
             "text": joined_text,
             "segments": seg_spans,
             "speaker_id": spk_id,
-            "speaker_name": spk_name,
+            "speaker_name": resolved_name,
             "speaker_dist": round(spk_dist, 3) if isinstance(spk_dist, float) else None,
-        })
+        }
+        if tid is not None:
+            summary_track["track_id"] = tid
+        summary_tracks.append(summary_track)
 
         # 4) 丟給 FAST（跨窗合併）：以「句子片段」為 token
         # 新：餵 words（全域時間）
@@ -866,13 +939,14 @@ def handle_window_result(
                 })
             if tokens:
                 aggregator.append_window_tokens(
-                    track_id=tid,
+                    track_id=(None if (use_speaker_name and speaker_name) else tid),
                     tokens=tokens,
                     t_start=result.t_start,
                     t_end=result.t_end,
-                    is_last_window= is_last,              # ★ 傳下去
+                    is_last_window=is_last,              # ★ 傳下去
                     window_index=result.window_index,  # 供監控/除錯
                     rtf=float(result.rtf),
+                    speaker_name=(speaker_name if (use_speaker_name and speaker_name) else None),
                 )
 
 
@@ -939,6 +1013,7 @@ def run_file_mode(
     workers: int,
     lang: str,
     enable_fast: bool,
+    use_speaker_name: bool,
     separator: AudioSeparator,
     identifier: Optional[SpeakerIdentifier],
     asr: WhisperASR,
@@ -994,7 +1069,13 @@ def run_file_mode(
             pending[w_idx] = fut
 
             _flush_ready_results_in_order(
-                pending, track_manager, summary_writer, aggregator, rtf_state, next_to_flush
+                pending,
+                track_manager,
+                summary_writer,
+                aggregator,
+                rtf_state,
+                next_to_flush,
+                use_speaker_name,
             )
             while next_to_flush in pending and pending[next_to_flush].done():
                 pending.pop(next_to_flush, None)
@@ -1005,7 +1086,12 @@ def run_file_mode(
     finally:
         executor.shutdown(wait=True)
         _flush_all_remaining(
-            pending, track_manager, summary_writer, aggregator, rtf_state
+            pending,
+            track_manager,
+            summary_writer,
+            aggregator,
+            rtf_state,
+            use_speaker_name,
         )
 
     # MIRRORED FROM orchestrator_sample.py: finalize + export (do not diverge)
@@ -1029,6 +1115,7 @@ def _flush_ready_results_in_order(
     aggregator: Optional[FastAggregator],
     rtf_state: Dict[str, float],
     next_to_flush: int,
+    use_speaker_name: bool,
 ) -> None:
     """
     嘗試從 next_to_flush 開始，依序處理已經完成的 future。
@@ -1060,6 +1147,7 @@ def _flush_ready_results_in_order(
             summary_writer,
             aggregator,
             rtf_state,
+            use_speaker_name,
         )
         # 不能在這裡 pop，因為外面也會 pop & 進位 (避免重入衝突)
         next_to_flush += 1
@@ -1071,6 +1159,7 @@ def _flush_all_remaining(
     summary_writer: SummaryWriter,
     aggregator: Optional[FastAggregator],
     rtf_state: Dict[str, float],
+    use_speaker_name: bool,
 ) -> None:
     """
     結束前保底：把所有 future.block 等到結束，然後依序寫出。
@@ -1100,6 +1189,7 @@ def _flush_all_remaining(
             summary_writer,
             aggregator,
             rtf_state,
+            use_speaker_name,
             is_last=(idx == last_idx),   # ★ 新增
         )
 
@@ -1116,6 +1206,7 @@ def run_stream_mode(
     workers: int,
     lang: str,
     enable_fast: bool,
+    use_speaker_name: bool,
     separator: AudioSeparator,
     identifier: Optional[SpeakerIdentifier],
     asr: WhisperASR,
@@ -1221,7 +1312,13 @@ def run_stream_mode(
 
                 # 丟一個 flush 檢查
                 _flush_ready_results_in_order(
-                    pending, track_manager, summary_writer, aggregator, rtf_state, next_to_flush
+                    pending,
+                    track_manager,
+                    summary_writer,
+                    aggregator,
+                    rtf_state,
+                    next_to_flush,
+                    use_speaker_name,
                 )
                 while next_to_flush in pending and pending[next_to_flush].done():
                     pending.pop(next_to_flush, None)
@@ -1245,7 +1342,12 @@ def run_stream_mode(
 
         executor.shutdown(wait=True)
         _flush_all_remaining(
-            pending, track_manager, summary_writer, aggregator, rtf_state
+            pending,
+            track_manager,
+            summary_writer,
+            aggregator,
+            rtf_state,
+            use_speaker_name,
         )
 
         if aggregator:
@@ -1277,6 +1379,12 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lang", type=str, default="zh")
     p.add_argument("--device", choices=["auto", "cpu", "cuda"], default="auto")
     p.add_argument("--enable-fast", type=str, default="true")
+    p.add_argument(
+        "--use-speaker-name",
+        type=str,
+        default="true",
+        help="Use upstream speaker_name for assignment (default: true).",
+    )
 
     # stream mode audio params
     p.add_argument("--rate", type=int, default=16000)
@@ -1349,6 +1457,7 @@ def main() -> None:
     args = parse_args()
 
     enable_fast = _str_to_bool(args.enable_fast)
+    use_speaker_name = _str_to_bool(args.use_speaker_name)
     
     # MIRRORED FROM orchestrator_sample.py: build aggregator config (do not diverge)
     agg_config = _build_aggregator_config(args)
@@ -1380,6 +1489,7 @@ def main() -> None:
             workers=args.workers,
             lang=args.lang,
             enable_fast=enable_fast,
+            use_speaker_name=use_speaker_name,
             separator=separator,
             identifier=identifier,
             asr=asr,
@@ -1393,6 +1503,7 @@ def main() -> None:
             workers=args.workers,
             lang=args.lang,
             enable_fast=enable_fast,
+            use_speaker_name=use_speaker_name,
             separator=separator,
             identifier=identifier,
             asr=asr,

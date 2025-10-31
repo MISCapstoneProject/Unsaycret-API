@@ -95,6 +95,17 @@ class TrackAggState:
     """
     aggregator: CoreAggregator
     last_window_index: int = -1
+    speaker_name: Optional[str] = None
+    legacy_track_id: Optional[int] = None
+    key: str = ""
+    created_order: int = 0
+
+    def display_label(self) -> str:
+        if self.speaker_name:
+            return self.speaker_name
+        if self.legacy_track_id is not None:
+            return f"S{self.legacy_track_id}"
+        return self.key or "Unknown"
 
 
 # -----------------------------
@@ -111,8 +122,9 @@ class FastAggregator:
 
     def __init__(self, config: Optional[AggregatorCLIConfig] = None) -> None:
         self.config = config or AggregatorCLIConfig()
-        self._tracks: Dict[int, TrackAggState] = {}
+        self._tracks: Dict[str, TrackAggState] = {}
         self._lock = threading.Lock()
+        self._creation_counter = 0
         self._export_path: Optional[str] = None
         self._session_stem: str = "session"
         self._sse_enabled = False
@@ -144,13 +156,31 @@ class FastAggregator:
         self._sse_port = port
         # Actual SSE server startup logic can be implemented here or left as placeholder
 
-    def _get_or_create_track(self, track_id: int) -> TrackAggState:
+    def _make_track_key(self, track_id: Optional[int], speaker_name: Optional[str]) -> str:
+        if speaker_name:
+            return f"speaker::{speaker_name}"
+        if track_id is not None:
+            return f"track::{track_id}"
+        raise ValueError("FastAggregator requires either speaker_name or track_id.")
+
+    @staticmethod
+    def _sanitize_for_path(label: str) -> str:
+        invalid = '<>:"/\\|?*'
+        sanitized = "".join("_" if ch in invalid else ch for ch in label)
+        sanitized = sanitized.strip()
+        return sanitized or "speaker"
+
+    def _get_or_create_track(
+        self,
+        track_key: str,
+        track_id: Optional[int],
+        speaker_name: Optional[str],
+    ) -> TrackAggState:
         """
-        MIRRORED FROM orchestrator_sample.py:
-        Create CoreAggregator with exact same parameters.
+        Create or retrieve a CoreAggregator bound to a logical speaker key.
         """
-        if track_id not in self._tracks:
-            # MIRRORED: same construction as sample
+        state = self._tracks.get(track_key)
+        if state is None:
             agg = CoreAggregator(
                 commit_tail_sec=self.config.commit_tail_sec,
                 epsilon=self.config.epsilon,
@@ -160,7 +190,6 @@ class FastAggregator:
                 cov_min_overlap_sec=self.config.cov_min_overlap_sec,
                 cov_min_cover_ratio=self.config.cov_min_cover_ratio,
             )
-            # MIRRORED: assign additional fields (sample does this)
             agg.fuse_back = float(self.config.fuse_back)
             agg.dedup_near_gap = float(self.config.dedup_near_gap)
             agg.dedup_overlap_ratio = float(self.config.dedup_overlap_ratio)
@@ -168,26 +197,62 @@ class FastAggregator:
             agg.dedup_bigram_gap = float(self.config.dedup_bigram_gap)
             agg.front_grace_sec = float(self.config.front_grace_sec)
 
-            self._tracks[track_id] = TrackAggState(aggregator=agg)
-            logger.debug("[FastAggregator] Created track %d", track_id)
+            state = TrackAggState(
+                aggregator=agg,
+                speaker_name=speaker_name,
+                legacy_track_id=track_id,
+                key=track_key,
+                created_order=self._creation_counter,
+            )
+            self._creation_counter += 1
+            self._tracks[track_key] = state
+            logger.debug(
+                "[FastAggregator] Created track key=%s speaker=%s legacy=%s",
+                track_key,
+                speaker_name,
+                track_id,
+            )
 
-            # MIRRORED: enforce track_limit (same logic as sample)
-            if len(self._tracks) > self.config.track_limit:
-                oldest = min(self._tracks.keys())
-                self._tracks.pop(oldest, None)
-                logger.warning("[FastAggregator] Track limit exceeded; dropped track %d", oldest)
+            if self.config.track_limit > 0 and len(self._tracks) > self.config.track_limit:
+                victims = [
+                    (k, st)
+                    for k, st in self._tracks.items()
+                    if k != track_key
+                ]
+                if victims:
+                    victim_key, victim_state = min(
+                        victims,
+                        key=lambda kv: kv[1].created_order,
+                    )
+                    self._tracks.pop(victim_key, None)
+                    logger.warning(
+                        "[FastAggregator] Track limit exceeded; dropped track %s",
+                        victim_state.display_label(),
+                    )
+                else:
+                    logger.warning(
+                        "[FastAggregator] Track limit %d reached; retaining current track %s",
+                        self.config.track_limit,
+                        state.display_label(),
+                    )
+        else:
+            if speaker_name and not state.speaker_name:
+                state.speaker_name = speaker_name
+            if track_id is not None and state.legacy_track_id is None:
+                state.legacy_track_id = track_id
 
-        return self._tracks[track_id]
+        return state
 
     def append_window_tokens(
         self,
-        track_id: int,
+        track_id: Optional[int],
         tokens: List[dict],
         t_start: float,
         t_end: float,
         is_last_window: bool = False,
         window_index: int = 0,
         rtf: float = 0.0,
+        speaker_name: Optional[str] = None,
     ) -> None:
         """
         MIRRORED FROM orchestrator_sample.py:
@@ -195,8 +260,12 @@ class FastAggregator:
         - Same is_last_window handling
         - Same append_fast() call signature
         """
+        if track_id is None and speaker_name is None:
+            raise ValueError("FastAggregator.append_window_tokens requires speaker_name or track_id.")
+
+        track_key = self._make_track_key(track_id, speaker_name)
         with self._lock:
-            state = self._get_or_create_track(track_id)
+            state = self._get_or_create_track(track_key, track_id, speaker_name)
             agg = state.aggregator
 
             # Convert dict tokens to Tok objects
@@ -245,6 +314,14 @@ class FastAggregator:
 
             mid_toks = [t for t in toks if keep_token(t)]
 
+            if speaker_name and not is_first_window and mid_toks:
+                logger.debug(
+                    "Merged utterances for %s from %.2f-%.2f",
+                    speaker_name,
+                    t_start,
+                    t_end,
+                )
+
             # MIRRORED: protect head of tail (sample logic)
             if agg.state.tail and self.config.protect_head_sec > 0:
                 tail_head = agg.state.tail[0].start
@@ -271,8 +348,8 @@ class FastAggregator:
             # MIRRORED: append_fast call (same as sample)
             report = agg.append_fast(mid_toks)
             logger.debug(
-                "[FastAggregator] track=%d win=%d kept=%d dropped=%d commit=%d tail_dur=%.2fs",
-                track_id,
+                "[FastAggregator] track=%s win=%d kept=%d dropped=%d commit=%d tail_dur=%.2fs",
+                state.display_label(),
                 window_index,
                 report.kept_new,
                 report.dropped_by_floor,
@@ -286,11 +363,11 @@ class FastAggregator:
         - Same finalize() call on all aggregators
         """
         with self._lock:
-            for tid, state in self._tracks.items():
+            for state in self._tracks.values():
                 state.aggregator.finalize()
                 logger.debug(
-                    "[FastAggregator] Finalized track %d (%d committed)",
-                    tid,
+                    "[FastAggregator] Finalized track %s (%d committed)",
+                    state.display_label(),
                     len(state.aggregator.state.committed),
                 )
 
@@ -324,20 +401,29 @@ class FastAggregator:
                 logger.warning("[FastAggregator] No tracks to export")
                 return
 
-            for tid in sorted(self._tracks.keys()):
-                state = self._tracks[tid]
+            used_stems: Dict[str, int] = {}
+            for _, state in sorted(
+                self._tracks.items(),
+                key=lambda kv: kv[1].display_label(),
+            ):
                 agg = state.aggregator
                 committed = agg.state.committed
 
                 if not committed:
                     continue
 
-                track_stem = f"{stem}_S{tid}"
+                display_label = state.display_label()
+                base_suffix = f"{stem}_{self._sanitize_for_path(display_label)}"
+                count = used_stems.get(base_suffix, 0)
+                track_stem = f"{base_suffix}_{count + 1}" if count else base_suffix
+                used_stems[base_suffix] = count + 1
 
                 # MIRRORED: TXT export (committed-only)
                 if write_txt:
                     txt_path = base_dir / f"{track_stem}.txt"
                     full_text = tokens_to_text(committed)
+                    if display_label:
+                        full_text = f"{display_label}: {full_text}"
                     txt_path.write_text(full_text, encoding="utf-8")
                     logger.info("[FastAggregator] Exported TXT: %s", txt_path)
 
@@ -349,6 +435,7 @@ class FastAggregator:
                         committed,
                         max_len=self.config.srt_max_line,
                         gap_break=self.config.srt_gap_break,
+                        speaker_label=display_label,
                     )
                     logger.info("[FastAggregator] Exported SRT: %s", srt_path)
 
@@ -358,6 +445,7 @@ class FastAggregator:
         toks: List[Tok],
         max_len: int,
         gap_break: float,
+        speaker_label: Optional[str] = None,
     ) -> None:
         """
         MIRRORED FROM orchestrator_sample.py (or Fast_Test.py):
@@ -399,6 +487,8 @@ class FastAggregator:
             if line:
                 wrapped.append(line)
             body = "\n".join(wrapped) if wrapped else text
+            if speaker_label:
+                body = f"{speaker_label}: {body}"
 
             lines.append(f"{idx}\n{start_ts} --> {end_ts}\n{body}\n")
 
@@ -413,11 +503,14 @@ class FastAggregator:
         path_obj.parent.mkdir(parents=True, exist_ok=True)
         with self._lock:
             lines = []
-            for tid in sorted(self._tracks.keys()):
-                state = self._tracks[tid]
+            for _, state in sorted(
+                self._tracks.items(),
+                key=lambda kv: kv[1].display_label(),
+            ):
                 agg = state.aggregator
                 full_text = tokens_to_text(agg.state.committed)
                 if full_text.strip():
-                    lines.append(f"[S{tid}] {full_text}")
+                    label = state.display_label()
+                    lines.append(f"[{label}] {full_text}")
             path_obj.write_text("\n".join(lines), encoding="utf-8")
             logger.info("[FastAggregator] Exported merged TXT: %s", path_obj)
