@@ -28,8 +28,8 @@ ASR_STREAM_POLICY = "SMALL_LOOKAHEAD"
 
 
 # 預設模型配置 (經過測試的穩定版本)
-DEFAULT_WHISPER_MODEL = "medium"
-DEFAULT_WHISPER_BEAM_SIZE = 5
+DEFAULT_WHISPER_MODEL = "large-v3"
+DEFAULT_WHISPER_BEAM_SIZE = 3
 DEFAULT_SEPARATION_MODEL = "sepformer_2speaker"
 
 # 模型名稱常數 (固定的 HuggingFace 模型ID)
