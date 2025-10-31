@@ -819,6 +819,11 @@ class AudioSeparator:
         流程：語者計數 → 動態模型選擇 → 分離 → 儲存
         """
         try:
+            audio_tensor = self.denoiser.denoise(
+                audio=audio_tensor,
+                sample_rate=TARGET_RATE
+            ) if self.enable_post_denoiser else audio_tensor
+
             # 1) 語者數量偵測（維持原邏輯）
             detected_speakers = self.spk_counter.count_with_refine(
                 audio=audio_tensor,
@@ -937,14 +942,14 @@ class AudioSeparator:
                     try:
                         speaker_audio = est_ST[i].contiguous()  # 1D [T]
                         
-                        if self.enable_post_denoiser and self.denoiser is not None:
-                            # 使用自適應降噪器進行降噪
-                            denoised_audio = self.denoiser.denoise(
-                                audio=speaker_audio,  # 1D 張量
-                                sample_rate=TARGET_RATE
-                            )
-                        else:
-                            denoised_audio = speaker_audio
+                        # if self.enable_post_denoiser and self.denoiser is not None:
+                        #     # 使用自適應降噪器進行降噪
+                        #     denoised_audio = self.denoiser.denoise(
+                        #         audio=speaker_audio,  # 1D 張量
+                        #         sample_rate=TARGET_RATE
+                        #     )
+                        # else:
+                        denoised_audio = speaker_audio
 
                         final_tensor = denoised_audio.unsqueeze(0).cpu()  # [1, T]
 

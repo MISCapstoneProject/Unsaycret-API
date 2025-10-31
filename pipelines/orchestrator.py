@@ -101,7 +101,7 @@ def process_segment(seg_path: str, t0: float, t1: float, absolute_timestamp: flo
     seg_root_dir = seg_dir.parent if seg_dir is not None else None
 
     #是否跨窗0.6秒上下文
-    USE_CONTEXT_ASR = False  # True = current behavior; False = legacy no-context
+    USE_CONTEXT_ASR = True  # True = current behavior; False = legacy no-context
 
     seg_idx = None
     if seg_dir is not None:
