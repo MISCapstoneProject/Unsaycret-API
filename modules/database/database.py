@@ -3,9 +3,15 @@
 語者與聲紋資料庫接口 (Speaker and Voiceprint Database Interface) V2
 ===============================================================================
 
-版本：v2.1.0
+版本：v2.0.1
 作者：CYouuu  
-最後更新：2025-10-28
+最後更新：2025-07-28
+
+⚠️ 重要變更 ⚠️
+本版本已升級為V2資料庫結構，與V1版本不相容！
+- Speaker: 新增speaker_id (INT)、full_name、nickname、gender、meet_count、meet_days
+- VoicePrint V2: sample_count (預留欄位，可為空值)、quality_score (可為None)
+- 時間欄位重命名: create_time -> created_at, updated_time -> updated_at
 
 主要功能接口：
 -----------
@@ -1582,16 +1588,35 @@ class DatabaseService:
             results = (
                 self.client.collections.get(self.SESSION_CLASS)
                 .query.fetch_objects(
-                    return_references=QueryReference(link_on="participants", return_properties=["uuid"])
+                    return_references=QueryReference(
+                        link_on="participants",
+                        return_properties=["full_name", "nickname"]
+                    )
                 )
             )
             
             sessions = []
             for obj in results.objects:
-                # 處理參與者引用
-                participants = []
+                # 處理參與者引用 - 同時取得 UUID 和名稱
+                participants = []  # UUID 列表 (向後兼容)
+                participants_details = []  # 完整資訊
+                
                 if obj.references and obj.references.get("participants"):
-                    participants = [str(ref_obj.uuid) for ref_obj in obj.references["participants"].objects]
+                    for ref_obj in obj.references["participants"].objects:
+                        speaker_uuid = str(ref_obj.uuid)
+                        participants.append(speaker_uuid)
+                        
+                        # 提取語者名稱和暱稱
+                        full_name = ref_obj.properties.get("full_name")
+                        nickname = ref_obj.properties.get("nickname")
+                        
+                        participants_details.append({
+                            "uuid": speaker_uuid,
+                            "full_name": full_name,
+                            "nickname": nickname
+                        })
+                        
+                        logger.debug(f"✅ Session 參與者: uuid={speaker_uuid[:8]}, name={full_name}, nickname={nickname}")
                 
                 # 處理時間欄位
                 start_time = obj.properties.get("start_time")
@@ -1610,7 +1635,8 @@ class DatabaseService:
                     "start_time": start_time,
                     "end_time": end_time,
                     "summary": obj.properties.get("summary"),
-                    "participants": participants
+                    "participants": participants,
+                    "participants_details": participants_details
                 })
             
             # 按 session_id 排序
@@ -1639,7 +1665,10 @@ class DatabaseService:
                     self.client.collections.get(self.SESSION_CLASS)
                     .query.fetch_object_by_id(
                         uuid=session_id,
-                        return_references=QueryReference(link_on="participants", return_properties=["uuid"])
+                        return_references=QueryReference(
+                            link_on="participants",
+                            return_properties=["full_name", "nickname"]
+                        )
                     )
                 )
             else:
@@ -1649,7 +1678,10 @@ class DatabaseService:
                     .query.fetch_objects(
                         filters=Filter.by_property("session_id").equal(session_id),
                         limit=1,
-                        return_references=QueryReference(link_on="participants", return_properties=["uuid"])
+                        return_references=QueryReference(
+                            link_on="participants",
+                            return_properties=["full_name", "nickname"]
+                        )
                     )
                 )
                 obj = results.objects[0] if results.objects else None
@@ -1657,10 +1689,26 @@ class DatabaseService:
             if not obj:
                 return {}
             
-            # 處理參與者引用
-            participants = []
+            # 處理參與者引用 - 同時取得 UUID 和名稱
+            participants = []  # UUID 列表 (向後兼容)
+            participants_details = []  # 完整資訊
+            
             if obj.references and obj.references.get("participants"):
-                participants = [str(ref_obj.uuid) for ref_obj in obj.references["participants"].objects]
+                for ref_obj in obj.references["participants"].objects:
+                    speaker_uuid = str(ref_obj.uuid)
+                    participants.append(speaker_uuid)
+                    
+                    # 提取語者名稱和暱稱
+                    full_name = ref_obj.properties.get("full_name")
+                    nickname = ref_obj.properties.get("nickname")
+                    
+                    participants_details.append({
+                        "uuid": speaker_uuid,
+                        "full_name": full_name,
+                        "nickname": nickname
+                    })
+                    
+                    logger.debug(f"✅ Session 參與者: uuid={speaker_uuid[:8]}, name={full_name}, nickname={nickname}")
             
             # 處理時間欄位
             start_time = obj.properties.get("start_time")
@@ -1679,7 +1727,8 @@ class DatabaseService:
                 "start_time": start_time,
                 "end_time": end_time,
                 "summary": obj.properties.get("summary"),
-                "participants": participants
+                "participants": participants,
+                "participants_details": participants_details
             }
             
         except Exception as e:
@@ -1900,7 +1949,8 @@ class DatabaseService:
                 "timestamp": timestamp_to_use,
                 "confidence": getattr(request, 'confidence', None),
                 "duration": getattr(request, 'duration', None),
-                "language": getattr(request, 'language', None) or ""
+                "language": getattr(request, 'language', None) or "",
+                "audio_path": getattr(request, 'audio_path', None) or ""  # 新增音檔路徑
             }
             
             # 準備引用
@@ -1908,24 +1958,10 @@ class DatabaseService:
             
             # 處理語者引用
             speaker_uuid = getattr(request, 'speaker', None)
-            if speaker_uuid:
-                # 🚨 【Bug #2 修復】驗證 UUID 格式
-                if not valid_uuid(speaker_uuid):
-                    error_msg = f"語者 UUID 格式無效: {speaker_uuid}"
-                    logger.error(error_msg)
-                    raise ValueError(error_msg)
-                
-                # 🚨 【Bug #2 修復】驗證語者是否存在於資料庫
-                speaker_obj = self.get_speaker(speaker_uuid)
-                if not speaker_obj:
-                    error_msg = f"語者不存在（UUID: {speaker_uuid}），無法建立 SpeechLog"
-                    logger.error(error_msg)
-                    logger.error("可能原因: 1) 語者已被刪除 2) 語者尚未建立 3) 時序競態條件")
-                    raise ValueError(error_msg)
-                
-                # ✅ 語者驗證通過，建立引用
+            if speaker_uuid and valid_uuid(speaker_uuid) and self.get_speaker(speaker_uuid):
                 references["speaker"] = [speaker_uuid]
-                logger.debug(f"✅ 語者引用已建立: {speaker_uuid}")
+            elif speaker_uuid:
+                logger.warning(f"(e2) 語者 UUID {speaker_uuid} 無效或不存在，已跳過")
             
             # 處理 Session 引用
             session_uuid = getattr(request, 'session', None)
@@ -1941,51 +1977,13 @@ class DatabaseService:
             
             # 建立 SpeechLog
             speechlog_collection = self.client.collections.get(self.SPEECHLOG_CLASS)
+            speechlog_collection.data.insert(
+                properties=properties,
+                uuid=speechlog_uuid,
+                references=references
+            )
             
-            # 🔧 【修復】檢查 Weaviate 返回值，確保真正寫入成功
-            try:
-                insert_result = speechlog_collection.data.insert(
-                    properties=properties,
-                    uuid=speechlog_uuid,
-                    references=references
-                )
-                
-                # 驗證寫入結果
-                logger.info(f"✅ Weaviate 插入返回: {insert_result}")
-                
-                # 🔍 【驗證】立即回查確認寫入成功（重試機制）
-                import time
-                max_retries = 5  # 🔧 增加到 5 次重試
-                retry_delay = 0.2  # 🔧 延遲增加到 200ms
-                verify_obj = None
-                
-                for attempt in range(max_retries):
-                    verify_obj = speechlog_collection.query.fetch_object_by_id(uuid=speechlog_uuid)
-                    if verify_obj:
-                        logger.info(f"✅ 回查驗證成功 (嘗試 {attempt + 1}/{max_retries}): {verify_obj.properties.get('content', '')[:30]}...")
-                        break
-                    else:
-                        if attempt < max_retries - 1:
-                            logger.warning(f"⚠️  回查失敗 (嘗試 {attempt + 1}/{max_retries})，{retry_delay}秒後重試...")
-                            time.sleep(retry_delay)
-                        else:
-                            error_msg = f"❌ SpeechLog {speechlog_uuid} 寫入後回查失敗（重試 {max_retries} 次）！"
-                            logger.error(error_msg)
-                            logger.error(f"   內容: {properties.get('content', '')[:50]}")
-                            logger.error(f"   語者: {speaker_uuid}")
-                            logger.error(f"   Session: {session_uuid}")
-                            logger.error(f"   Weaviate 可能存在最終一致性延遲問題")
-                            raise RuntimeError(error_msg)
-                
-                logger.info(f"已建立新 SpeechLog (UUID: {speechlog_uuid})")
-                
-            except Exception as insert_error:
-                logger.error(f"❌ Weaviate 插入操作失敗: {insert_error}")
-                logger.error(f"   UUID: {speechlog_uuid}")
-                logger.error(f"   屬性: {properties}")
-                logger.error(f"   引用: {references}")
-                raise
-            
+            logger.info(f"已建立新 SpeechLog (UUID: {speechlog_uuid})")
             return {
                 "success": True,
                 "message": "成功建立 SpeechLog",
@@ -1993,30 +1991,23 @@ class DatabaseService:
             }
             
         except Exception as e:
-            # 🚨 不要吞掉異常！重新拋出讓上層處理
-            logger.error(f"❌ 建立 SpeechLog 發生嚴重錯誤: {e}")
-            logger.error(f"   異常類型: {type(e).__name__}")
-            logger.error(f"   內容: {getattr(request, 'content', '')[:50]}...")
-            logger.error(f"   語者: {getattr(request, 'speaker', 'N/A')}")
-            logger.error(f"   Session: {getattr(request, 'session', 'N/A')}")
-            raise  # 🔥 重新拋出異常，讓 API 層知道失敗了
+            logger.error(f"建立 SpeechLog 時發生錯誤: {e}")
+            return {"success": False, "message": str(e), "data": None}
     
     def list_speechlogs(self) -> list:
         """
-        列出所有 SpeechLog (包含語者資訊)
+        列出所有 SpeechLog
         Returns:
-            list: SpeechLogInfo 列表 (包含 speaker_name, speaker_nickname)
+            list: SpeechLogInfo 列表
         """
         try:
             results = (
                 self.client.collections.get(self.SPEECHLOG_CLASS)
                 .query.fetch_objects(
                     return_references=[
-                        # ✅ JOIN Speaker: 一次性取得 full_name 和 nickname
-                        QueryReference(link_on="speaker", return_properties=["uuid", "full_name", "nickname"]),
-                        QueryReference(link_on="session", return_properties=["uuid"])
-                    ],
-                    limit=10000  # 🔧 明確設置 limit，避免默認限制（Weaviate 默認可能只返回 100 條）
+                        QueryReference(link_on="speaker", return_properties=["full_name", "nickname"]),
+                        QueryReference(link_on="session")
+                    ]
                 )
             )
             
@@ -2029,12 +2020,13 @@ class DatabaseService:
                 session_uuid = None
                 
                 if obj.references:
-                    # ✅ 從引用中取得 Speaker 的名字和暱稱
                     if obj.references.get("speaker") and obj.references["speaker"].objects:
-                        speaker_obj = obj.references["speaker"].objects[0]
-                        speaker_uuid = str(speaker_obj.uuid)
-                        speaker_name = speaker_obj.properties.get("full_name")
-                        speaker_nickname = speaker_obj.properties.get("nickname")
+                        speaker_ref = obj.references["speaker"].objects[0]
+                        speaker_uuid = str(speaker_ref.uuid)
+                        # 從 reference 中直接取得 speaker 的 properties
+                        if hasattr(speaker_ref, 'properties') and speaker_ref.properties:
+                            speaker_name = speaker_ref.properties.get("full_name")
+                            speaker_nickname = speaker_ref.properties.get("nickname")
                     if obj.references.get("session") and obj.references["session"].objects:
                         session_uuid = str(obj.references["session"].objects[0].uuid)
                 
@@ -2051,10 +2043,10 @@ class DatabaseService:
                     "duration": obj.properties.get("duration"),
                     "language": obj.properties.get("language"),
                     "speaker": speaker_uuid,
-                    # ✅ 新增欄位: 直接回傳 Speaker 的名字和暱稱
+                    "session": session_uuid,
                     "speaker_name": speaker_name,
                     "speaker_nickname": speaker_nickname,
-                    "session": session_uuid
+                    "audio_path": obj.properties.get("audio_path")
                 })
             
             # 按時間排序（最新在前）
@@ -2260,16 +2252,17 @@ class DatabaseService:
 
     def get_speechlogs_by_speaker(self, speaker_id: str) -> list:
         """
-        透過 Speaker 取得相關的 SpeechLog 列表 (包含語者資訊)
+        透過 Speaker 取得相關的 SpeechLog 列表
         
         Args:
             speaker_id: 語者 UUID
             
         Returns:
-            list: SpeechLogInfo 列表 (包含 speaker_name, speaker_nickname)
+            list: SpeechLogInfo 列表
         """
         try:
-            # 使用優化後的 list_speechlogs (已包含 Speaker JOIN)
+            # 暫時使用獲取所有 SpeechLog 然後篩選的方法
+            # 因為 by_ref 查詢語法在當前 Weaviate 版本中可能有問題
             all_speechlogs = self.list_speechlogs()
             
             # 篩選出屬於指定 Speaker 的 SpeechLog
@@ -2284,75 +2277,27 @@ class DatabaseService:
 
     def get_speechlogs_by_session(self, session_id: str) -> list:
         """
-        透過 Session 取得相關的 SpeechLog 列表 (包含語者資訊)
+        透過 Session 取得相關的 SpeechLog 列表
         
         Args:
             session_id: Session UUID
             
         Returns:
-            list: SpeechLogInfo 列表 (包含 speaker_name, speaker_nickname)
+            list: SpeechLogInfo 列表
         """
         try:
-            from weaviate.classes.query import Filter, QueryReference
+            # 暫時使用獲取所有 SpeechLog 然後篩選的方法
+            # 因為 by_ref 查詢語法在當前 Weaviate 版本中可能有問題
+            all_speechlogs = self.list_speechlogs()
             
-            # 🔧 【修復】直接用 Weaviate 條件查詢，避免先取所有再過濾
-            results = (
-                self.client.collections.get(self.SPEECHLOG_CLASS)
-                .query.fetch_objects(
-                    filters=Filter.by_ref("session").by_id().equal(session_id),
-                    return_references=[
-                        QueryReference(link_on="speaker", return_properties=["uuid", "full_name", "nickname"]),
-                        QueryReference(link_on="session", return_properties=["uuid"])
-                    ],
-                    limit=1000  # 🔧 明確設置 limit，避免默認限制
-                )
-            )
+            # 篩選出屬於指定 Session 的 SpeechLog
+            result = [sl for sl in all_speechlogs if sl.get("session") == session_id]
             
-            speechlogs = []
-            for obj in results.objects:
-                # 處理引用
-                speaker_uuid = None
-                speaker_name = None
-                speaker_nickname = None
-                session_uuid = None
-                
-                if obj.references:
-                    if obj.references.get("speaker") and obj.references["speaker"].objects:
-                        speaker_obj = obj.references["speaker"].objects[0]
-                        speaker_uuid = str(speaker_obj.uuid)
-                        speaker_name = speaker_obj.properties.get("full_name")
-                        speaker_nickname = speaker_obj.properties.get("nickname")
-                    if obj.references.get("session") and obj.references["session"].objects:
-                        session_uuid = str(obj.references["session"].objects[0].uuid)
-                
-                # 處理時間欄位
-                timestamp = obj.properties.get("timestamp")
-                if hasattr(timestamp, 'isoformat'):
-                    timestamp = timestamp.isoformat()
-                
-                speechlogs.append({
-                    "uuid": str(obj.uuid),
-                    "content": obj.properties.get("content"),
-                    "timestamp": timestamp,
-                    "confidence": obj.properties.get("confidence"),
-                    "duration": obj.properties.get("duration"),
-                    "language": obj.properties.get("language"),
-                    "speaker": speaker_uuid,
-                    "speaker_name": speaker_name,
-                    "speaker_nickname": speaker_nickname,
-                    "session": session_uuid
-                })
-            
-            # 按時間排序（最新在前）
-            speechlogs.sort(key=lambda s: s["timestamp"] or "", reverse=True)
-            
-            logger.info(f"找到 {len(speechlogs)} 個 SpeechLog 屬於 Session {session_id}")
-            return speechlogs
+            logger.info(f"找到 {len(result)} 個 SpeechLog 屬於 Session {session_id}")
+            return result
             
         except Exception as e:
             logger.error(f"查詢 Session 的 SpeechLog 時發生錯誤: {e}")
-            logger.error(f"   Session UUID: {session_id}")
-            logger.error(f"   異常類型: {type(e).__name__}")
             return []
 
 # 單元測試代碼
