@@ -250,6 +250,7 @@ class WeaviateV2CollectionManager:
                     wc.Property(name="confidence", data_type=wc.DataType.NUMBER),
                     wc.Property(name="duration", data_type=wc.DataType.NUMBER),
                     wc.Property(name="language", data_type=wc.DataType.TEXT),
+                    wc.Property(name="audio_path", data_type=wc.DataType.TEXT),  # 分離後的語者音檔路徑
                 ],
                 references=[
                     wc.ReferenceProperty(

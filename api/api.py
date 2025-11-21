@@ -10,9 +10,10 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from typing import Optional, List
 from fastapi import WebSocket, WebSocketDisconnect
-from fastapi.responses import StreamingResponse
+from fastapi.responses import StreamingResponse, FileResponse
 import asyncio, threading, queue, json
 from datetime import datetime
+import aiofiles
 from pipelines.orchestrator import (
     run_pipeline_FILE,
     run_pipeline_STREAM,
@@ -176,6 +177,12 @@ class SessionUpdateRequest(BaseModel):
     summary: Optional[str] = None
     participants: Optional[List[str]] = None
 
+class ParticipantDetail(BaseModel):
+    """參與者詳細資訊"""
+    uuid: str
+    full_name: Optional[str] = None
+    nickname: Optional[str] = None
+
 class SessionInfo(BaseModel):
     uuid: str
     session_id: str
@@ -184,7 +191,8 @@ class SessionInfo(BaseModel):
     start_time: Optional[str] = None
     end_time: Optional[str] = None
     summary: Optional[str] = None
-    participants: Optional[List[str]] = []
+    participants: Optional[List[str]] = []  # UUID 列表 (向後兼容)
+    participants_details: Optional[List[ParticipantDetail]] = []  # 完整資訊
 
 @app.post("/sessions", response_model=ApiResponse)
 async def create_session(request: SessionCreateRequest) -> ApiResponse:
@@ -262,6 +270,7 @@ class SpeechLogCreateRequest(BaseModel):
     language: Optional[str] = None
     speaker: Optional[str] = None  # 語者 UUID
     session: Optional[str] = None  # Session UUID
+    audio_path: Optional[str] = None  # 分離後的語者音檔路徑
 
 class SpeechLogUpdateRequest(BaseModel):
     content: Optional[str] = None
@@ -281,6 +290,9 @@ class SpeechLogInfo(BaseModel):
     language: Optional[str] = None
     speaker: Optional[str] = None
     session: Optional[str] = None
+    speaker_name: Optional[str] = None
+    speaker_nickname: Optional[str] = None
+    audio_path: Optional[str] = None
 
 @app.post("/speechlogs", response_model=ApiResponse)
 async def create_speechlog(request: SpeechLogCreateRequest) -> ApiResponse:
@@ -334,6 +346,59 @@ async def delete_speechlog(speechlog_id: str) -> ApiResponse:
         raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"刪除SpeechLog時發生內部錯誤: {str(e)}")
+
+@app.get("/audio/{file_path:path}")
+async def get_audio_file(file_path: str):
+    """
+    提供音檔檔案服務（異步串流，不阻塞其他請求）
+    
+    Args:
+        file_path: 音檔的相對路徑 (例如: stream_output/20250121_123456/segment_001/speaker1.wav)
+    
+    Returns:
+        StreamingResponse: 音檔檔案串流
+    """
+    try:
+        # 安全性檢查：防止路徑穿越攻擊
+        if ".." in file_path or file_path.startswith("/"):
+            raise HTTPException(status_code=400, detail="無效的檔案路徑")
+        
+        # 檢查檔案是否存在
+        if not os.path.exists(file_path):
+            raise HTTPException(status_code=404, detail="音檔不存在")
+        
+        # 檢查是否為音檔格式
+        if not file_path.lower().endswith(('.wav', '.mp3', '.flac', '.m4a')):
+            raise HTTPException(status_code=400, detail="不支援的音檔格式")
+        
+        # 取得檔案大小（用於 Content-Length 和瀏覽器快取）
+        file_size = os.path.getsize(file_path)
+        
+        # 異步檔案串流生成器（分塊讀取，完全不阻塞其他請求）
+        async def audio_stream():
+            """異步分塊讀取音檔，每次 256KB（提升傳輸速度）"""
+            chunk_size = 256 * 1024  # 256KB per chunk (更大的塊 = 更快)
+            async with aiofiles.open(file_path, "rb") as audio_file:
+                while chunk := await audio_file.read(chunk_size):
+                    yield chunk
+        
+        # 返回串流響應（不會阻塞其他請求）
+        return StreamingResponse(
+            audio_stream(),
+            media_type="audio/wav",
+            headers={
+                "Content-Length": str(file_size),  # 🚀 加速關鍵：告訴瀏覽器檔案大小
+                "Content-Disposition": f'inline; filename="{os.path.basename(file_path)}"',
+                "Accept-Ranges": "bytes",  # 支援 HTML5 Audio seek
+                "Cache-Control": "public, max-age=3600",  # 🚀 快取 1 小時，避免重複下載
+                "ETag": f'"{file_path}-{file_size}"'  # 🚀 ETag 支援瀏覽器快取驗證
+            }
+        )
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"提供音檔時發生錯誤: {e}")
+        raise HTTPException(status_code=500, detail=f"提供音檔時發生內部錯誤: {str(e)}")
 
 # ----------------------------------------------------------------------------
 # Core Processing APIs - 核心處理功能
@@ -534,6 +599,7 @@ async def ws_stream(ws: WebSocket):
                             duration=duration,
                             speaker=speaker_id,
                             session=session_uuid,
+                            audio_path=sp.get("path"),  # 提取音檔路徑
                         )
                         
                         # 💾 嘗試儲存到資料庫
@@ -600,6 +666,7 @@ async def ws_stream(ws: WebSocket):
                             "absoluteStartTime": speaker.get("absolute_start_time", None),  # 📅 絕對開始時間
                             "absoluteEndTime": speaker.get("absolute_end_time", None),      # 📅 絕對結束時間
                             "isFinal": True,                                      # ✅ 串流模式都是最終版本
+                            "audioPath": speaker.get("path", None),              # 🔊 分離後的語者音檔路徑
                             "segment": {                                          # � 片段資訊
                                 "totalSpeakers": total_speakers,                 # 👥 此片段總語者數
                                 "speakerIndex": speaker_idx,                     # 📍 當前語者在片段中的索引

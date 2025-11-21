@@ -1588,16 +1588,35 @@ class DatabaseService:
             results = (
                 self.client.collections.get(self.SESSION_CLASS)
                 .query.fetch_objects(
-                    return_references=QueryReference(link_on="participants", return_properties=["uuid"])
+                    return_references=QueryReference(
+                        link_on="participants",
+                        return_properties=["full_name", "nickname"]
+                    )
                 )
             )
             
             sessions = []
             for obj in results.objects:
-                # 處理參與者引用
-                participants = []
+                # 處理參與者引用 - 同時取得 UUID 和名稱
+                participants = []  # UUID 列表 (向後兼容)
+                participants_details = []  # 完整資訊
+                
                 if obj.references and obj.references.get("participants"):
-                    participants = [str(ref_obj.uuid) for ref_obj in obj.references["participants"].objects]
+                    for ref_obj in obj.references["participants"].objects:
+                        speaker_uuid = str(ref_obj.uuid)
+                        participants.append(speaker_uuid)
+                        
+                        # 提取語者名稱和暱稱
+                        full_name = ref_obj.properties.get("full_name")
+                        nickname = ref_obj.properties.get("nickname")
+                        
+                        participants_details.append({
+                            "uuid": speaker_uuid,
+                            "full_name": full_name,
+                            "nickname": nickname
+                        })
+                        
+                        logger.debug(f"✅ Session 參與者: uuid={speaker_uuid[:8]}, name={full_name}, nickname={nickname}")
                 
                 # 處理時間欄位
                 start_time = obj.properties.get("start_time")
@@ -1616,7 +1635,8 @@ class DatabaseService:
                     "start_time": start_time,
                     "end_time": end_time,
                     "summary": obj.properties.get("summary"),
-                    "participants": participants
+                    "participants": participants,
+                    "participants_details": participants_details
                 })
             
             # 按 session_id 排序
@@ -1645,7 +1665,10 @@ class DatabaseService:
                     self.client.collections.get(self.SESSION_CLASS)
                     .query.fetch_object_by_id(
                         uuid=session_id,
-                        return_references=QueryReference(link_on="participants", return_properties=["uuid"])
+                        return_references=QueryReference(
+                            link_on="participants",
+                            return_properties=["full_name", "nickname"]
+                        )
                     )
                 )
             else:
@@ -1655,7 +1678,10 @@ class DatabaseService:
                     .query.fetch_objects(
                         filters=Filter.by_property("session_id").equal(session_id),
                         limit=1,
-                        return_references=QueryReference(link_on="participants", return_properties=["uuid"])
+                        return_references=QueryReference(
+                            link_on="participants",
+                            return_properties=["full_name", "nickname"]
+                        )
                     )
                 )
                 obj = results.objects[0] if results.objects else None
@@ -1663,10 +1689,26 @@ class DatabaseService:
             if not obj:
                 return {}
             
-            # 處理參與者引用
-            participants = []
+            # 處理參與者引用 - 同時取得 UUID 和名稱
+            participants = []  # UUID 列表 (向後兼容)
+            participants_details = []  # 完整資訊
+            
             if obj.references and obj.references.get("participants"):
-                participants = [str(ref_obj.uuid) for ref_obj in obj.references["participants"].objects]
+                for ref_obj in obj.references["participants"].objects:
+                    speaker_uuid = str(ref_obj.uuid)
+                    participants.append(speaker_uuid)
+                    
+                    # 提取語者名稱和暱稱
+                    full_name = ref_obj.properties.get("full_name")
+                    nickname = ref_obj.properties.get("nickname")
+                    
+                    participants_details.append({
+                        "uuid": speaker_uuid,
+                        "full_name": full_name,
+                        "nickname": nickname
+                    })
+                    
+                    logger.debug(f"✅ Session 參與者: uuid={speaker_uuid[:8]}, name={full_name}, nickname={nickname}")
             
             # 處理時間欄位
             start_time = obj.properties.get("start_time")
@@ -1685,7 +1727,8 @@ class DatabaseService:
                 "start_time": start_time,
                 "end_time": end_time,
                 "summary": obj.properties.get("summary"),
-                "participants": participants
+                "participants": participants,
+                "participants_details": participants_details
             }
             
         except Exception as e:
@@ -1906,7 +1949,8 @@ class DatabaseService:
                 "timestamp": timestamp_to_use,
                 "confidence": getattr(request, 'confidence', None),
                 "duration": getattr(request, 'duration', None),
-                "language": getattr(request, 'language', None) or ""
+                "language": getattr(request, 'language', None) or "",
+                "audio_path": getattr(request, 'audio_path', None) or ""  # 新增音檔路徑
             }
             
             # 準備引用
@@ -1961,8 +2005,8 @@ class DatabaseService:
                 self.client.collections.get(self.SPEECHLOG_CLASS)
                 .query.fetch_objects(
                     return_references=[
-                        QueryReference(link_on="speaker", return_properties=["uuid"]),
-                        QueryReference(link_on="session", return_properties=["uuid"])
+                        QueryReference(link_on="speaker", return_properties=["full_name", "nickname"]),
+                        QueryReference(link_on="session")
                     ]
                 )
             )
@@ -1971,11 +2015,18 @@ class DatabaseService:
             for obj in results.objects:
                 # 處理引用
                 speaker_uuid = None
+                speaker_name = None
+                speaker_nickname = None
                 session_uuid = None
                 
                 if obj.references:
                     if obj.references.get("speaker") and obj.references["speaker"].objects:
-                        speaker_uuid = str(obj.references["speaker"].objects[0].uuid)
+                        speaker_ref = obj.references["speaker"].objects[0]
+                        speaker_uuid = str(speaker_ref.uuid)
+                        # 從 reference 中直接取得 speaker 的 properties
+                        if hasattr(speaker_ref, 'properties') and speaker_ref.properties:
+                            speaker_name = speaker_ref.properties.get("full_name")
+                            speaker_nickname = speaker_ref.properties.get("nickname")
                     if obj.references.get("session") and obj.references["session"].objects:
                         session_uuid = str(obj.references["session"].objects[0].uuid)
                 
@@ -1992,7 +2043,10 @@ class DatabaseService:
                     "duration": obj.properties.get("duration"),
                     "language": obj.properties.get("language"),
                     "speaker": speaker_uuid,
-                    "session": session_uuid
+                    "session": session_uuid,
+                    "speaker_name": speaker_name,
+                    "speaker_nickname": speaker_nickname,
+                    "audio_path": obj.properties.get("audio_path")
                 })
             
             # 按時間排序（最新在前）
